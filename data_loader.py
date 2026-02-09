@@ -147,7 +147,11 @@ class DataLoader:
             buyer_agent TEXT,
             buyer_office TEXT,
             days_on_market INTEGER,
-            cumulative_dom INTEGER
+            cumulative_dom INTEGER,
+            geo_lat REAL,
+            geo_lon REAL,
+            pcn_validated INTEGER,
+            geo_zone TEXT
         );
         """
         try:

@@ -6,6 +6,7 @@ from data_analysis_functions import (
     pending_sales,
     active_inventory,
     pending_inventory,
+    new_pending_sales,
     median_dom,
     listing_discount,
     subdivision_median_price,
@@ -29,6 +30,7 @@ STATISTIC_FUNCTIONS = {
     "Sales Count": "sales_count",
     "New Listings": "new_listings",
     "Pending Sales": "pending_sales",
+    "New Pending Sales": "new_pending_sales",
     "Active Inventory": "active_inventory",
     "Pending Inventory": "pending_inventory",
     "Median DOM": "median_dom",
@@ -103,20 +105,26 @@ STATS_METADATA = {
     "active_inventory": {
         "func": active_inventory,
         "date_col_for_filtering": "listing_date",
-        "skip_start_date_filter": True,
+        "skip_all_date_filter": True,
         "dtype": "Int64",
         "is_dist": False
     },
     "pending_inventory": {
         "func": pending_inventory,
         "date_col_for_filtering": "under_contract_date",
-        "skip_start_date_filter": True,
+        "skip_all_date_filter": True,
+        "dtype": "Int64",
+        "is_dist": False
+    },
+    "new_pending_sales": {
+        "func": new_pending_sales,
+        "date_col_for_filtering": "under_contract_date",
         "dtype": "Int64",
         "is_dist": False
     },
     "median_dom": {
         "func": median_dom,
-        "date_col_for_filtering": "listing_date",
+        "date_col_for_filtering": "effective_active_end_date",
         "dtype": "Float64",
         "is_dist": False
     },

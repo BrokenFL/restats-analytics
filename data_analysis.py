@@ -143,10 +143,15 @@ def analyze_real_estate_data(df_master_unfiltered, params):
             start_filter = pd.Timestamp(actual_start)
             end_filter = pd.Timestamp(end_str)
 
-            # Check for special skip flag (Used for Active/Pending Inventory)
+            # Check for special skip flags (Used for Active/Pending Inventory)
             skip_start_filter = meta.get("skip_start_date_filter", False)
+            skip_all_date_filter = meta.get("skip_all_date_filter", False)
 
-            if skip_start_filter:
+            if skip_all_date_filter:
+                # Don't filter by date at all - inventory metrics need ALL historical records
+                # to calculate current snapshot (a listing from 2020 could still be active)
+                pass
+            elif skip_start_filter:
                 # Only filter future dates. Keep history for "carry-over" inventory.
                 df = df[df[date_col] <= end_filter]
             else:
@@ -174,7 +179,7 @@ def analyze_real_estate_data(df_master_unfiltered, params):
             continue
 
         # ---------------------------------------
-        # YOY CALC
+        # YOY CALC (must happen BEFORE reindex to user periods)
         # ---------------------------------------
         if calc_yoy and not is_dist:
             # Determine the actual column name in raw_df
@@ -190,6 +195,10 @@ def analyze_real_estate_data(df_master_unfiltered, params):
                 # If the column name doesn't match display_name, rename it so downstream logic works
                 if actual_col_name != display_name:
                     raw_df.rename(columns={actual_col_name: display_name}, inplace=True)
+                
+                # Debug log to verify YoY was calculated
+                yoy_valid = raw_df[yoy_name].notna().sum()
+                logger.debug(f"YoY calculated for {display_name}: {yoy_valid} valid values out of {len(raw_df)}")
             else:
                  logger.warning(f"Could not find value column for {display_name}")
 
@@ -223,15 +232,22 @@ def _compute_yoy(df, col, timeframe):
     if "PeriodIndex" not in df.columns:
         return pd.Series([np.nan] * len(df))
 
+    # Sort by PeriodIndex to ensure shift works correctly
+    df_sorted = df.sort_values("PeriodIndex").reset_index(drop=True)
+    
     shifts = {"monthly": 12, "quarterly": 4, "annually": 1}
     shift_n = shifts.get(timeframe, 12)
 
-    series = pd.to_numeric(df[col], errors="coerce")
+    series = pd.to_numeric(df_sorted[col], errors="coerce")
     prev = series.shift(shift_n)
 
     denom = prev.replace(0, np.nan).abs()
     yoy = ((series - prev) / denom) * 100
-    return yoy.replace([np.inf, -np.inf], np.nan).astype("Float64")
+    yoy_result = yoy.replace([np.inf, -np.inf], np.nan).astype("Float64")
+    
+    # Map back to original df order using PeriodIndex
+    yoy_map = dict(zip(df_sorted["PeriodIndex"], yoy_result))
+    return df["PeriodIndex"].map(yoy_map)
 
 
 def _error_df_shell(display_name, periods, labels, calc_yoy, is_dist):

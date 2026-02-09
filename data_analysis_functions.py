@@ -222,7 +222,7 @@ def pending_inventory(df, freq, start, end):
     
     df = df.copy()
     # Ensure dates
-    cols = ['under_contract_date', 'sold_date', 'fallthrough_date', 'cancel_date', 'withdrawn_date', 'status_change_date']
+    cols = ['under_contract_date', 'sold_date', 'fallthrough_date', 'cancel_date', 'withdrawn_date', 'status_change_date', 'effective_active_end_date', 'listing_date']
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -234,33 +234,90 @@ def pending_inventory(df, freq, start, end):
     # Determine Pending End Date (Earliest of Sold/Fallthrough/Cancel/Withdraw)
     df["calc_pending_end"] = pd.NaT
 
-    # 1. If Sold, it ended on Sold Date
+    # 1. If Sold/Closed, it ended on Sold Date
     mask_sold = df["status"].astype(str).str.upper().isin(['S', 'C', 'CLOSED', 'SOLD'])
     df.loc[mask_sold, "calc_pending_end"] = df.loc[mask_sold, "sold_date"]
 
-    # 2. If Dead Deal, it ended on Fallthrough/Cancel/Withdraw/Change
+    # 2. If Dead Deal (Expired, Cancelled, Withdrawn, etc.), find the end date
     pending_codes = ['P', 'PENDING', 'U', 'UNDER CONTRACT', 'D', 'BACKUP']
     mask_dead = ~df["status"].astype(str).str.upper().isin(pending_codes + ['S', 'C', 'CLOSED', 'SOLD'])
     
-    dead_dates = df.loc[mask_dead, ["fallthrough_date", "cancel_date", "withdrawn_date", "status_change_date"]]
+    # Use multiple date columns to find when the pending period ended
+    dead_dates = df.loc[mask_dead, ["fallthrough_date", "cancel_date", "withdrawn_date", "status_change_date", "effective_active_end_date"]]
     df.loc[mask_dead, "calc_pending_end"] = dead_dates.min(axis=1)
+    
+    # 3. For dead deals where we STILL don't have an end date, use under_contract_date as fallback
+    # (they went pending and then died, so they're not currently pending)
+    mask_dead_no_end = mask_dead & df["calc_pending_end"].isna()
+    df.loc[mask_dead_no_end, "calc_pending_end"] = df.loc[mask_dead_no_end, "under_contract_date"]
 
-    # 3. Data Cleanup
+    # 4. Data Cleanup - end date can't be before contract date
     bad_data_mask = df["calc_pending_end"] < df["under_contract_date"]
-    df.loc[bad_data_mask, "calc_pending_end"] = pd.NaT
+    df.loc[bad_data_mask, "calc_pending_end"] = df.loc[bad_data_mask, "under_contract_date"]
+    
+    # 5. PCN-based invalidation: If same parcel has a newer listing, the old pending is dead
+    if 'parcel_id' in df.columns:
+        df['parcel_id'] = df['parcel_id'].astype(str)
+        # For each parcel_id, find the max listing_date
+        pcn_max_listing = df.groupby('parcel_id')['listing_date'].transform('max')
+        # If this listing's listing_date is not the max for its parcel_id, it's superseded
+        mask_superseded = (df['listing_date'] < pcn_max_listing) & df["calc_pending_end"].isna()
+        df.loc[mask_superseded, "calc_pending_end"] = df.loc[mask_superseded, "listing_date"]
 
     period_idx = get_period_range(start, end, freq)
     out = []
     
+    # Max pending duration: 6 months (180 days) - anything older is likely stale/dead
+    MAX_PENDING_DAYS = 180
+    
     for period in period_idx:
         snapshot_date = period.to_timestamp(how='end')
+        stale_cutoff = snapshot_date - pd.Timedelta(days=MAX_PENDING_DAYS)
+        
+        # Only count as pending if:
+        # 1. Went under contract before snapshot
+        # 2. Either ended after snapshot OR (no end date AND status is pending AND not stale)
         mask = (df["under_contract_date"] <= snapshot_date) & (
-            (df["calc_pending_end"].isna()) | 
-            (df["calc_pending_end"] > snapshot_date)
+            (df["calc_pending_end"] > snapshot_date) |
+            (
+                (df["calc_pending_end"].isna()) & 
+                df["status"].astype(str).str.upper().isin(pending_codes) &
+                (df["under_contract_date"] > stale_cutoff)  # Not stale (< 6 months old)
+            )
         )
         out.append([period, mask.sum()])
         
     return pd.DataFrame(out, columns=["PeriodIndex", "Pending Inventory"])
+
+
+def new_pending_sales(df, freq, start, end):
+    """
+    Count of listings that went under contract (pending) during each period.
+    This is a FLOW metric (activity during period), not a snapshot.
+    """
+    if df.empty: return _empty_stat_shell(freq, start, end, "New Pending Sales")
+    
+    df = df.copy()
+    df["under_contract_date"] = pd.to_datetime(df["under_contract_date"], errors="coerce")
+    df = df[df["under_contract_date"].notna()]
+    
+    # Filter to date range
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    df = df[(df["under_contract_date"] >= start_ts) & (df["under_contract_date"] <= end_ts)]
+    
+    # Group by period and count
+    df["PeriodIndex"] = df["under_contract_date"].dt.to_period({"monthly": "M", "quarterly": "Q", "annually": "A"}[freq])
+    
+    grouped = df.groupby("PeriodIndex").size().reset_index(name="New Pending Sales")
+    
+    # Fill missing periods
+    period_idx = get_period_range(start, end, freq)
+    result = pd.DataFrame({"PeriodIndex": period_idx})
+    result = result.merge(grouped, on="PeriodIndex", how="left")
+    result["New Pending Sales"] = result["New Pending Sales"].fillna(0).astype("Int64")
+    
+    return result
 
 
 def median_dom(df, freq, start, end):
@@ -269,7 +326,8 @@ def median_dom(df, freq, start, end):
     df["effective_active_end_date"] = pd.to_datetime(df["effective_active_end_date"], errors="coerce")
     df = df[df["listing_date"].notna() & df["effective_active_end_date"].notna()].copy()
     df["DOM"] = (df["effective_active_end_date"] - df["listing_date"]).dt.days
-    return safe_group_aggregation(df, "listing_date", "DOM", "median", freq, start, end, "Median DOM")
+    # Group by when listing ended (sold/closed), not when it was listed
+    return safe_group_aggregation(df, "effective_active_end_date", "DOM", "median", freq, start, end, "Median DOM")
 
 def listing_discount(df, freq, start, end):
     df = df.copy()

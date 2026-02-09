@@ -73,12 +73,26 @@ data_dictionary = {
     "total_floors_stories": {"original_name": "Total Floors/Stories", "data_type": "integer"},
     "property_type": {"original_name": "Type", "data_type": "string"},
     "terms_of_sale": {"original_name": "Terms of Sale", "data_type": "string"},
+    "geo_lat": {"original_name": "Geo Lat", "data_type": "float"},
+    "geo_lon": {"original_name": "Geo Lon", "data_type": "float"},
     # Derived Columns
     "effective_active_end_date": {"original_name": "effective_active_end_date", "data_type": "date"},
     "calculated_status": {"original_name": "calculated_status", "data_type": "string"},
     "is_zombie": {"original_name": "is_zombie", "data_type": "boolean"},
     "pcn_10_digit": {"original_name": "pcn_10_digit", "data_type": "string"},
-    "final_subdivision": {"original_name": "final_subdivision", "data_type": "string"}
+    "final_subdivision": {"original_name": "final_subdivision", "data_type": "string"},
+    "geo_zone": {"original_name": "geo_zone", "data_type": "string"}
+}
+
+# Geo Zone Definitions (latitude-based)
+GEO_ZONES = {
+    "South End": {
+        "city": "Palm Beach",
+        "lat_max": 26.646906,  # North boundary - south of this latitude
+        "lat_min": 26.594029,  # South boundary - north of this latitude
+        "lon_min": None,
+        "lon_max": None
+    }
 }
 
 # --- 2. HELPER FUNCTIONS ---
@@ -370,6 +384,22 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
             logger.info("Applied global PCN grouping.")
         except Exception as e:
             logger.error(f"Grouping error: {e}")
+
+        # Apply geo zones
+        try:
+            final_merged['geo_zone'] = None
+            for zone_name, zone_def in GEO_ZONES.items():
+                mask = pd.Series([True] * len(final_merged))
+                if zone_def.get('city'):
+                    mask &= (final_merged['city'] == zone_def['city'])
+                if zone_def.get('lat_max') is not None and 'geo_lat' in final_merged.columns:
+                    mask &= (final_merged['geo_lat'].notna()) & (final_merged['geo_lat'] <= zone_def['lat_max'])
+                if zone_def.get('lat_min') is not None and 'geo_lat' in final_merged.columns:
+                    mask &= (final_merged['geo_lat'].notna()) & (final_merged['geo_lat'] >= zone_def['lat_min'])
+                final_merged.loc[mask, 'geo_zone'] = zone_name
+            logger.info("Applied geo zones.")
+        except Exception as e:
+            logger.error(f"Geo zone error: {e}")
 
         # Ensure schema alignment
         try:
