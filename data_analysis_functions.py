@@ -199,6 +199,15 @@ def pending_sales(df, freq, start, end):
     return safe_group_aggregation(df, "under_contract_date", "listing_number", "count", freq, start, end, "Pending Sales")
 
 def active_inventory(df, freq, start, end):
+    """
+    Count Active listings at end of each period.
+    A listing was active at a point in time if:
+    1. listing_date <= snapshot AND
+    2. effective_active_end_date is NULL (still active) OR > snapshot (went off-market later)
+    
+    Note: This correctly counts historical inventory - a listing that is now Closed
+    but was Active in Dec 2025 will count for Dec 2025 if effective_active_end_date > Dec 31.
+    """
     if df.empty: return _empty_stat_shell(freq, start, end, "Active Inventory")
     df = df.copy()
     df["listing_date"] = pd.to_datetime(df["listing_date"], errors="coerce")

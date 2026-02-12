@@ -2,7 +2,6 @@
 
 import pandas as pd
 import numpy as np
-import logging
 from datetime import datetime
 import os
 import traceback
@@ -11,29 +10,21 @@ import traceback
 from app_config import STATISTIC_FUNCTIONS, STATS_METADATA
 from data_analysis_functions import get_period_range, label_period
 
+# Centralized logging
+from analytics_logger import (
+    logger, log_analysis_params, log_stat_calculation, 
+    log_dataframe_summary, log_data_filter, log_section,
+    run_diagnostics, log_timing
+)
+
 DEFAULT_DATE_COL_FOR_FILTERING = "listing_date"
-
-# -------------------------------
-# Logging Setup
-# -------------------------------
-log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-log_filename = os.path.join(log_dir, "real_estate_analysis.log")
-
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
-        handlers=[logging.FileHandler(log_filename, mode="w"), logging.StreamHandler()],
-    )
-    logger.propagate = False
 
 
 # =====================================================================
 # MAIN ANALYSIS ENGINE
 # =====================================================================
 
+@log_timing
 def analyze_real_estate_data(df_master_unfiltered, params):
     """
     Top-level analysis engine.
@@ -45,22 +36,28 @@ def analyze_real_estate_data(df_master_unfiltered, params):
         - pcn_10_digit
     Returns dict: { DisplayName: DataFrame }
     """
-
+    log_section("ANALYSIS START")
+    
     # ---------------------------------------
     # Validate params
     # ---------------------------------------
     required = ["start_date", "end_date", "timeframe", "stats_to_calculate"]
     if not isinstance(params, dict) or not all(k in params for k in required):
         missing = [k for k in required if k not in params]
+        logger.error(f"Missing required parameters: {missing}")
         return {"error": f"Missing required analysis parameters: {missing}"}
 
     timeframe = params["timeframe"].lower()
     if timeframe not in ["monthly", "quarterly", "annually"]:
+        logger.error(f"Invalid timeframe: {timeframe}")
         return {"error": f"Invalid timeframe: {timeframe}"}
 
     calc_yoy = params.get("calculate_yoy", False)
     start_str = params["start_date"]
     end_str = params["end_date"]
+    
+    # Log all parameters
+    log_analysis_params(params)
 
     # ---------------------------------------
     # Validate Dates
@@ -71,15 +68,20 @@ def analyze_real_estate_data(df_master_unfiltered, params):
         if start_ts > end_ts:
             raise ValueError("Start date is after end date.")
     except Exception as e:
+        logger.error(f"Invalid date formatting: {e}")
         return {"error": f"Invalid date formatting: {e}"}
 
     logger.info(
-        f"Begin analysis | timeframe={timeframe} | YoY={calc_yoy} | range={start_ts.date()} to {end_ts.date()}"
+        f"Analysis range: {start_ts.date()} to {end_ts.date()} | timeframe={timeframe} | YoY={calc_yoy}"
     )
 
     df_base = df_master_unfiltered.copy() if isinstance(df_master_unfiltered, pd.DataFrame) else pd.DataFrame()
     if df_base.empty:
+        logger.error("Master DataFrame is empty or invalid")
         return {"error": "Master DataFrame is empty or invalid."}
+    
+    # Run diagnostics on input data
+    run_diagnostics(df_base)
 
     # ---------------------------------------
     # Build Period Index
@@ -138,7 +140,9 @@ def analyze_real_estate_data(df_master_unfiltered, params):
 
         try:
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            before_filter = len(df)
             df = df[df[date_col].notna()]
+            log_data_filter("date_notna", df, f"(was {before_filter}, now {len(df)})")
             
             start_filter = pd.Timestamp(actual_start)
             end_filter = pd.Timestamp(end_str)
@@ -149,17 +153,20 @@ def analyze_real_estate_data(df_master_unfiltered, params):
 
             if skip_all_date_filter:
                 # Don't filter by date at all - inventory metrics need ALL historical records
-                # to calculate current snapshot (a listing from 2020 could still be active)
-                pass
+                log_data_filter("skip_all_date", df, "(no date filter applied)")
             elif skip_start_filter:
                 # Only filter future dates. Keep history for "carry-over" inventory.
+                before = len(df)
                 df = df[df[date_col] <= end_filter]
+                log_data_filter("skip_start", df, f"(<= {end_filter.date()}, was {before})")
             else:
                 # Standard filtering (Start to End)
+                before = len(df)
                 df = df[(df[date_col] >= start_filter) & (df[date_col] <= end_filter)]
+                log_data_filter("date_range", df, f"({start_filter.date()} to {end_filter.date()}, was {before})")
 
         except Exception as err:
-            logger.error(f"Date filtering failed for '{display_name}': {err}")
+            logger.error(f"Date filtering failed for '{display_name}': {err}", exc_info=True)
             results[display_name] = _error_df_shell(display_name, all_periods, all_labels, calc_yoy, is_dist)
             continue
 
@@ -167,7 +174,9 @@ def analyze_real_estate_data(df_master_unfiltered, params):
         # STAT FUNCTION EXECUTION
         # ---------------------------------------
         try:
+            logger.debug(f"Calling {internal_key} with {len(df)} rows")
             raw_df = func(df, timeframe, actual_start, end_str)
+            log_stat_calculation(display_name, df, raw_df)
         except Exception as err:
             logger.error(f"Stat function '{internal_key}' failed: {err}", exc_info=True)
             results[display_name] = _error_df_shell(display_name, all_periods, all_labels, calc_yoy, is_dist)
@@ -206,6 +215,7 @@ def analyze_real_estate_data(df_master_unfiltered, params):
         # REINDEX TO USER PERIODS
         # ---------------------------------------
         raw_df = raw_df.set_index("PeriodIndex")
+        # Reindex ensures chronological order since all_periods is already sorted
         aligned = raw_df.reindex(all_periods).reset_index()
         aligned["Period"] = all_labels
 
@@ -219,7 +229,14 @@ def analyze_real_estate_data(df_master_unfiltered, params):
 
         results[display_name] = aligned
 
-    logger.info("Analysis complete.")
+    # Final summary
+    log_section("ANALYSIS COMPLETE")
+    logger.info(f"Stats calculated: {len(results)}")
+    for stat_name, df in results.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            valid_count = df[stat_name].notna().sum() if stat_name in df.columns else 0
+            logger.info(f"  {stat_name}: {valid_count} valid periods")
+    
     return results
 
 
@@ -228,26 +245,52 @@ def analyze_real_estate_data(df_master_unfiltered, params):
 # =====================================================================
 
 def _compute_yoy(df, col, timeframe):
-    """Compute Year-over-Year % based on period index shifting."""
+    """
+    Compute Year-over-Year % by matching each period to its prior year period.
+    Uses period arithmetic instead of row shifting to handle gaps in data.
+    """
     if "PeriodIndex" not in df.columns:
         return pd.Series([np.nan] * len(df))
 
-    # Sort by PeriodIndex to ensure shift works correctly
-    df_sorted = df.sort_values("PeriodIndex").reset_index(drop=True)
+    # Build a lookup dict: PeriodIndex -> value
+    value_lookup = {}
+    for _, row in df.iterrows():
+        period = row["PeriodIndex"]
+        val = row[col]
+        if pd.notna(val):
+            value_lookup[period] = val
     
-    shifts = {"monthly": 12, "quarterly": 4, "annually": 1}
-    shift_n = shifts.get(timeframe, 12)
-
-    series = pd.to_numeric(df_sorted[col], errors="coerce")
-    prev = series.shift(shift_n)
-
-    denom = prev.replace(0, np.nan).abs()
-    yoy = ((series - prev) / denom) * 100
-    yoy_result = yoy.replace([np.inf, -np.inf], np.nan).astype("Float64")
+    # For each period, find the prior year period and calculate YoY
+    yoy_values = []
+    for _, row in df.iterrows():
+        current_period = row["PeriodIndex"]
+        current_val = row[col]
+        
+        if pd.isna(current_val):
+            yoy_values.append(np.nan)
+            continue
+        
+        # Calculate prior year period using period arithmetic
+        try:
+            # Subtract 1 year worth of periods
+            if timeframe == "monthly":
+                prior_period = current_period - 12
+            elif timeframe == "quarterly":
+                prior_period = current_period - 4
+            else:  # annually
+                prior_period = current_period - 1
+            
+            prior_val = value_lookup.get(prior_period)
+            
+            if prior_val is not None and prior_val != 0:
+                yoy_pct = ((current_val - prior_val) / abs(prior_val)) * 100
+                yoy_values.append(yoy_pct)
+            else:
+                yoy_values.append(np.nan)
+        except Exception:
+            yoy_values.append(np.nan)
     
-    # Map back to original df order using PeriodIndex
-    yoy_map = dict(zip(df_sorted["PeriodIndex"], yoy_result))
-    return df["PeriodIndex"].map(yoy_map)
+    return pd.Series(yoy_values, dtype="Float64")
 
 
 def _error_df_shell(display_name, periods, labels, calc_yoy, is_dist):
