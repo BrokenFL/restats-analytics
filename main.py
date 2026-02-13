@@ -9,6 +9,8 @@ import re
 import glob
 import pandas as pd
 
+DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
@@ -262,6 +264,104 @@ def launch_dashboard():
         print(f"\nAn unexpected error occurred: {e}")
         input("\nPress Enter to continue...")
 
+def find_latest_enhanced_csv(created_after=None):
+    """
+    Find the latest ENHANCED csv in Downloads.
+    Prefer *_COMBINED.csv when available.
+    """
+    patterns = [
+        os.path.join(DOWNLOAD_FOLDER, "ENHANCED_*_COMBINED.csv"),
+        os.path.join(DOWNLOAD_FOLDER, "ENHANCED_*.csv"),
+    ]
+    candidates = []
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                ctime = os.path.getctime(path)
+            except Exception:
+                continue
+            if created_after is None or ctime >= created_after:
+                candidates.append((ctime, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+def run_off_market_scraper_automation():
+    """
+    Automated off-market full pipeline:
+    - Default city: Palm Beach
+    - Start date: last imported PBC sold_date + 1 day
+    - Import ENHANCED CSV into DB
+    - Run cabana merge in DB
+    """
+    print("\n--- Off-Market Full Pipeline (Automation Mode) ---")
+    print("City: Palm Beach | Date mode: from last imported PBC sale date")
+    started_at = time.time()
+    try:
+        # Step 1: Scrape + normalize into ENHANCED csv
+        subprocess.run(
+            [
+                sys.executable,
+                "PalmBeachProrpertyScraper.py",
+                "--city", "Palm Beach",
+                "--from-last-imported",
+                "--non-interactive"
+            ],
+            check=True
+        )
+
+        # Step 2: Import newest ENHANCED csv into listing_details
+        enhanced_csv = find_latest_enhanced_csv(created_after=started_at - 120)
+        if not enhanced_csv:
+            print("\n❌ Could not find a newly generated ENHANCED CSV in Downloads.")
+            input("\nPress Enter to continue...")
+            return
+
+        print(f"\n📥 Importing off-market CSV into database:\n{enhanced_csv}")
+        subprocess.run(
+            [sys.executable, "pbc_importer.py", enhanced_csv],
+            check=True
+        )
+
+        # Step 3: Merge likely cabana records in DB
+        print("\n🏷️  Running cabana merge on database...")
+        subprocess.run(
+            [sys.executable, "merge_cabanas.py", "--merge"],
+            check=True
+        )
+        print("\n✅ Off-market automation pipeline complete.")
+    except subprocess.CalledProcessError as e:
+        print(f"\nError running off-market automation pipeline: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+    input("\nPress Enter to continue...")
+
+def run_off_market_scraper_custom():
+    """
+    Manual off-market pull:
+    - User chooses city (Palm Beach default)
+    - User can set start/end dates (optional)
+    """
+    print("\n--- Off-Market Scraper (Custom) ---")
+    city = input("Enter Municipality (Press Enter for 'Palm Beach'): ").strip() or "Palm Beach"
+    start_date = input("Enter Start Date MM/DD/YYYY (optional): ").strip()
+    end_date = input("Enter End Date MM/DD/YYYY (optional): ").strip()
+
+    cmd = [sys.executable, "PalmBeachProrpertyScraper.py", "--city", city, "--non-interactive"]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\nError running off-market scraper: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+    input("\nPress Enter to continue...")
+
 def main():
     while True:
         clear_screen()
@@ -272,10 +372,12 @@ def main():
         print("2. 📊 Launch Dashboard")
         print("3. 🏘️  Update Subdivisions (Lookup Sheets)")
         print("4. ⚠️  Reset Database & Restore Files")
-        print("5. ❌ Exit")
+        print("5. 🤖 Off-Market Full Run (Auto: scrape -> import -> cabana merge)")
+        print("6. 🧭 Off-Market Pull (Custom city/date range)")
+        print("7. ❌ Exit")
         print("========================================")
         
-        choice = input("Enter your choice (1-5): ").strip()
+        choice = input("Enter your choice (1-7): ").strip()
         
         if choice == '1':
             run_data_processing()
@@ -286,6 +388,10 @@ def main():
         elif choice == '4':
             reset_database()
         elif choice == '5':
+            run_off_market_scraper_automation()
+        elif choice == '6':
+            run_off_market_scraper_custom()
+        elif choice == '7':
             print("Goodbye!")
             break
         else:

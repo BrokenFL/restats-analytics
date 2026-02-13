@@ -5,6 +5,7 @@ import csv
 import requests
 import sys
 import sqlite3
+import argparse
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -15,6 +16,58 @@ from selenium.webdriver.support import expected_conditions as EC
 # --- CONFIGURATION ---
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'Downloads')
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
+
+
+def parse_mmddyyyy(date_str):
+    """Validate and normalize MM/DD/YYYY input."""
+    if not date_str:
+        return None
+    dt = datetime.strptime(date_str.strip(), "%m/%d/%Y")
+    return dt.strftime("%m/%d/%Y")
+
+
+def get_last_imported_pbc_sale_date(target_city=None):
+    """
+    Returns latest sold_date for PBC-imported rows.
+    If city is provided, filters by that city.
+    """
+    if not os.path.exists(DB_FILE):
+        return None
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        city_filter = target_city.strip().title() if target_city else None
+        if city_filter:
+            cursor.execute(
+                """
+                SELECT MAX(DATE(sold_date))
+                FROM listing_details
+                WHERE listing_number LIKE 'PBC-%'
+                  AND city = ?
+                  AND sold_date IS NOT NULL
+                """,
+                (city_filter,)
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT MAX(DATE(sold_date))
+                FROM listing_details
+                WHERE listing_number LIKE 'PBC-%'
+                  AND sold_date IS NOT NULL
+                """
+            )
+
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return None
+        latest = datetime.strptime(row[0], "%Y-%m-%d")
+        return latest
+    except Exception as e:
+        print(f"Warning: Could not read last imported PBC sold date: {e}")
+        return None
 
 
 def get_existing_sales_from_db():
@@ -222,38 +275,224 @@ def scrape_property_details(driver, pcn):
     
     return details
 
-def run_scraper(target_city=None, start_date=None):
+def _switch_to_municipality_mode(driver):
+    """
+    Attempt to switch search type from subdivisions to municipalities.
+    Works across minor DOM changes.
+    """
+    try:
+        search_type_js = """
+            var selects = document.querySelectorAll('select');
+            for (var s of selects) {
+                var hasMunicipality = false;
+                var hasSubdivision = false;
+                var municipalityIdx = -1;
+                for (var i = 0; i < s.options.length; i++) {
+                    var txt = (s.options[i].text || '').toLowerCase();
+                    if (txt.includes('municipalit')) {
+                        hasMunicipality = true;
+                        municipalityIdx = i;
+                    }
+                    if (txt.includes('subdiv')) {
+                        hasSubdivision = true;
+                    }
+                }
+                if (hasMunicipality && (hasSubdivision || municipalityIdx >= 0)) {
+                    s.selectedIndex = municipalityIdx;
+                    s.dispatchEvent(new Event('change', { bubbles: true }));
+                    return s.id || 'search-type-select';
+                }
+            }
+            return null;
+        """
+        result = driver.execute_script(search_type_js)
+        if result:
+            print("✓ Switched to Municipalities search mode")
+            time.sleep(2)
+    except Exception as e:
+        print(f"Note: Could not switch search mode automatically: {e}")
+
+
+def _force_click_municipality_mode(driver):
+    """
+    Fallbacks for UIs where municipality mode is a tab/radio/button rather than select.
+    """
+    # Recorder-confirmed path: municipality radio is input[2] with value MUNI.
+    try:
+        muni_js = """
+            var el = document.evaluate(
+                "/html/body/main/div/div/div/form/div/div[2]/div/input[2]",
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+            if (el) {
+                el.click();
+                el.checked = true;
+                if (el.value !== 'MUNI') { el.value = 'MUNI'; }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }
+            return false;
+        """
+        if driver.execute_script(muni_js):
+            time.sleep(0.6)
+            return True
+    except Exception:
+        pass
+
+    selector_candidates = [
+        (By.CSS_SELECTOR, "input[type='radio'][value='MUNI']"),
+        (By.ID, "Municipality"),
+        (By.ID, "Municipalities"),
+        (By.CSS_SELECTOR, "input[value*='Municip']"),
+        (By.CSS_SELECTOR, "button[id*='Municip']"),
+        (By.CSS_SELECTOR, "a[id*='Municip']"),
+        (By.XPATH, "//*[contains(normalize-space(text()), 'Municipality')]"),
+        (By.XPATH, "//*[contains(normalize-space(text()), 'Municipalities')]"),
+    ]
+
+    for by, sel in selector_candidates:
+        try:
+            elems = driver.find_elements(by, sel)
+            for elem in elems:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(0.4)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_municipality_options(driver, timeout_sec=12):
+    """Wait until Municipality select has real options."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            elem = driver.find_element(By.ID, "Municipality")
+            options = Select(elem).options
+            real = [o.text.strip() for o in options if o.text and o.text.strip()]
+            if real:
+                return real
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return []
+
+
+def _select_municipality(driver, wait, target_city):
+    """Select municipality robustly with exact then contains matching."""
+    wait.until(EC.presence_of_element_located((By.ID, "Municipality")))
+    options = _wait_for_municipality_options(driver, timeout_sec=10)
+    if not options:
+        # Retry search mode switch once in case options populated late.
+        _switch_to_municipality_mode(driver)
+        if not _wait_for_municipality_options(driver, timeout_sec=3):
+            _force_click_municipality_mode(driver)
+        options = _wait_for_municipality_options(driver, timeout_sec=8)
+
+    municipality_select = Select(driver.find_element(By.ID, "Municipality"))
+    if not options:
+        options = [opt.text.strip() for opt in municipality_select.options if opt.text and opt.text.strip()]
+    def _norm(s):
+        return " ".join(str(s).strip().lower().split())
+
+    def _strip_prefixes(s):
+        prefixes = ("town of ", "city of ", "village of ")
+        out = _norm(s)
+        for p in prefixes:
+            if out.startswith(p):
+                return out[len(p):]
+        return out
+
+    target_norm = _norm(target_city)
+    exact = next((o for o in options if _norm(o) == target_norm), None)
+    exact_prefixed = next((o for o in options if _strip_prefixes(o) == target_norm), None)
+
+    contains_candidates = [o for o in options if target_norm in _norm(o)]
+    contains_ranked = sorted(contains_candidates, key=lambda o: len(_norm(o)) - len(target_norm))
+    contains = contains_ranked[0] if contains_ranked else None
+
+    selected_text = exact or exact_prefixed or contains
+
+    if not selected_text:
+        sample = options[:20]
+        raise ValueError(f"Municipality '{target_city}' not found. Available sample: {sample}")
+
+    municipality_select.select_by_visible_text(selected_text)
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('change', { bubbles: true }));",
+        driver.find_element(By.ID, "Municipality")
+    )
+    print(f"✓ Selected municipality: {selected_text}")
+
+
+def run_scraper(target_city=None, start_date=None, end_date=None, use_last_imported=False, prompt_for_missing=True):
     # --- PHASE 0: USER INPUTS ---
     print("\n--- PBC Property Scraper Configuration ---")
-    
-    # Check for command line arguments first
-    if len(sys.argv) >= 3:
-        target_city = sys.argv[1]
-        start_date = sys.argv[2]
-    
+
     # 1. Get Municipality
     if not target_city:
         target_city = input("Enter Municipality (Press Enter for 'Palm Beach'): ").strip()
         if not target_city:
             target_city = "Palm Beach"
-        
-    # 2. Get Start Date
+
+    # 2. Get Start Date (with optional last-imported mode)
     default_date = (datetime.now() - timedelta(days=180)).strftime("%m/%d/%Y")
+    if use_last_imported and not start_date:
+        latest = get_last_imported_pbc_sale_date(target_city)
+        if latest:
+            start_date = (latest + timedelta(days=1)).strftime("%m/%d/%Y")
+            print(f"✓ Using last imported PBC date +1 day: {start_date}")
+        else:
+            print("Note: No prior PBC import date found; using default start date.")
+
     if not start_date:
-        start_date_input = input(f"Enter Start Date MM/DD/YYYY (Press Enter for {default_date}): ").strip()
+        if prompt_for_missing:
+            start_date_input = input(f"Enter Start Date MM/DD/YYYY (Press Enter for {default_date}): ").strip()
+        else:
+            start_date_input = ""
         if not start_date_input:
             formatted_date = default_date
         else:
             try:
-                datetime.strptime(start_date_input, "%m/%d/%Y")
-                formatted_date = start_date_input
+                formatted_date = parse_mmddyyyy(start_date_input)
             except ValueError:
                 print(f"Invalid date format! Defaulting to {default_date}")
                 formatted_date = default_date
     else:
-        formatted_date = start_date
+        try:
+            formatted_date = parse_mmddyyyy(start_date)
+        except ValueError:
+            print(f"Invalid start date '{start_date}'. Falling back to {default_date}")
+            formatted_date = default_date
 
-    print(f"\n-> Starting Search for '{target_city}' sales since {formatted_date}...\n")
+    # 3. Optional End Date
+    if end_date is None and prompt_for_missing:
+        end_date_input = input("Enter End Date MM/DD/YYYY (optional, press Enter for no end date): ").strip()
+        if end_date_input:
+            try:
+                formatted_end_date = parse_mmddyyyy(end_date_input)
+            except ValueError:
+                print("Invalid end date format. Ignoring end date.")
+                formatted_end_date = None
+        else:
+            formatted_end_date = None
+    else:
+        try:
+            formatted_end_date = parse_mmddyyyy(end_date) if end_date else None
+        except ValueError:
+            print(f"Invalid end date '{end_date}'. Ignoring end date.")
+            formatted_end_date = None
+
+    if formatted_end_date:
+        print(f"\n-> Starting Search for '{target_city}' sales from {formatted_date} to {formatted_end_date}...\n")
+    else:
+        print(f"\n-> Starting Search for '{target_city}' sales since {formatted_date}...\n")
 
     # --- PHASE 1: SEARCH & DOWNLOAD ---
     
@@ -271,64 +510,15 @@ def run_scraper(target_city=None, start_date=None):
         
         # Wait for page to fully load
         time.sleep(2)
-        
-        # FIRST: Select "Municipalities" from the search type dropdown (defaults to Subdivisions)
+
+        # FIRST: ensure we are in municipality search mode
+        _switch_to_municipality_mode(driver)
+        if not _wait_for_municipality_options(driver, timeout_sec=3):
+            _force_click_municipality_mode(driver)
+
+        # SECOND: select municipality robustly
         try:
-            # Look for a dropdown that lets you choose between Subdivisions/Municipalities
-            search_type_js = """
-                var selects = document.querySelectorAll('select');
-                for (var s of selects) {
-                    for (var i = 0; i < s.options.length; i++) {
-                        if (s.options[i].text.includes('Municipalit')) {
-                            s.selectedIndex = i;
-                            s.dispatchEvent(new Event('change'));
-                            return s.id || 'found';
-                        }
-                    }
-                }
-                return null;
-            """
-            result = driver.execute_script(search_type_js)
-            if result:
-                print(f"✓ Switched to Municipalities search mode")
-                time.sleep(2)  # Wait for Municipality dropdown to populate
-        except Exception as e:
-            print(f"Note: Could not find search type selector: {e}")
-        
-        wait.until(EC.presence_of_element_located((By.ID, "Municipality")))
-        time.sleep(1)
-        
-        # SECOND: Select the specific Municipality
-        try:
-            # Use JavaScript to select the option
-            js_select = f"""
-                var select = document.getElementById('Municipality');
-                for (var i = 0; i < select.options.length; i++) {{
-                    if (select.options[i].text === '{target_city}') {{
-                        select.selectedIndex = i;
-                        select.dispatchEvent(new Event('change'));
-                        return true;
-                    }}
-                }}
-                return false;
-            """
-            result = driver.execute_script(js_select)
-            if result:
-                print(f"✓ Selected municipality: {target_city}")
-            else:
-                # Get available options via JS
-                options_js = driver.execute_script("""
-                    var select = document.getElementById('Municipality');
-                    var opts = [];
-                    for (var i = 0; i < select.options.length; i++) {
-                        if (select.options[i].text.trim()) opts.push(select.options[i].text);
-                    }
-                    return opts;
-                """)
-                print(f"ERROR: Municipality '{target_city}' not found.")
-                print(f"Available: {options_js[:20]}...")
-                driver.quit()
-                return
+            _select_municipality(driver, wait, target_city)
         except Exception as e:
             print(f"ERROR selecting municipality: {e}")
             driver.quit()
@@ -339,9 +529,17 @@ def run_scraper(target_city=None, start_date=None):
         driver.execute_script("arguments[0].click();", qs_radio)
 
         # Set Date based on USER INPUT
-        date_input = driver.find_element(By.ID, "SaleDateFrom")
-        date_input.clear()
-        date_input.send_keys(formatted_date)
+        date_from_input = driver.find_element(By.ID, "SaleDateFrom")
+        date_from_input.clear()
+        date_from_input.send_keys(formatted_date)
+        if formatted_end_date:
+            try:
+                date_to_input = driver.find_element(By.ID, "SaleDateTo")
+                date_to_input.clear()
+                date_to_input.send_keys(formatted_end_date)
+                print(f"✓ Applied date range: {formatted_date} to {formatted_end_date}")
+            except Exception:
+                print("Note: SaleDateTo field not found on page; using start date only.")
 
         # Click Search
         driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "btnFormSearch"))
@@ -377,7 +575,10 @@ def run_scraper(target_city=None, start_date=None):
             # Check if there are any results at all
             try:
                 no_results = driver.find_element(By.XPATH, "//*[contains(text(), 'No records')]")
-                print(f"No results found for {target_city} since {formatted_date}")
+                if formatted_end_date:
+                    print(f"No results found for {target_city} from {formatted_date} to {formatted_end_date}")
+                else:
+                    print(f"No results found for {target_city} since {formatted_date}")
             except:
                 print("No CSV button found. The page structure may have changed.")
                 # Take a screenshot for debugging
@@ -409,8 +610,12 @@ def run_scraper(target_city=None, start_date=None):
         
         # Output file name includes city and date for clarity
         safe_city = target_city.replace(" ", "_")
-        safe_date = formatted_date.replace("/", "-")
-        output_csv_path = os.path.join(DOWNLOAD_FOLDER, f"ENHANCED_{safe_city}_{safe_date}.csv")
+        safe_start = formatted_date.replace("/", "-")
+        if formatted_end_date:
+            safe_end = formatted_end_date.replace("/", "-")
+            output_csv_path = os.path.join(DOWNLOAD_FOLDER, f"ENHANCED_{safe_city}_{safe_start}_to_{safe_end}.csv")
+        else:
+            output_csv_path = os.path.join(DOWNLOAD_FOLDER, f"ENHANCED_{safe_city}_{safe_start}.csv")
 
         with open(input_csv_path, 'r', encoding='utf-8-sig') as f_in, \
              open(output_csv_path, 'w', newline='', encoding='utf-8') as f_out:
@@ -607,4 +812,26 @@ def combine_cabana_sales(csv_path):
 
 
 if __name__ == "__main__":
-    run_scraper()
+    parser = argparse.ArgumentParser(description="PBC off-market scraper")
+    parser.add_argument("--city", help="Municipality (example: Palm Beach)")
+    parser.add_argument("--start-date", help="Start date MM/DD/YYYY")
+    parser.add_argument("--end-date", help="End date MM/DD/YYYY")
+    parser.add_argument(
+        "--from-last-imported",
+        action="store_true",
+        help="Set start date to last imported PBC sold_date + 1 day (optionally filtered by city)."
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Do not prompt for missing inputs; use defaults."
+    )
+    args = parser.parse_args()
+
+    run_scraper(
+        target_city=args.city,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        use_last_imported=args.from_last_imported,
+        prompt_for_missing=(not args.non_interactive)
+    )
