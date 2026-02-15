@@ -457,6 +457,17 @@ def run_cross_source_duplicate_cleanup():
     except Exception as e:
         print(f"⚠️  Cross-source cleanup error: {e}")
 
+def run_data_integrity_sweep():
+    """Run all data-quality hardening checks/fixes in sequence."""
+    print("\n--- Data Integrity Sweep ---")
+    run_subdivision_master_sync()
+    run_cross_source_duplicate_cleanup()
+    run_pbc_geo_zone_audit_and_fix()
+    run_property_type_normalization()
+    run_duplicate_audit_summary()
+    print("\n✅ Data integrity sweep complete.")
+    input("\nPress Enter to continue...")
+
 def run_off_market_scraper_automation():
     """
     Automated off-market full pipeline:
@@ -617,10 +628,11 @@ def main():
         print("6. 🤖 Off-Market Full Run (Auto incremental: scrape -> import -> cabana merge)")
         print("7. 🧭 Off-Market Pull (Custom city/date range)")
         print("8. ⚛️  Launch React Dashboard (API + frontend)")
-        print("9. ❌ Exit")
+        print("9. 🧪 Run Data Integrity Sweep")
+        print("10. ❌ Exit")
         print("========================================")
         
-        choice = input("Enter your choice (1-9): ").strip()
+        choice = input("Enter your choice (1-10): ").strip()
         
         if choice == '1':
             run_data_processing()
@@ -639,6 +651,8 @@ def main():
         elif choice == '8':
             launch_react_dashboard()
         elif choice == '9':
+            run_data_integrity_sweep()
+        elif choice == '10':
             print("Goodbye!")
             break
         else:
