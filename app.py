@@ -1095,22 +1095,29 @@ def render_market_report_tab(df_filtered, selected_cities, selected_subs, prop_t
             value = last_row.get(stat, None)
             yoy_col = f"{stat} YoY %"
             yoy = last_row.get(yoy_col, None) if yoy_col in df_stat.columns else None
+            value_num = pd.to_numeric(value, errors="coerce")
+            yoy_num = pd.to_numeric(yoy, errors="coerce")
             
-            if pd.isna(value):
-                formatted_value = "N/A"
+            if pd.isna(value_num):
+                if value is not None and not pd.isna(value):
+                    formatted_value = str(value)
+                else:
+                    formatted_value = "N/A"
             elif "Price" in stat or "Volume" in stat:
-                formatted_value = f"${value:,.0f}"
+                formatted_value = f"${value_num:,.0f}"
             elif "%" in stat or "Discount" in stat:
-                formatted_value = f"{value:.1f}%"
+                formatted_value = f"{value_num:.1f}%"
             elif "Supply" in stat or "MSI" in stat:
-                formatted_value = f"{value:.1f}"
+                formatted_value = f"{value_num:.1f}"
             else:
-                formatted_value = f"{value:,.0f}"
+                formatted_value = f"{value_num:,.0f}"
             
-            if pd.notna(yoy):
-                yoy_color = "#00D09C" if yoy >= 0 else "#FF6B6B"
-                yoy_arrow = "&#9650;" if yoy >= 0 else "&#9660;"
-                yoy_str = f'<span style="color: {yoy_color};">{yoy_arrow} {abs(yoy):.1f}% YoY</span>'
+            if pd.notna(yoy_num):
+                yoy_color = "#00D09C" if yoy_num >= 0 else "#FF6B6B"
+                yoy_arrow = "&#9650;" if yoy_num >= 0 else "&#9660;"
+                yoy_str = f'<span style="color: {yoy_color};">{yoy_arrow} {abs(yoy_num):.1f}% YoY</span>'
+            elif pd.notna(yoy):
+                yoy_str = f'<span style="color: #718096;">{yoy}</span>'
             else:
                 yoy_str = '<span style="color: #718096;">N/A</span>'
             
@@ -1611,7 +1618,56 @@ def render_analytics_tab():
                         else:  # F
                             color = "red"
                         st.markdown(f"#### Current Grade: :{color}[{current_grade}]")
-                        st.caption(f"Based on Velocity (DOM) & Absorption (MSI) as of {period}")
+                        st.caption(f"Market Grade v2 as of {period}")
+                        grade_desc = {
+                            "A": "Strong Seller: very tight supply and fast absorption.",
+                            "B": "Seller: seller-leaning with healthy demand.",
+                            "C": "Balanced: demand and supply are relatively balanced.",
+                            "D": "Buyer: buyers have leverage as demand softens.",
+                            "F": "Strong Buyer: high supply and slow absorption favor buyers."
+                        }
+                        grade_letter = grade_str.strip()[0] if grade_str else ""
+                        if grade_letter in grade_desc:
+                            st.caption(grade_desc[grade_letter])
+                        st.caption("Legend: A=Strong Seller, B=Seller, C=Balanced, D=Buyer, F=Strong Buyer")
+                        if "Market Grade Score" in last_row and pd.notna(last_row.get("Market Grade Score")):
+                            st.caption(f"Market Grade Score: {float(last_row.get('Market Grade Score')):.1f}/100")
+                        if "Market Grade Formula" in last_row and pd.notna(last_row.get("Market Grade Formula")):
+                            st.caption(str(last_row.get("Market Grade Formula")))
+
+                        def _fmt_pct(v):
+                            return "N/A" if pd.isna(v) else f"{float(v):.1f}%"
+
+                        def _fmt_num(v):
+                            return "N/A" if pd.isna(v) else f"{float(v):.1f}"
+
+                        component_bits = []
+                        if "Pace Score" in last_row:
+                            component_bits.append(f"Pace {_fmt_num(last_row.get('Pace Score'))}")
+                        if "Supply Pressure Score" in last_row:
+                            component_bits.append(f"Supply {_fmt_num(last_row.get('Supply Pressure Score'))}")
+                        if "Pricing Power Score" in last_row:
+                            component_bits.append(f"Pricing {_fmt_num(last_row.get('Pricing Power Score'))}")
+                        if "Demand Quality Score" in last_row:
+                            component_bits.append(f"Demand {_fmt_num(last_row.get('Demand Quality Score'))}")
+                        if component_bits:
+                            st.caption("Component Scores (0-100): " + " | ".join(component_bits))
+
+                        raw_bits = []
+                        if "Months Supply" in last_row:
+                            raw_bits.append(f"MSI {_fmt_num(last_row.get('Months Supply'))}")
+                        if "Median DOM" in last_row:
+                            raw_bits.append(f"DOM {_fmt_num(last_row.get('Median DOM'))}")
+                        if "Pending-to-Sold" in last_row:
+                            raw_bits.append(f"Pending/Sold {_fmt_num(last_row.get('Pending-to-Sold'))}")
+                        if "Active Inventory YoY %" in last_row:
+                            raw_bits.append(f"Inventory YoY {_fmt_pct(last_row.get('Active Inventory YoY %'))}")
+                        if "Listing Discount" in last_row:
+                            raw_bits.append(f"Median Discount {_fmt_pct(last_row.get('Listing Discount'))}")
+                        if "Cash Sales %" in last_row:
+                            raw_bits.append(f"Cash Sales {_fmt_pct(last_row.get('Cash Sales %'))}")
+                        if raw_bits:
+                            st.caption("Inputs: " + " | ".join(raw_bits))
                         st.markdown("""</div>""", unsafe_allow_html=True)
             
             # =============================================

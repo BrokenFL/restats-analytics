@@ -6,6 +6,8 @@ import os
 import csv
 import chardet
 from datetime import datetime, timedelta
+from property_type_utils import canonical_property_type_series
+from geo_zone_utils import classify_palm_beach_zone
 
 # --- 1. SETUP & CONFIGURATION ---
 
@@ -84,16 +86,8 @@ data_dictionary = {
     "geo_zone": {"original_name": "geo_zone", "data_type": "string"}
 }
 
-# Geo Zone Definitions (latitude-based)
-GEO_ZONES = {
-    "South End": {
-        "city": "Palm Beach",
-        "lat_max": 26.646906,  # North boundary - south of this latitude
-        "lat_min": 26.594029,  # South boundary - north of this latitude
-        "lon_min": None,
-        "lon_max": None
-    }
-}
+# Geo zoning is centralized in geo_zone_utils.classify_palm_beach_zone
+# and applied only for Palm Beach records.
 
 # --- 2. HELPER FUNCTIONS ---
 
@@ -156,6 +150,7 @@ def normalize_subdivision_name(name):
     for key, val in replacements.items():
         if name.endswith(f" {key}"):
             name = name.replace(f" {key}", f" {val}")
+
     return name
 
 def apply_global_pcn_grouping(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,6 +266,10 @@ def _process_chunk(df_chunk, lookup_dict):
         else:
             df[norm_name] = df[norm_name].astype(str).str.strip()
 
+    # Canonicalize property_type to keep dashboard categories stable across sources.
+    if 'property_type' in df.columns:
+        df['property_type'] = canonical_property_type_series(df['property_type'])
+
     # Apply Timeline Logic
     logic_results = df.apply(calculate_timeline_logic, axis=1)
     df = pd.concat([df, logic_results], axis=1)
@@ -385,18 +384,19 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
         except Exception as e:
             logger.error(f"Grouping error: {e}")
 
-        # Apply geo zones
+        # Apply geo zones (Palm Beach landmark bands)
         try:
-            final_merged['geo_zone'] = None
-            for zone_name, zone_def in GEO_ZONES.items():
-                mask = pd.Series([True] * len(final_merged))
-                if zone_def.get('city'):
-                    mask &= (final_merged['city'] == zone_def['city'])
-                if zone_def.get('lat_max') is not None and 'geo_lat' in final_merged.columns:
-                    mask &= (final_merged['geo_lat'].notna()) & (final_merged['geo_lat'] <= zone_def['lat_max'])
-                if zone_def.get('lat_min') is not None and 'geo_lat' in final_merged.columns:
-                    mask &= (final_merged['geo_lat'].notna()) & (final_merged['geo_lat'] >= zone_def['lat_min'])
-                final_merged.loc[mask, 'geo_zone'] = zone_name
+            if 'geo_lat' in final_merged.columns and 'city' in final_merged.columns:
+                final_merged['geo_zone'] = final_merged.apply(
+                    lambda r: classify_palm_beach_zone(
+                        r.get('geo_lat'),
+                        r.get('city'),
+                        short_address=r.get('short_address'),
+                    ),
+                    axis=1
+                )
+            else:
+                final_merged['geo_zone'] = None
             logger.info("Applied geo zones.")
         except Exception as e:
             logger.error(f"Geo zone error: {e}")

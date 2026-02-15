@@ -35,7 +35,7 @@ def is_cabana_address(addr):
     """Check if address looks like a cabana/parking/storage."""
     addr = addr.upper()
     # Keep this strict so normal condo units like C3034 are not treated as cabanas.
-    has_c = bool(re.search(r'\bC(?:\s|-)?\d{1,3}\b', addr))
+    has_c = bool(re.search(r'\bC(?:\s|-)?\d{1,3}[A-Z]?\b', addr))
     has_cs = bool(re.search(r'\bCS\d{1,3}\b', addr))  # CS4 = Cabana South 4
     has_zero_unit = re.search(r' 0\d{2,3}$', addr)  # Unit like 0120, 0050
     has_stg = 'STG' in addr or ' PK ' in addr or 'STORAGE' in addr or 'PARKING' in addr
@@ -124,7 +124,8 @@ def find_cabana_pairs():
             cab_date = parse_date(cab['date'])
             if not cab_date:
                 continue
-            
+            best_match = None
+            best_rank = None
             for condo in condos:
                 condo_date = parse_date(condo['date'])
                 if not condo_date:
@@ -140,7 +141,16 @@ def find_cabana_pairs():
                 price_ratio = cab['price'] / condo['price'] if condo['price'] > 0 else 0
                 
                 if price_match or (price_ratio <= 0.20 and price_ratio > 0):
-                    pairs.append({
+                    # Rank candidates so each cabana merges into the single best condo.
+                    # 1) Same-day first, 2) exact price match first, 3) smaller day gap,
+                    # 4) larger condo price as a tie-breaker.
+                    rank = (
+                        0 if days_diff == 0 else 1,
+                        0 if price_match else 1,
+                        days_diff,
+                        -(condo['price'] or 0),
+                    )
+                    candidate = {
                         'condo_ln': condo['ln'],
                         'condo_addr': condo['addr'],
                         'condo_price': condo['price'],
@@ -150,7 +160,12 @@ def find_cabana_pairs():
                         'sold_date': condo['date'],
                         'days_diff': days_diff,
                         'price_match': price_match
-                    })
+                    }
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best_match = candidate
+            if best_match:
+                pairs.append(best_match)
     
     conn.close()
     return pairs
@@ -203,6 +218,77 @@ def merge_cabana_pairs(pairs, dry_run=True):
     
     return merged
 
+def cleanup_orphan_cabana_duplicates(dry_run=True):
+    """
+    Remove leftover cabana rows when a merged main row already exists.
+
+    Pattern removed:
+    - same building
+    - same sold_date (date portion)
+    - same sold_price
+    - one row already contains '& Cabana' in short_address (keeper)
+    - the other row is a likely cabana row (delete candidate)
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT listing_number, short_address, sold_date, sold_price, total_bedrooms, sqft_living
+        FROM listing_details
+        WHERE sold_price IS NOT NULL
+          AND sold_price > 10000
+          AND sold_date IS NOT NULL
+        ORDER BY sold_date, short_address
+    """)
+    records = cursor.fetchall()
+
+    rows = []
+    for ln, addr, sold_date, price, beds, sqft in records:
+        rows.append({
+            'ln': ln,
+            'addr': addr or "",
+            'date': str(sold_date)[:10] if sold_date else None,
+            'price': float(price or 0),
+            'beds': beds,
+            'sqft': sqft,
+            'building': get_building(addr or ""),
+        })
+
+    by_signature = {}
+    for r in rows:
+        if not r['date']:
+            continue
+        key = (r['building'], r['date'], round(r['price'], 2))
+        by_signature.setdefault(key, []).append(r)
+
+    to_delete = set()
+    for (_bldg, _date, _price), group in by_signature.items():
+        main_rows = [g for g in group if "& CABANA" in g['addr'].upper()]
+        if not main_rows:
+            continue
+        for g in group:
+            if "& CABANA" in g['addr'].upper():
+                continue
+            # Restrict deletes to PBC imports to avoid removing MLS records.
+            if not str(g['ln']).startswith("PBC-"):
+                continue
+            if is_likely_cabana(g):
+                to_delete.add(g['ln'])
+
+    deleted = 0
+    candidate_count = len(to_delete)
+    if to_delete:
+        print(f"\n🧹 Orphan cabana cleanup candidates: {len(to_delete)}")
+        for ln in sorted(to_delete):
+            print(f"  Removing orphan cabana row: {ln}")
+            if not dry_run:
+                cursor.execute("DELETE FROM listing_details WHERE listing_number = ?", (ln,))
+                deleted += 1
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+    return candidate_count if dry_run else deleted
+
 def check_beds_baths():
     """Check how many PBC records have beds/baths populated."""
     conn = sqlite3.connect(DB_FILE)
@@ -239,14 +325,21 @@ if __name__ == "__main__":
     pairs = find_cabana_pairs()
     print(f"Found {len(pairs)} pairs to merge\n")
     
-    if pairs:
-        if "--merge" in sys.argv:
+    if "--merge" in sys.argv:
+        if pairs:
             print("MERGING cabana+condo pairs:")
             merged = merge_cabana_pairs(pairs, dry_run=False)
             print(f"\nMerged {merged} pairs!")
-        else:
+        cleaned = cleanup_orphan_cabana_duplicates(dry_run=False)
+        if not pairs:
+            print("No fresh pairs found.")
+        print(f"Cleaned {cleaned} orphan cabana duplicates.")
+    else:
+        if pairs:
             print("DRY RUN - Preview of merges:")
             merge_cabana_pairs(pairs, dry_run=True)
-            print("\nTo actually merge, run with --merge flag")
+        cleaned_preview = cleanup_orphan_cabana_duplicates(dry_run=True)
+        print(f"Preview orphan cabana duplicates to remove: {cleaned_preview}")
+        print("\nTo actually merge/clean, run with --merge flag")
     
     check_beds_baths()

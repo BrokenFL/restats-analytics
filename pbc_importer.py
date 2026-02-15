@@ -8,22 +8,11 @@ import sqlite3
 import pandas as pd
 import os
 from datetime import datetime, timedelta
+from property_type_utils import canonical_property_type
+from geo_zone_utils import classify_palm_beach_zone
 
 # Configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
-
-# Geo Zone definitions (same as in data_cleaning.py)
-GEO_ZONES = {
-    'Palm Beach - South End': {
-        'city': 'Palm Beach',
-        'lat_max': 26.705  # South of Worth Ave area
-    },
-    'Palm Beach - North End': {
-        'city': 'Palm Beach',
-        'lat_min': 26.705
-    }
-}
-
 
 def get_existing_sales():
     """Load existing parcel_id + sold_date from database for duplicate checking."""
@@ -65,23 +54,48 @@ def is_duplicate(parcel_id, sale_date_str, existing_sales, days_threshold=7):
     return False
 
 
-def determine_geo_zone(lat, lon, city):
-    """Determine geo zone based on lat/lon coordinates. Only tags South End."""
-    if not lat or not lon:
+def normalize_sale_date(raw_date):
+    """
+    Normalize sale date to YYYY-MM-DD.
+    Accepts common formats used by exports and recorder flows.
+    """
+    if raw_date is None:
         return None
-    
+    s = str(raw_date).strip()
+    if not s or s.lower() == "nan":
+        return None
+
+    candidates = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")
+    for fmt in candidates:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def build_pbc_listing_number(parcel_number, sale_date_yyyy_mm_dd):
+    """Build stable off-market identity key: PBC-<parcel>-<yyyymmdd>."""
+    date_suffix = sale_date_yyyy_mm_dd.replace("-", "")
+    return f"PBC-{parcel_number}-{date_suffix}"
+
+
+def determine_geo_zone(lat, lon, city, short_address=None):
+    """Determine Palm Beach geo zone for PBC imports using shared landmark bands."""
+    if lat is None:
+        return None
     try:
         lat = float(lat)
-        lon = float(lon)
-    except:
+    except Exception:
         return None
-    
-    # Only tag South End (lat < 26.705), leave North End as NULL
-    if city.upper() == 'PALM BEACH':
-        if lat < 26.705:
-            return 'South End'
-    
-    return None
+    return classify_palm_beach_zone(lat, city, short_address=short_address)
 
 
 def clean_price(price_str):
@@ -143,7 +157,45 @@ def import_pbc_data(csv_path, dry_run=False):
     
     # Read CSV
     df = pd.read_csv(csv_path)
-    print(f"✓ Read {len(df)} records from CSV\n")
+    print(f"✓ Read {len(df)} records from CSV")
+
+    # Fast pre-filter pass before expensive row mapping:
+    # 1) missing parcel/date,
+    # 2) duplicate parcel+date rows inside CSV,
+    # 3) duplicates already present in DB (±7 day window).
+    prefiltered_rows = []
+    seen_row_keys = set()
+    skipped_missing_key = 0
+    skipped_csv_dupes = 0
+    skipped_db_dupes = 0
+
+    for idx, row in df.iterrows():
+        parcel_number = str(row.get('Parcel Number', '')).replace('-', '').strip()
+        sale_date_raw = row.get('Sale Date', '')
+        sale_date = normalize_sale_date(sale_date_raw)
+        if not parcel_number or not sale_date:
+            skipped_missing_key += 1
+            continue
+
+        row_key = (parcel_number, sale_date)
+        if row_key in seen_row_keys:
+            skipped_csv_dupes += 1
+            continue
+        seen_row_keys.add(row_key)
+
+        if is_duplicate(parcel_number, sale_date, existing_sales):
+            skipped_db_dupes += 1
+            continue
+
+        prefiltered_rows.append((idx, row, parcel_number, sale_date))
+
+    print(
+        "✓ Pre-filter summary: "
+        f"to_import={len(prefiltered_rows)} | "
+        f"skipped_missing_key={skipped_missing_key} | "
+        f"skipped_csv_dupes={skipped_csv_dupes} | "
+        f"skipped_db_dupes={skipped_db_dupes}\n"
+    )
     
     # Connect to database
     conn = sqlite3.connect(DB_FILE)
@@ -153,23 +205,10 @@ def import_pbc_data(csv_path, dry_run=False):
     skipped = 0
     errors = 0
     
-    for idx, row in df.iterrows():
+    for idx, row, parcel_number, sale_date in prefiltered_rows:
         try:
             # Get parcel ID (full PCN)
-            parcel_number = str(row.get('Parcel Number', '')).replace('-', '').strip()
-            sale_date = str(row.get('Sale Date', '')).strip()
             address = row.get('Location', '')
-            
-            if not parcel_number:
-                print(f"  Skipping row {idx}: No parcel number")
-                skipped += 1
-                continue
-            
-            # Check for duplicate
-            if is_duplicate(parcel_number, sale_date, existing_sales):
-                print(f"  Skipping {parcel_number} ({address}) - duplicate in database")
-                skipped += 1
-                continue
             
             # Skip low-value transfer deeds (< $10,000)
             sale_price = clean_price(row.get('Sale Price'))
@@ -178,8 +217,8 @@ def import_pbc_data(csv_path, dry_run=False):
                 skipped += 1
                 continue
             
-            # Generate unique listing number for off-market sales
-            listing_number = f"PBC-{parcel_number}"
+            # Generate stable off-market listing identity (preserves repeat sales across time)
+            listing_number = build_pbc_listing_number(parcel_number, sale_date)
             
             # Map fields
             record = {
@@ -197,7 +236,7 @@ def import_pbc_data(csv_path, dry_run=False):
                 'state_province': 'FL',
                 'subdivision': row.get('Subdivision') if row.get('Subdivision') != 'N/A' else None,
                 'final_subdivision': row.get('Subdivision') if row.get('Subdivision') != 'N/A' else None,
-                'property_type': row.get('Property_Type') if row.get('Property_Type') != 'N/A' else None,
+                'property_type': canonical_property_type(row.get('Property_Type')),
                 'total_bedrooms': clean_int(row.get('Bed_Rooms')),
                 'baths_full': clean_numeric(row.get('Full_Baths')),
                 'baths_half': clean_numeric(row.get('Half_Baths')),
@@ -214,7 +253,8 @@ def import_pbc_data(csv_path, dry_run=False):
             record['geo_zone'] = determine_geo_zone(
                 record['geo_lat'], 
                 record['geo_lon'], 
-                record['city']
+                record['city'],
+                short_address=record.get('short_address'),
             )
             
             # Calculate baths_total
@@ -234,6 +274,8 @@ def import_pbc_data(csv_path, dry_run=False):
                 
                 cursor.execute(sql, list(record.values()))
                 imported += 1
+                # Update in-memory duplicate map so same-run duplicates are also blocked.
+                existing_sales.setdefault(parcel_number, []).append(sale_date)
                 
                 if imported % 50 == 0:
                     print(f"  Imported {imported} records...")
@@ -273,7 +315,11 @@ def import_pbc_data(csv_path, dry_run=False):
     print("IMPORT COMPLETE")
     print(f"{'='*60}")
     print(f"  Imported: {imported}")
-    print(f"  Skipped (duplicates): {skipped}")
+    print(f"  Skipped (duplicates/keys): {skipped + skipped_missing_key + skipped_csv_dupes + skipped_db_dupes}")
+    print(
+        f"    Details => in-loop skipped: {skipped}, "
+        f"missing key: {skipped_missing_key}, csv dupes: {skipped_csv_dupes}, db dupes: {skipped_db_dupes}"
+    )
     print(f"  Errors: {errors}")
     print(f"{'='*60}\n")
     

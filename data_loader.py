@@ -156,6 +156,19 @@ class DataLoader:
         """
         try:
             self.conn.execute(create_sql)
+            # Guardrail/performance indexes for duplicate checks and forensic audits.
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listing_details_parcel_sold_date "
+                "ON listing_details(parcel_id, sold_date);"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listing_details_listing_number "
+                "ON listing_details(listing_number);"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listing_details_pcn10_sold_date "
+                "ON listing_details(pcn_10_digit, sold_date);"
+            )
         except Exception as e:
             logger.error(f"Error creating schema: {e}")
 

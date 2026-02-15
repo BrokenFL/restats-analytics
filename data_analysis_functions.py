@@ -62,6 +62,21 @@ def _empty_stat_shell(freq, start, end, col):
         col: pd.NA
     })
 
+
+def _active_snapshot_mask(df, snapshot_date):
+    """
+    Active-at-snapshot mask with protection against bad NULL end-dates.
+    - If effective_active_end_date > snapshot -> include.
+    - If effective_active_end_date is NULL, include only if status is active-ish.
+    """
+    activeish = df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().isin(
+        ["A", "ACTIVE", "ACT", "COMING SOON", "CS"]
+    )
+    return (df["listing_date"] <= snapshot_date) & (
+        (df["effective_active_end_date"] > snapshot_date)
+        | (df["effective_active_end_date"].isna() & activeish)
+    )
+
 # ================================================================
 # CORE METRIC FUNCTIONS
 # ================================================================
@@ -109,10 +124,7 @@ def median_list_price(df, freq, start, end):
         snapshot_date = period.to_timestamp(how='end')
         
         # Identify Active Listings at snapshot date
-        active_mask = (df["listing_date"] <= snapshot_date) & (
-            (df["effective_active_end_date"].isna()) | 
-            (df["effective_active_end_date"] > snapshot_date)
-        )
+        active_mask = _active_snapshot_mask(df, snapshot_date)
         
         # Calculate Median of those active listings
         active_prices = df.loc[active_mask, "list_price"]
@@ -142,10 +154,7 @@ def median_list_price_per_sqft(df, freq, start, end):
         snapshot_date = period.to_timestamp(how='end')
         
         # Identify Active Listings at snapshot date
-        active_mask = (df["listing_date"] <= snapshot_date) & (
-            (df["effective_active_end_date"].isna()) | 
-            (df["effective_active_end_date"] > snapshot_date)
-        )
+        active_mask = _active_snapshot_mask(df, snapshot_date)
         
         # Calculate Median of those active listings
         active_ppsf = df.loc[active_mask, "ListPPSF"]
@@ -219,10 +228,7 @@ def active_inventory(df, freq, start, end):
     for period in period_idx:
         # Snapshot is END of period
         snapshot_date = period.to_timestamp(how='end')
-        mask = (df["listing_date"] <= snapshot_date) & (
-            (df["effective_active_end_date"].isna()) | 
-            (df["effective_active_end_date"] > snapshot_date)
-        )
+        mask = _active_snapshot_mask(df, snapshot_date)
         out.append([period, mask.sum()])
     return pd.DataFrame(out, columns=["PeriodIndex", "Active Inventory"])
 
@@ -394,10 +400,7 @@ def months_supply(df, freq, start, end):
         
         # 1. Active Count (Snapshot at End of Period)
         # We use the end of the period for consistent "projected" inventory
-        active_mask = (df["listing_date"] <= snapshot_date) & (
-            (df["effective_active_end_date"].isna()) | 
-            (df["effective_active_end_date"] > snapshot_date)
-        )
+        active_mask = _active_snapshot_mask(df, snapshot_date)
         active_count = active_mask.sum()
         
         # 2. Sales Rate (Last 12 Months of ACTUAL Data)
@@ -426,52 +429,238 @@ def months_supply(df, freq, start, end):
         
     return pd.DataFrame(out, columns=["PeriodIndex", "Months Supply"])
 
-# --- NEW: PROPRIETARY MARKET GRADE (Strategic Report 4.1) ---
+def _clamp_score(v):
+    if pd.isna(v):
+        return np.nan
+    return float(max(0, min(100, v)))
+
+
+def _score_dom(dom):
+    if pd.isna(dom):
+        return np.nan
+    if dom <= 30:
+        return 100
+    if dom <= 45:
+        return 85
+    if dom <= 60:
+        return 70
+    if dom <= 90:
+        return 50
+    if dom <= 120:
+        return 30
+    return 15
+
+
+def _score_pending_to_sold(p2s):
+    if pd.isna(p2s):
+        return np.nan
+    if p2s >= 1.20:
+        return 100
+    if p2s >= 1.00:
+        return 85
+    if p2s >= 0.80:
+        return 70
+    if p2s >= 0.60:
+        return 50
+    if p2s >= 0.40:
+        return 30
+    return 15
+
+
+def _score_msi(msi):
+    if pd.isna(msi):
+        return np.nan
+    if msi <= 2.0:
+        return 100
+    if msi <= 3.0:
+        return 90
+    if msi <= 4.0:
+        return 75
+    if msi <= 5.5:
+        return 60
+    if msi <= 7.0:
+        return 40
+    if msi <= 9.0:
+        return 25
+    return 10
+
+
+def _score_inventory_yoy(inv_yoy):
+    if pd.isna(inv_yoy):
+        return np.nan
+    # Lower inventory growth is hotter market; negative is strongest.
+    if inv_yoy <= -15:
+        return 100
+    if inv_yoy <= -5:
+        return 85
+    if inv_yoy <= 5:
+        return 65
+    if inv_yoy <= 15:
+        return 45
+    if inv_yoy <= 30:
+        return 25
+    return 10
+
+
+def _score_discount(discount):
+    if pd.isna(discount):
+        return np.nan
+    # Lower discount = stronger seller pricing power.
+    if discount <= 0:
+        return 100
+    if discount <= 2:
+        return 85
+    if discount <= 4:
+        return 70
+    if discount <= 6:
+        return 55
+    if discount <= 8:
+        return 40
+    if discount <= 10:
+        return 25
+    return 10
+
+
+def _score_cash(cash):
+    if pd.isna(cash):
+        return np.nan
+    if cash >= 55:
+        return 100
+    if cash >= 45:
+        return 85
+    if cash >= 35:
+        return 70
+    if cash >= 25:
+        return 55
+    if cash >= 15:
+        return 40
+    return 25
+
+
+def _grade_from_score(score):
+    if pd.isna(score):
+        return pd.NA
+    if score >= 80:
+        return "A (Strong Seller)"
+    if score >= 65:
+        return "B (Seller)"
+    if score >= 45:
+        return "C (Balanced)"
+    if score >= 30:
+        return "D (Buyer)"
+    return "F (Strong Buyer)"
+
+
+def _weighted_average(values_and_weights):
+    num = 0.0
+    den = 0.0
+    for v, w in values_and_weights:
+        if pd.notna(v):
+            num += float(v) * float(w)
+            den += float(w)
+    if den == 0:
+        return np.nan
+    return num / den
+
+
+# --- PROPRIETARY MARKET GRADE V2 ---
 def market_grade_score(df, freq, start, end):
     """
-    Synthesizes MSI and DOM into a proprietary 'Market Grade' (A-F).
-    A (Seller's Market): High Demand (Low DOM), Low Supply (Low MSI).
-    F (Buyer's Market): Low Demand (High DOM), High Supply (High MSI).
+    Weighted market barometer (0-100) with explainable components:
+      - Pace (30%): DOM + Pending/Sold
+      - Supply Pressure (30%): MSI + Active Inventory YoY
+      - Pricing Power (25%): Median Listing Discount
+      - Demand Quality (15%): Cash Sales %
     """
-    # 1. Calculate underlying metrics
+    period_idx = get_period_range(start, end, freq)
+
     msi_df = months_supply(df, freq, start, end)
     dom_df = median_dom(df, freq, start, end)
-    
-    if msi_df.empty or dom_df.empty:
-        return _empty_stat_shell(freq, start, end, "Market Grade")
+    pending_df = pending_sales(df, freq, start, end)
+    sales_df = sales_count(df, freq, start, end)
+    inventory_df = active_inventory(df, freq, start, end)
+    discount_df = listing_discount(df, freq, start, end)
+    cash_df = cash_sales_percentage(df, freq, start, end)
 
-    # 2. Merge
-    merged = pd.merge(msi_df, dom_df, on="PeriodIndex", how="inner")
-    
-    def _assign_grade(row):
-        msi = row["Months Supply"]
-        dom = row["Median DOM"]
-        
-        if pd.isna(msi) or pd.isna(dom): return pd.NA
-        
-        # Scoring Logic (Weighted)
-        # MSI < 3 is hot, > 6 is cold
-        # DOM < 30 is hot, > 90 is cold
-        
-        score = 0
-        if msi < 3: score += 4
-        elif msi < 5: score += 3
-        elif msi < 7: score += 2
-        else: score += 1
-        
-        if dom < 30: score += 4
-        elif dom < 60: score += 3
-        elif dom < 90: score += 2
-        else: score += 1
-        
-        # 2-8 Scale
-        if score >= 7: return "A (Strong Seller)"
-        if score >= 6: return "B (Seller)"
-        if score >= 4: return "C (Balanced)"
-        if score >= 3: return "D (Buyer)"
-        return "F (Strong Buyer)"
+    merged = pd.DataFrame({"PeriodIndex": period_idx})
+    for x in [msi_df, dom_df, pending_df, sales_df, inventory_df, discount_df, cash_df]:
+        merged = merged.merge(x, on="PeriodIndex", how="left")
 
-    merged["Market Grade"] = merged.apply(_assign_grade, axis=1)
-    
-    # We only return the Grade column
-    return merged[["PeriodIndex", "Market Grade"]]
+    prior_map = dict(zip(merged["PeriodIndex"], merged["Active Inventory"]))
+
+    def _prior_period(p):
+        if freq == "monthly":
+            return p - 12
+        if freq == "quarterly":
+            return p - 4
+        return p - 1
+
+    # Core component inputs
+    merged["Pending-to-Sold"] = merged["Pending Sales"] / merged["Sales Count"]
+    merged.loc[merged["Sales Count"].fillna(0) <= 0, "Pending-to-Sold"] = np.nan
+
+    merged["Active Inventory YoY %"] = merged["PeriodIndex"].apply(
+        lambda p: np.nan
+        if pd.isna(prior_map.get(_prior_period(p), np.nan)) or prior_map.get(_prior_period(p), 0) == 0
+        else ((prior_map.get(p, np.nan) - prior_map.get(_prior_period(p), np.nan)) / prior_map.get(_prior_period(p), np.nan)) * 100
+    )
+
+    # Subscores
+    merged["DOM Score"] = merged["Median DOM"].apply(_score_dom).apply(_clamp_score)
+    merged["P2S Score"] = merged["Pending-to-Sold"].apply(_score_pending_to_sold).apply(_clamp_score)
+    merged["MSI Score"] = merged["Months Supply"].apply(_score_msi).apply(_clamp_score)
+    merged["Inventory YoY Score"] = merged["Active Inventory YoY %"].apply(_score_inventory_yoy).apply(_clamp_score)
+    merged["Discount Score"] = merged["Listing Discount"].apply(_score_discount).apply(_clamp_score)
+    merged["Cash Score"] = merged["Cash Sales %"].apply(_score_cash).apply(_clamp_score)
+
+    # Pillars
+    merged["Pace Score"] = merged.apply(
+        lambda r: _clamp_score(_weighted_average([(r.get("DOM Score"), 0.70), (r.get("P2S Score"), 0.30)])),
+        axis=1,
+    )
+    merged["Supply Pressure Score"] = merged.apply(
+        lambda r: _clamp_score(_weighted_average([(r.get("MSI Score"), 0.70), (r.get("Inventory YoY Score"), 0.30)])),
+        axis=1,
+    )
+    merged["Pricing Power Score"] = merged["Discount Score"].apply(_clamp_score)
+    merged["Demand Quality Score"] = merged["Cash Score"].apply(_clamp_score)
+
+    # Final weighted grade score
+    merged["Market Grade Score"] = merged.apply(
+        lambda r: _clamp_score(
+            _weighted_average(
+                [
+                    (r.get("Pace Score"), 0.30),
+                    (r.get("Supply Pressure Score"), 0.30),
+                    (r.get("Pricing Power Score"), 0.25),
+                    (r.get("Demand Quality Score"), 0.15),
+                ]
+            )
+        ),
+        axis=1,
+    )
+
+    merged["Market Grade"] = merged["Market Grade Score"].apply(_grade_from_score)
+    merged["Market Grade Formula"] = (
+        "Score = 0.30*Pace + 0.30*Supply + 0.25*Pricing + 0.15*Demand; "
+        "Pace=0.70*DOM+0.30*Pending/Sold; Supply=0.70*MSI+0.30*InventoryYoY"
+    )
+
+    return merged[
+        [
+            "PeriodIndex",
+            "Market Grade",
+            "Market Grade Score",
+            "Pace Score",
+            "Supply Pressure Score",
+            "Pricing Power Score",
+            "Demand Quality Score",
+            "Months Supply",
+            "Median DOM",
+            "Pending-to-Sold",
+            "Active Inventory YoY %",
+            "Listing Discount",
+            "Cash Sales %",
+            "Market Grade Formula",
+        ]
+    ]

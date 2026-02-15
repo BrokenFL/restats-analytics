@@ -635,70 +635,103 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
             
             # Load existing sales from database to skip duplicates
             existing_sales = get_existing_sales_from_db()
+
+            def is_existing_duplicate(clean_pcn_val, sale_date):
+                """Check if parcel+date already exists in DB (fuzzy ±7 days)."""
+                if not clean_pcn_val or not sale_date:
+                    return False
+                if clean_pcn_val not in existing_sales:
+                    return False
+                try:
+                    pbc_date = datetime.strptime(sale_date, "%Y-%m-%d")
+                    for db_date_str in existing_sales[clean_pcn_val]:
+                        db_date = datetime.strptime(db_date_str, "%Y-%m-%d")
+                        if abs((pbc_date - db_date).days) <= 7:
+                            return True
+                except Exception:
+                    return False
+                return False
+
+            # Pre-filter the downloaded CSV before expensive detail scraping/geocoding:
+            # 1) remove rows without parcel,
+            # 2) remove duplicate parcel+sale-date rows inside the same CSV,
+            # 3) remove rows already in database.
+            all_rows = list(reader)
+            prefiltered_rows = []
+            seen_row_keys = set()
+            skipped_no_pcn = 0
+            skipped_in_csv_dupes = 0
+            skipped_in_db = 0
+
+            for row in all_rows:
+                pcn = row.get('Parcel Number')
+                if not pcn:
+                    keys = [k for k in row.keys() if 'Parcel' in k]
+                    if keys:
+                        pcn = row[keys[0]]
+                if not pcn:
+                    skipped_no_pcn += 1
+                    continue
+
+                sale_date = row.get('Sale Date', '').strip()
+                clean_pcn_val = clean_pcn(pcn)
+                row_key = (clean_pcn_val, sale_date)
+                if row_key in seen_row_keys:
+                    skipped_in_csv_dupes += 1
+                    continue
+                seen_row_keys.add(row_key)
+
+                if is_existing_duplicate(clean_pcn_val, sale_date):
+                    skipped_in_db += 1
+                    continue
+
+                row['_clean_pcn'] = clean_pcn_val
+                prefiltered_rows.append(row)
+
+            total_skipped_prefilter = skipped_no_pcn + skipped_in_csv_dupes + skipped_in_db
+            print(
+                f"✓ Pre-filtered CSV rows: total={len(all_rows)} | to_process={len(prefiltered_rows)} | "
+                f"skipped_no_pcn={skipped_no_pcn} | skipped_csv_dupes={skipped_in_csv_dupes} | skipped_in_db={skipped_in_db}"
+            )
             
             count = 0
-            skipped = 0
-            for row in reader:
-                pcn = row.get('Parcel Number')
-                if not pcn: 
-                    keys = [k for k in row.keys() if 'Parcel' in k]
-                    if keys: pcn = row[keys[0]]
-                
-                if pcn:
-                    address = row.get('Location', '').strip()
-                    municipality = row.get('Municipality', '').strip()
-                    sale_date = row.get('Sale Date', '').strip()
-                    
-                    # Check if this PCN + Sale Date already exists in our database
-                    # Use full PCN (parcel_id) for matching - remove dashes
-                    clean_pcn_val = clean_pcn(pcn)  # Full PCN without dashes
-                    
-                    # Check for fuzzy date match (within 7 days)
-                    is_duplicate = False
-                    if clean_pcn_val in existing_sales and sale_date:
-                        try:
-                            pbc_date = datetime.strptime(sale_date, "%Y-%m-%d")
-                            for db_date_str in existing_sales[clean_pcn_val]:
-                                db_date = datetime.strptime(db_date_str, "%Y-%m-%d")
-                                if abs((pbc_date - db_date).days) <= 7:
-                                    is_duplicate = True
-                                    break
-                        except:
-                            pass
-                    
-                    if is_duplicate:
-                        print(f"Skipping {pcn} ({address}) - already in database")
-                        skipped += 1
-                        continue
+            for row in prefiltered_rows:
+                pcn = row.get('Parcel Number') or row.get('_clean_pcn')
+                address = row.get('Location', '').strip()
+                municipality = row.get('Municipality', '').strip()
 
-                    print(f"Processing {pcn} ({address})...", end="", flush=True)
-                    
-                    try:
-                        # 1. Scrape PBC Page
-                        extra_data = scrape_property_details(driver, pcn)
-                        
-                        # 2. Geocode Address (ArcGIS primary, OSM fallback)
-                        lat, lon = get_lat_long_arcgis(address, municipality)
-                        if not lat or not lon:
-                            lat, lon = get_lat_long_osm(address, municipality)
-                        extra_data['Latitude'] = lat
-                        extra_data['Longitude'] = lon
+                print(f"Processing {pcn} ({address})...", end="", flush=True)
 
-                        # 3. Combine All Data
-                        full_row = {**row, **extra_data}
-                        writer.writerow(full_row)
-                        print(f" Done. (Lat: {lat}, Lon: {lon})")
-                        
-                    except Exception as e:
-                        print(f" Error: {e}")
-                        writer.writerow(row)
-                    
-                    count += 1
-                    time.sleep(1.1) 
-                else:
-                    print("Skipping row (No PCN found)")
+                try:
+                    # 1. Scrape PBC Page
+                    extra_data = scrape_property_details(driver, pcn)
 
-        print(f"\n✓ DONE! Processed {count} new properties, skipped {skipped} already in database.")
+                    # 2. Geocode Address (ArcGIS primary, OSM fallback)
+                    lat, lon = get_lat_long_arcgis(address, municipality)
+                    if not lat or not lon:
+                        lat, lon = get_lat_long_osm(address, municipality)
+                    extra_data['Latitude'] = lat
+                    extra_data['Longitude'] = lon
+
+                    # 3. Combine All Data
+                    row.pop('_clean_pcn', None)
+                    full_row = {**row, **extra_data}
+                    writer.writerow(full_row)
+                    print(f" Done. (Lat: {lat}, Lon: {lon})")
+
+                except Exception as e:
+                    print(f" Error: {e}")
+                    row.pop('_clean_pcn', None)
+                    writer.writerow(row)
+
+                count += 1
+                time.sleep(1.1)
+
+        print(
+            f"\n✓ DONE! Processed {count} new properties, "
+            f"pre-filter skipped {total_skipped_prefilter} "
+            f"(no pcn: {skipped_no_pcn}, csv dupes: {skipped_in_csv_dupes}, in-db: {skipped_in_db})."
+        )
         print(f"  Enhanced spreadsheet saved to:\n  {output_csv_path}")
         
         # Post-process: Combine cabana + condo same-day sales

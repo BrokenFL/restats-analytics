@@ -3,6 +3,7 @@ import sys
 import subprocess
 import time
 import sqlite3
+from datetime import datetime, timedelta
 
 import shutil
 import re
@@ -10,6 +11,43 @@ import glob
 import pandas as pd
 
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
+
+def get_last_mls_status_date_plus_one():
+    """
+    Return MM/DD/YYYY for one day after the latest MLS status-related date in DB.
+    Excludes imported off-market rows (listing_number LIKE 'PBC-%').
+    """
+    db_file = "mls.db"
+    if not os.path.exists(db_file):
+        return None
+
+    sql = """
+    SELECT MAX(dt) FROM (
+        SELECT MAX(DATE(under_contract_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+        UNION ALL
+        SELECT MAX(DATE(sold_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+        UNION ALL
+        SELECT MAX(DATE(expiration_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+        UNION ALL
+        SELECT MAX(DATE(withdrawn_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+        UNION ALL
+        SELECT MAX(DATE(temp_off_market_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+        UNION ALL
+        SELECT MAX(DATE(cancel_date)) AS dt FROM listing_details WHERE listing_number NOT LIKE 'PBC-%'
+    );
+    """
+    try:
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        cur.execute(sql)
+        row = cur.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return None
+        last_dt = datetime.strptime(row[0], "%Y-%m-%d")
+        return (last_dt + timedelta(days=1)).strftime("%m/%d/%Y")
+    except Exception:
+        return None
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -264,6 +302,59 @@ def launch_dashboard():
         print(f"\nAn unexpected error occurred: {e}")
         input("\nPress Enter to continue...")
 
+def launch_react_dashboard():
+    """
+    Launch modern dashboard stack:
+    - FastAPI backend on port 8000
+    - React (Vite) frontend on port 5173
+    Keeps existing Streamlit dashboard untouched.
+    """
+    print("\n--- Launching React Dashboard (API + Frontend) ---")
+    print("Backend:  http://127.0.0.1:8000")
+    print("Frontend: http://127.0.0.1:5173")
+    print("Press Ctrl+C to stop both processes.")
+    time.sleep(1)
+
+    api_proc = None
+    fe_proc = None
+    try:
+        api_cmd = [
+            sys.executable, "-m", "uvicorn",
+            "api.main:app",
+            "--reload",
+            "--port", "8000"
+        ]
+        fe_cmd = ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173"]
+
+        api_proc = subprocess.Popen(api_cmd)
+        fe_proc = subprocess.Popen(fe_cmd, cwd="frontend")
+
+        # Keep this launcher alive while children run.
+        while True:
+            if api_proc.poll() is not None:
+                raise RuntimeError("FastAPI process exited unexpectedly.")
+            if fe_proc.poll() is not None:
+                raise RuntimeError("Frontend process exited unexpectedly.")
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nStopping React dashboard...")
+    except FileNotFoundError as e:
+        print(f"\nMissing command: {e}. Make sure 'npm' and Python deps are installed.")
+        input("\nPress Enter to continue...")
+    except Exception as e:
+        print(f"\nError launching React dashboard: {e}")
+        input("\nPress Enter to continue...")
+    finally:
+        for proc in [fe_proc, api_proc]:
+            if proc and proc.poll() is None:
+                proc.terminate()
+        # small grace period then force kill if needed
+        time.sleep(0.5)
+        for proc in [fe_proc, api_proc]:
+            if proc and proc.poll() is None:
+                proc.kill()
+
 def find_latest_enhanced_csv(created_after=None):
     """
     Find the latest ENHANCED csv in Downloads.
@@ -287,6 +378,85 @@ def find_latest_enhanced_csv(created_after=None):
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
+
+def run_duplicate_audit_summary():
+    """Run duplicate audit summary after auto pipelines."""
+    print("\n🔎 Running duplicate audit summary...")
+    json_path = os.path.join("output", "audits", "latest_audit_summary.json")
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "audit_duplicates.py",
+                "--window-days", "7",
+                "--sample-size", "10",
+                "--json-path", json_path,
+            ],
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Duplicate audit failed: {e}")
+    except Exception as e:
+        print(f"⚠️  Duplicate audit error: {e}")
+
+def run_property_type_normalization():
+    """Normalize property_type into canonical categories."""
+    print("\n🧩 Normalizing property types...")
+    try:
+        subprocess.run([sys.executable, "normalize_property_types.py"], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Property type normalization failed: {e}")
+    except Exception as e:
+        print(f"⚠️  Property type normalization error: {e}")
+
+def run_pbc_geo_zone_audit_and_fix():
+    """Audit and correct Palm Beach geo-zone tagging (North/Mid/Estate/South)."""
+    print("\n🧭 Auditing Palm Beach geo-zone assignments...")
+    report_path = os.path.join("output", "audits", "pbc_geo_zone_audit_latest.csv")
+    try:
+        subprocess.run(
+            [sys.executable, "audit_fix_pbc_geo_zones.py", "--apply", "--report-path", report_path],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  PBC geo-zone audit failed: {e}")
+    except Exception as e:
+        print(f"⚠️  PBC geo-zone audit error: {e}")
+
+def run_subdivision_master_sync():
+    """Sync final_subdivision to master lookup sheet by PCN."""
+    print("\n🗂️  Syncing subdivisions from master lookup...")
+    report_path = os.path.join("output", "audits", "subdivision_master_sync_report.csv")
+    try:
+        subprocess.run(
+            [sys.executable, "sync_subdivisions_from_master.py", "--apply", "--report-path", report_path],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Subdivision master sync failed: {e}")
+    except Exception as e:
+        print(f"⚠️  Subdivision master sync error: {e}")
+
+def run_cross_source_duplicate_cleanup():
+    """Remove PBC rows that duplicate MLS sales."""
+    print("\n🧹 Cleaning cross-source duplicates (PBC vs MLS)...")
+    report_path = os.path.join("output", "audits", "cross_source_duplicate_cleanup.csv")
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "clean_cross_source_duplicates.py",
+                "--window-days", "30",
+                "--apply",
+                "--report-path", report_path,
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Cross-source cleanup failed: {e}")
+    except Exception as e:
+        print(f"⚠️  Cross-source cleanup error: {e}")
+
 def run_off_market_scraper_automation():
     """
     Automated off-market full pipeline:
@@ -296,7 +466,7 @@ def run_off_market_scraper_automation():
     - Run cabana merge in DB
     """
     print("\n--- Off-Market Full Pipeline (Automation Mode) ---")
-    print("City: Palm Beach | Date mode: from last imported PBC sale date")
+    print("City: Palm Beach | Date mode: incremental from last imported PBC sale date (+1 day)")
     started_at = time.time()
     try:
         # Step 1: Scrape + normalize into ENHANCED csv
@@ -330,6 +500,11 @@ def run_off_market_scraper_automation():
             [sys.executable, "merge_cabanas.py", "--merge"],
             check=True
         )
+        run_subdivision_master_sync()
+        run_cross_source_duplicate_cleanup()
+        run_pbc_geo_zone_audit_and_fix()
+        run_property_type_normalization()
+        run_duplicate_audit_summary()
         print("\n✅ Off-market automation pipeline complete.")
     except subprocess.CalledProcessError as e:
         print(f"\nError running off-market automation pipeline: {e}")
@@ -339,14 +514,17 @@ def run_off_market_scraper_automation():
 
 def run_off_market_scraper_custom():
     """
-    Manual off-market pull:
+    Manual off-market full pipeline:
     - User chooses city (Palm Beach default)
     - User can set start/end dates (optional)
+    - Imports newest ENHANCED CSV
+    - Runs cabana merge + geo-zone audit + type normalization + duplicate audit
     """
-    print("\n--- Off-Market Scraper (Custom) ---")
+    print("\n--- Off-Market Full Pipeline (Custom) ---")
     city = input("Enter Municipality (Press Enter for 'Palm Beach'): ").strip() or "Palm Beach"
     start_date = input("Enter Start Date MM/DD/YYYY (optional): ").strip()
     end_date = input("Enter End Date MM/DD/YYYY (optional): ").strip()
+    started_at = time.time()
 
     cmd = [sys.executable, "PalmBeachProrpertyScraper.py", "--city", city, "--non-interactive"]
     if start_date:
@@ -355,9 +533,72 @@ def run_off_market_scraper_custom():
         cmd.extend(["--end-date", end_date])
 
     try:
+        # Step 1: Scrape + normalize into ENHANCED csv
         subprocess.run(cmd, check=True)
+
+        # Step 2: Import newest ENHANCED csv into listing_details
+        enhanced_csv = find_latest_enhanced_csv(created_after=started_at - 120)
+        if not enhanced_csv:
+            print("\n❌ Could not find a newly generated ENHANCED CSV in Downloads.")
+            input("\nPress Enter to continue...")
+            return
+
+        print(f"\n📥 Importing off-market CSV into database:\n{enhanced_csv}")
+        subprocess.run([sys.executable, "pbc_importer.py", enhanced_csv], check=True)
+
+        # Step 3: Merge likely cabana records in DB
+        print("\n🏷️  Running cabana merge on database...")
+        subprocess.run([sys.executable, "merge_cabanas.py", "--merge"], check=True)
+
+        # Step 4+: Cleanup/consistency checks
+        run_subdivision_master_sync()
+        run_cross_source_duplicate_cleanup()
+        run_pbc_geo_zone_audit_and_fix()
+        run_property_type_normalization()
+        run_duplicate_audit_summary()
+        print("\n✅ Off-market custom pipeline complete.")
     except subprocess.CalledProcessError as e:
-        print(f"\nError running off-market scraper: {e}")
+        print(f"\nError running off-market custom pipeline: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+    input("\nPress Enter to continue...")
+
+def run_mls_update_automation():
+    """
+    Automated MLS update pipeline:
+    - Runs Flexmls saved-search export
+    - Optionally updates all relevant status start-date filters
+    - Copies CSV into input_csvs
+    - Runs generate_db.py to clean + upsert
+    """
+    print("\n--- MLS Update (Auto Incremental: export -> ingest -> generate_db) ---")
+    print("Default saved search: PalmBeach_Wellington_NewData")
+    template = "AI Full DataSet"
+    from_date = get_last_mls_status_date_plus_one()
+    if from_date:
+        print(f"Date mode: incremental from last MLS status date (+1 day) => {from_date}")
+    else:
+        print("Date mode: no prior MLS status date found; using existing saved-search date defaults.")
+
+    cmd = [
+        sys.executable,
+        "mls_export_saved_search.py",
+        "--search-name", "PalmBeach_Wellington_NewData",
+        "--export-template", template,
+        "--run-generate-db",
+    ]
+    if from_date:
+        cmd.extend(["--from-date", from_date])
+
+    try:
+        subprocess.run(cmd, check=True)
+        run_subdivision_master_sync()
+        run_cross_source_duplicate_cleanup()
+        run_property_type_normalization()
+        run_duplicate_audit_summary()
+        print("\n✅ MLS update pipeline complete.")
+    except subprocess.CalledProcessError as e:
+        print(f"\nError running MLS update pipeline: {e}")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
     input("\nPress Enter to continue...")
@@ -372,12 +613,14 @@ def main():
         print("2. 📊 Launch Dashboard")
         print("3. 🏘️  Update Subdivisions (Lookup Sheets)")
         print("4. ⚠️  Reset Database & Restore Files")
-        print("5. 🤖 Off-Market Full Run (Auto: scrape -> import -> cabana merge)")
-        print("6. 🧭 Off-Market Pull (Custom city/date range)")
-        print("7. ❌ Exit")
+        print("5. 📥 Update MLS (Auto incremental: export -> generate_db)")
+        print("6. 🤖 Off-Market Full Run (Auto incremental: scrape -> import -> cabana merge)")
+        print("7. 🧭 Off-Market Pull (Custom city/date range)")
+        print("8. ⚛️  Launch React Dashboard (API + frontend)")
+        print("9. ❌ Exit")
         print("========================================")
         
-        choice = input("Enter your choice (1-7): ").strip()
+        choice = input("Enter your choice (1-9): ").strip()
         
         if choice == '1':
             run_data_processing()
@@ -388,10 +631,14 @@ def main():
         elif choice == '4':
             reset_database()
         elif choice == '5':
-            run_off_market_scraper_automation()
+            run_mls_update_automation()
         elif choice == '6':
-            run_off_market_scraper_custom()
+            run_off_market_scraper_automation()
         elif choice == '7':
+            run_off_market_scraper_custom()
+        elif choice == '8':
+            launch_react_dashboard()
+        elif choice == '9':
             print("Goodbye!")
             break
         else:
