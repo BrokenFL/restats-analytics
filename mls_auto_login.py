@@ -10,13 +10,16 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 LOGIN_URL = (
-    "https://beachesmls.mysolidearth.com/authenticate?"
+    os.getenv("MLS_LOGIN_URL")
+    or "https://beachesmls.mysolidearth.com/authenticate?"
     "redirect_to=eyJwYXJhbXMiOnt9LCJuYW1lIjoib2F1dGguYXV0aG9yaXplIiwicXVlcnkiOnsi"
-    "Y2xpZW50X2lkIjoiSUtLUmo1Y1JfNTgtdElSQ3VoalFBNG5qUVAtZEhhYTNlVUZiR0Q2eFRq"
-    "OCIsIm5vbmNlIjoiODY2Mjc4YzY5ZGJhNDE3ZDYzZmRmZjgwNjk3M2Q1YzkiLCJyZWRpcmVj"
-    "dF91cmkiOiJodHRwczovL2ZsLmZsZXhtbHMuY29tL29wZW5pZF9ycC9jYWxsYmFjayIsInJl"
-    "c3BvbnNlX3R5cGUiOiJjb2RlIiwic2NvcGUiOiJlbWFpbCBwcm9maWxlIG9wZW5pZCJ9fQ%3D%3D"
+    "Y2xpZW50X2lkIjoiVHdGMUQ1TVFxbGZDdnVJZzJSazdVTktLNHYzV0xtVy1lTjZ6ZUZicmhf"
+    "YyIsIm5vbmNlIjoiYjVkODMwYmY1YjNiYjBkZmJlYzc1MjljYWIxMjVmMGEiLCJyZWRpcmVj"
+    "dF91cmkiOiJodHRwczovL2Zsci5mbGV4bWxzLmNvbS9vcGVuaWRfcnAvY2FsbGJhY2siLCJy"
+    "ZXNwb25zZV90eXBlIjoiY29kZSIsInNjb3BlIjoiZW1haWwgcHJvZmlsZSBvcGVuaWQifX0%3D"
 )
+LOGIN_HOST_HINTS = ("mysolidearth.com", "authenticate")
+SUCCESS_HOST_HINTS = ("flexmls.com", "apps.flexmls.com")
 
 
 def _first_visible(wait, selectors):
@@ -37,7 +40,7 @@ def _first_clickable(wait, selectors):
     raise TimeoutException(f"No clickable element found for selectors: {selectors}")
 
 
-def login(email, password, headless=False, timeout=30, stay_open_seconds=10):
+def login(username, email, password, headless=False, timeout=30, stay_open_seconds=10):
     options = webdriver.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
@@ -49,15 +52,17 @@ def login(email, password, headless=False, timeout=30, stay_open_seconds=10):
     try:
         driver.get(LOGIN_URL)
 
-        email_input = _first_visible(
+        identity_input = _first_visible(
             wait,
             [
+                (By.NAME, "member_login_id"),
                 (By.NAME, "email"),
+                (By.CSS_SELECTOR, "input[name='member_login_id']"),
                 (By.CSS_SELECTOR, "input[name='email']"),
             ],
         )
-        email_input.clear()
-        email_input.send_keys(email)
+        identity_input.clear()
+        identity_input.send_keys(username or email)
 
         password_input = _first_visible(
             wait,
@@ -92,7 +97,12 @@ def login(email, password, headless=False, timeout=30, stay_open_seconds=10):
         )
         login_button.click()
 
-        wait.until(lambda d: "flexmls.com" in d.current_url and "authenticate" not in d.current_url)
+        wait.until(
+            lambda d: (
+                any(host in d.current_url for host in SUCCESS_HOST_HINTS)
+                and not any(host in d.current_url for host in LOGIN_HOST_HINTS)
+            )
+        )
         print(f"Login successful. Current URL: {driver.current_url}")
 
         if stay_open_seconds > 0:
@@ -109,6 +119,7 @@ def login(email, password, headless=False, timeout=30, stay_open_seconds=10):
 
 def _build_args():
     parser = argparse.ArgumentParser(description="Log into BeachesMLS/Flexmls.")
+    parser.add_argument("--username", default=os.getenv("MLS_USERNAME"), help="MLS member login / username")
     parser.add_argument("--email", default=os.getenv("MLS_EMAIL"), help="MLS account email")
     parser.add_argument("--password", default=os.getenv("MLS_PASSWORD"), help="MLS account password")
     parser.add_argument("--headless", action="store_true", help="Run Chrome in headless mode")
@@ -125,13 +136,15 @@ def _build_args():
 if __name__ == "__main__":
     args = _build_args()
 
+    username = args.username or os.getenv("MLS_EMAIL") or input("MLS username/member id: ").strip()
     email = args.email or input("MLS email: ").strip()
     password = args.password or getpass.getpass("MLS password: ").strip()
 
-    if not email or not password:
-        raise SystemExit("Email and password are required.")
+    if not username or not email or not password:
+        raise SystemExit("Username, email, and password are required.")
 
     login(
+        username=username,
         email=email,
         password=password,
         headless=args.headless,

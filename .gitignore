@@ -40,6 +40,10 @@ processed_archive/
 # Temp files
 *.tmp
 *.bak
+tmp/
+output/
+frontend/tsconfig.tsbuildinfo
+mls.db.iCloud_backup_*
 
 # Secrets
 .env

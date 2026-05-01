@@ -7,10 +7,11 @@ import os
 import base64
 from datetime import datetime
 from data_analysis import analyze_real_estate_data
+from data_analysis_functions import is_active_as_of, is_active_now
 from report_generator import generate_pdf_report
 
 # --- CONFIGURATION ---
-DB_FILE = "mls.db"
+DB_FILE = os.getenv("RESTATS_DB_PATH", "mls.db")
 
 STATS_OPTIONS = [
     "Market Grade", 
@@ -752,15 +753,18 @@ def main():
     # === KPI CARDS ===
     st.divider()
     latest_price = df_filtered[df_filtered['sold_date'] >= '2024-01-01']['sold_price'].median()
-    active_now_mask = (df_filtered['listing_date'].notna()) & \
-                      ((df_filtered['effective_active_end_date'].isna()) | (df_filtered['effective_active_end_date'] > datetime.now()))
-    active_count = active_now_mask.sum()
-    
-    k1, k2, k3, k4 = st.columns(4)
+    df_filtered["listing_date"] = pd.to_datetime(df_filtered["listing_date"], errors="coerce")
+    df_filtered["effective_active_end_date"] = pd.to_datetime(df_filtered["effective_active_end_date"], errors="coerce")
+    snapshot_date = pd.Timestamp(end_date_str)
+    active_count_current = int(is_active_now(df_filtered).sum())
+    active_count_snapshot = int(is_active_as_of(df_filtered, snapshot_date).sum())
+
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Median Price (2024+)", f"${latest_price:,.0f}" if pd.notna(latest_price) else "N/A")
-    k2.metric("Active Listings", f"{active_count}")
-    k3.metric("Records Analyzed", f"{len(df_filtered):,}")
-    k4.metric("Date Range", f"{start_month}/{start_year} - {end_month}/{end_year}")
+    k2.metric("Active Listings (Current)", f"{active_count_current:,}")
+    k3.metric(f"Active Listings (As of {snapshot_date.strftime('%Y-%m-%d')})", f"{active_count_snapshot:,}")
+    k4.metric("Records Analyzed", f"{len(df_filtered):,}")
+    k5.metric("Date Range", f"{start_month}/{start_year} - {end_month}/{end_year}")
     
     st.divider()
 

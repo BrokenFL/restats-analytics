@@ -11,45 +11,11 @@ Matching logic:
 """
 
 import sqlite3
-import re
 from datetime import datetime, timedelta
 
+from cabana_utils import get_building, is_cabana_address, is_excluded_building
+
 DB_FILE = "mls.db"
-EXCLUDED_CABANA_BUILDINGS = {
-    "235 SUNRISE AVENUE",  # Palm Beach Hotel
-    "235 SUNRISE AVE",     # Palm Beach Hotel (abbrev)
-}
-
-def get_building(addr):
-    """Extract building address (number + street name)."""
-    addr = addr.upper()
-    match = re.match(r'^(\d+)\s+([NSEW]?\s*\w+\s+(?:BLVD|AVE|RD|DR|WAY|PL|ROW|LN|CT|CIRCLE))', addr)
-    if match:
-        return f'{match.group(1)} {match.group(2).strip()}'
-    parts = addr.split()
-    if len(parts) >= 3:
-        return ' '.join(parts[:3])
-    return addr
-
-def is_cabana_address(addr):
-    """Check if address looks like a cabana/parking/storage."""
-    addr = addr.upper()
-    # Keep this strict so normal condo units like C3034 are not treated as cabanas.
-    has_c = bool(re.search(r'\bC(?:\s|-)?\d{1,3}[A-Z]?\b', addr))
-    has_cs = bool(re.search(r'\bCS\d{1,3}\b', addr))  # CS4 = Cabana South 4
-    has_zero_unit = re.search(r' 0\d{2,3}$', addr)  # Unit like 0120, 0050
-    has_stg = 'STG' in addr or ' PK ' in addr or 'STORAGE' in addr or 'PARKING' in addr
-    has_cabana_word = 'CABANA' in addr
-    return has_c or has_cs or has_zero_unit or has_stg or has_cabana_word
-
-def is_excluded_building(building):
-    b = building.upper().strip()
-    if b in EXCLUDED_CABANA_BUILDINGS:
-        return True
-    if b.startswith("235 SUNRISE AVE") or b.startswith("235 SUNRISE AVENUE"):
-        return True
-    return False
-
 def is_likely_cabana(record):
     """Check if record is likely a cabana based on multiple signals."""
     addr = record.get('addr', '').upper()

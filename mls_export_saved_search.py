@@ -19,15 +19,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.ui import Select
 
 LOGIN_URL = (
-    "https://beachesmls.mysolidearth.com/authenticate?"
-    "redirect_to=eyJwYXJhbXMiOnt9LCJuYW1lIjoib2F1dGguYXV0aG9yaXplIiwicXVlcnkiOnsi"
-    "Y2xpZW50X2lkIjoiSUtLUmo1Y1JfNTgtdElSQ3VoalFBNG5qUVAtZEhhYTNlVUZiR0Q2eFRq"
-    "OCIsIm5vbmNlIjoiODY2Mjc4YzY5ZGJhNDE3ZDYzZmRmZjgwNjk3M2Q1YzkiLCJyZWRpcmVj"
-    "dF91cmkiOiJodHRwczovL2ZsLmZsZXhtbHMuY29tL29wZW5pZF9ycC9jYWxsYmFjayIsInJl"
-    "c3BvbnNlX3R5cGUiOiJjb2RlIiwic2NvcGUiOiJlbWFpbCBwcm9maWxlIG9wZW5pZCJ9fQ%3D%3D"
+    os.getenv("MLS_LOGIN_URL")
+    or "https://beachesmls.mysolidearth.com/authenticate"
 )
-START_URL = "https://fl.flexmls.com"
-LOGIN_PAGE_URL_FRAGMENT = "beachesmls.mysolidearth.com"
+START_URL = os.getenv("MLS_START_URL", "https://flr.flexmls.com")
+LOGIN_PAGE_URL_FRAGMENTS = ("beachesmls.mysolidearth.com", "mysolidearth.com", "authenticate")
+RESOURCE_PANELS_URL_FRAGMENT = "/resources/panels/"
+FLEXMLS_RESOURCE_CARD_HREF = os.getenv(
+    "MLS_FLEXMLS_RESOURCE_HREF",
+    "https://flr.flexmls.com/openid_rp?provider_id=71",
+)
 SAVED_SEARCHES_URL = "https://apps.flexmls.com/search/saved_searches?_variant=flagship"
 
 
@@ -237,6 +238,238 @@ def _force_custom_export_mode(driver, logger=None):
     return bool(state.get("custom_checked")) and state.get("checked_id") == "type5"
 
 
+def _wait_for_export_dialog(driver, logger=None, timeout_sec=90):
+    selectors = [
+        "label[for='type5']",
+        "#type5",
+        "input[name='stype'][value='custom']",
+        "select[name='template_id']",
+        "button[type='submit']",
+        "button.g-recaptcha.btn.btn-primary",
+    ]
+    ready = _switch_to_context_with_selector(
+        driver,
+        selectors[0],
+        logger=logger,
+        timeout_sec=0,
+    )
+    if ready:
+        return True
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        for selector in selectors:
+            if _switch_to_context_with_selector(driver, selector, logger=logger, timeout_sec=1):
+                if logger:
+                    logger.info("Export dialog ready via selector: %s", selector)
+                return True
+        time.sleep(1)
+    if logger:
+        logger.info("Export dialog did not expose known selectors within %ss", timeout_sec)
+    return False
+
+
+def _run_new_export_page(driver, wait, export_template=None, logger=None, debug_dir=None, timeout_sec=30):
+    deadline = time.time() + timeout_sec
+    heading_xpath = "//*[contains(normalize-space(.), 'Export Flexmls Data to Other Software')]"
+
+    while time.time() < deadline:
+        try:
+            heading = driver.find_elements(By.XPATH, heading_xpath)
+            if heading:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        return False
+
+    if logger:
+        logger.info("Detected new export page")
+    _capture_debug(driver, debug_dir, "new_export_page")
+
+    custom_selected = False
+    try:
+        custom_radio = _first_clickable(
+            wait,
+            [
+                (By.CSS_SELECTOR, "label[for='type5']"),
+                (By.ID, "type5"),
+                (By.XPATH, "//label[contains(normalize-space(.), 'Custom Text Export')]"),
+            ],
+        )
+        _click_logged(driver, custom_radio, "custom_text_export_new_page", logger=logger, debug_dir=debug_dir)
+    except Exception:
+        pass
+
+    try:
+        custom_selected = bool(
+            driver.execute_script(
+                """
+                const radio = document.querySelector('#type5');
+                const label = document.querySelector("label[for='type5']");
+                if (label) { try { label.click(); } catch (e) {} }
+                if (radio) {
+                  try { radio.click(); } catch (e) {}
+                  radio.checked = true;
+                  radio.dispatchEvent(new Event('input', { bubbles: true }));
+                  radio.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                return !!(radio && radio.checked);
+                """
+            )
+        )
+    except Exception:
+        custom_selected = False
+
+    if logger:
+        logger.info("Custom Text Export selected on new export page: %s", custom_selected)
+    _capture_debug(driver, debug_dir, "custom_text_export_new_page")
+    if not custom_selected:
+        raise TimeoutException("Custom Text Export (type5) did not become selected on the export page.")
+
+    if export_template:
+        try:
+            select_el = _first_visible(
+                wait,
+                [
+                    (By.XPATH, "//select[option[contains(normalize-space(.), 'AIDataSet')] or option[contains(normalize-space(.), 'AI Full DataSet')]]"),
+                    (By.CSS_SELECTOR, "select"),
+                ],
+            )
+            try:
+                Select(select_el).select_by_visible_text(export_template)
+                if logger:
+                    logger.info("Selected new export page template: %s", export_template)
+            except Exception as e:
+                if logger:
+                    logger.info("New export page template select failed (%s): %s", export_template, e)
+        except Exception:
+            pass
+
+    export_button = _first_clickable(
+        wait,
+        [
+            (By.CSS_SELECTOR, "button.g-recaptcha.btn.btn-primary[type='submit']"),
+            (By.XPATH, "//button[normalize-space()='EXPORT' or contains(normalize-space(.), 'EXPORT')]"),
+            (By.XPATH, "//input[@type='submit' and (@value='EXPORT' or @value='Export')]"),
+        ],
+    )
+    _click_logged(driver, export_button, "new_export_page_submit", logger=logger, debug_dir=debug_dir)
+    if logger:
+        logger.info("Clicked new export page EXPORT button")
+    return True
+
+
+def _wait_for_export_page(driver, wait, logger=None, debug_dir=None, timeout_sec=12):
+    deadline = time.time() + timeout_sec
+    heading_xpath = "//*[contains(normalize-space(.), 'Export Flexmls Data to Other Software')]"
+
+    while time.time() < deadline:
+        try:
+            if driver.find_elements(By.XPATH, heading_xpath):
+                if logger:
+                    logger.info("Visible export page detected")
+                _capture_debug(driver, debug_dir, "export_page_visible")
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _submit_export_form_fallback(driver, export_template=None, logger=None, debug_dir=None):
+    js = """
+        const exportTemplate = arguments[0];
+        const resultsNode = document.querySelector('#results_totaldiv');
+        const selectedNode = document.querySelector('#cart_totaldiv');
+        const exportForm = document.forms['exportform'];
+        if (!exportForm) {
+          return {ok: false, reason: 'missing_exportform'};
+        }
+
+        const resultsText = resultsNode ? (resultsNode.textContent || '') : '';
+        const selectedText = selectedNode ? (selectedNode.textContent || '') : '';
+        const countAll = parseInt(resultsText.replace(/[^0-9]/g, ''), 10) || 0;
+        const countSelected = parseInt(selectedText.replace(/[^0-9]/g, ''), 10) || 0;
+        const whereValue =
+          (typeof results_allwherestr !== 'undefined' && results_allwherestr) ||
+          (typeof allwherestr !== 'undefined' && allwherestr) ||
+          '';
+        const additional =
+          (typeof additionalcond !== 'undefined' && additionalcond) ||
+          '';
+
+        if (!whereValue || countAll <= 0) {
+          return {
+            ok: false,
+            reason: 'missing_results_context',
+            count_all: countAll,
+            count_selected: countSelected,
+            where_present: !!whereValue
+          };
+        }
+
+        const ensure = (name, value) => {
+          let el = exportForm.querySelector(`[name="${name}"]`);
+          if (!el) {
+            el = document.createElement('input');
+            el.type = 'hidden';
+            el.name = name;
+            exportForm.appendChild(el);
+          }
+          el.value = value;
+        };
+
+        ensure('where', whereValue);
+        ensure('additionalcond', additional);
+        ensure('countall', String(countAll));
+        ensure('countselected', String(countSelected));
+        ensure('showonlyselectedoption', 'false');
+
+        let matchedTemplate = null;
+        if (exportTemplate) {
+          const templateSelect =
+            document.querySelector("select[name='template_id']") ||
+            exportForm.querySelector("[name='template_id']");
+          if (templateSelect && templateSelect.options) {
+            const options = Array.from(templateSelect.options);
+            const match = options.find(opt => (opt.textContent || '').trim() === exportTemplate);
+            if (match) {
+              templateSelect.value = match.value;
+              ensure('template_id', match.value);
+              matchedTemplate = { text: (match.textContent || '').trim(), value: match.value };
+            }
+          }
+        }
+
+        exportForm.submit();
+        return {
+          ok: true,
+          count_all: countAll,
+          count_selected: countSelected,
+          where_present: true,
+          template_text: matchedTemplate ? matchedTemplate.text : null,
+          template_value: matchedTemplate ? matchedTemplate.value : null
+        };
+    """
+    state = driver.execute_script(js, export_template) or {}
+    if logger:
+        logger.info(
+            "Fallback export submit: ok=%s reason=%s count_all=%s count_selected=%s where_present=%s template_text=%s template_value=%s",
+            state.get("ok"),
+            state.get("reason"),
+            state.get("count_all"),
+            state.get("count_selected"),
+            state.get("where_present"),
+            state.get("template_text"),
+            state.get("template_value"),
+        )
+    _capture_debug(driver, debug_dir, "export_form_fallback")
+    return bool(state.get("ok"))
+
+
 def _dump_browser_logs(driver, log_dir, run_ts, logger=None):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     out = []
@@ -274,17 +507,53 @@ def _set_value_via_js(driver, selectors, value):
     return bool(driver.execute_script(js, selectors, value))
 
 
-def _fill_identity_fields(driver, value, logger=None):
+def _select_identity_mode(driver, mode, logger=None):
+    mode = (mode or "").strip().lower()
+    if mode not in {"mls_username", "email"}:
+        return False
+
+    label_text = "MLS Username" if mode == "mls_username" else "Email"
+    input_name = "member_login_id" if mode == "mls_username" else "email"
+
     js = """
-        const value = arguments[0];
-        const selectors = [
-          "input[name='member_login_id']",
-          "input[name='email']",
-          "input[aria-label='MLS Username']",
-          "input[aria-label='Email']"
+        const labelText = arguments[0];
+        const inputName = arguments[1];
+        const labels = Array.from(document.querySelectorAll("label"));
+        for (const label of labels) {
+          const txt = (label.textContent || "").trim();
+          if (txt !== labelText) continue;
+          const clickables = [
+            label,
+            label.previousElementSibling,
+            label.parentElement,
+            label.closest(".v-input"),
+            label.closest(".v-radio"),
+            label.closest("[role='radio']")
+          ].filter(Boolean);
+          for (const el of clickables) {
+            try { el.click(); } catch (e) {}
+          }
+          break;
+        }
+        const input = document.querySelector(`input[name='${inputName}']`);
+        return !!input;
+    """
+    ok = bool(driver.execute_script(js, label_text, input_name))
+    if logger:
+        logger.info("Selected identity mode %s: %s", mode, ok)
+    return ok
+
+
+def _fill_identity_fields(driver, username, logger=None):
+    js = """
+        const username = arguments[0];
+        const selectorValues = [
+          ["input[name='member_login_id']", username],
+          ["input[aria-label='MLS Username']", username]
         ];
         const filled = [];
-        for (const sel of selectors) {
+        for (const [sel, value] of selectorValues) {
+          if (!value) continue;
           const nodes = Array.from(document.querySelectorAll(sel));
           for (const el of nodes) {
             try {
@@ -298,10 +567,110 @@ def _fill_identity_fields(driver, value, logger=None):
         }
         return filled;
     """
-    filled = driver.execute_script(js, value) or []
+    filled = driver.execute_script(js, username) or []
     if logger:
         logger.info("Filled identity selectors: %s", ", ".join(filled) if filled else "(none)")
     return filled
+
+
+def _fill_first_page_username(driver, wait, username, logger=None, timeout_sec=30):
+    deadline = time.time() + timeout_sec
+    last_error = None
+    selectors = [
+        "input[name='member_login_id']",
+        "input[aria-label='MLS Username']",
+        "input[placeholder='MLS Username']",
+    ]
+
+    while time.time() < deadline:
+        try:
+            _select_identity_mode(driver, "mls_username", logger=logger)
+        except Exception as e:
+            last_error = e
+
+        for selector in selectors:
+            try:
+                fields = driver.find_elements(By.CSS_SELECTOR, selector)
+                for field in fields:
+                    if field.is_displayed() and field.is_enabled():
+                        field.clear()
+                        field.send_keys(username)
+                        if logger:
+                            logger.info("Filled first-page username selector: %s", selector)
+                        return selector
+            except Exception as e:
+                last_error = e
+
+        try:
+            if _set_value_via_js(driver, selectors, username):
+                if logger:
+                    logger.info("Filled first-page username via JS")
+                return "js"
+        except Exception as e:
+            last_error = e
+
+        time.sleep(0.5)
+
+    if last_error:
+        raise last_error
+    _first_present(
+        wait,
+        [
+            (By.CSS_SELECTOR, "input[name='member_login_id']"),
+            (By.CSS_SELECTOR, "input[aria-label='MLS Username']"),
+        ],
+    )
+    raise TimeoutException("MLS Username field found but could not be filled.")
+
+
+def _fill_first_page_email(driver, wait, email, logger=None, timeout_sec=30):
+    deadline = time.time() + timeout_sec
+    last_error = None
+    selectors = [
+        "input[name='email']",
+        "input[aria-label='Email']",
+        "input[type='email']",
+    ]
+
+    while time.time() < deadline:
+        try:
+            _select_identity_mode(driver, "email", logger=logger)
+        except Exception as e:
+            last_error = e
+
+        for selector in selectors:
+            try:
+                fields = driver.find_elements(By.CSS_SELECTOR, selector)
+                for field in fields:
+                    if field.is_displayed() and field.is_enabled():
+                        field.clear()
+                        field.send_keys(email)
+                        if logger:
+                            logger.info("Filled first-page email selector: %s", selector)
+                        return selector
+            except Exception as e:
+                last_error = e
+
+        try:
+            if _set_value_via_js(driver, selectors, email):
+                if logger:
+                    logger.info("Filled first-page email via JS")
+                return "js"
+        except Exception as e:
+            last_error = e
+
+        time.sleep(0.5)
+
+    if last_error:
+        raise last_error
+    _first_present(
+        wait,
+        [
+            (By.CSS_SELECTOR, "input[name='email']"),
+            (By.CSS_SELECTOR, "input[aria-label='Email']"),
+        ],
+    )
+    raise TimeoutException("Email field found but could not be filled.")
 
 
 def _fill_password(driver, wait, password, logger=None, timeout_sec=40):
@@ -426,6 +795,38 @@ def _switch_to_latest_window(driver, logger=None):
             logger.info("Window switch skipped: %s", e)
 
 
+def _switch_to_post_login_window(driver, logger=None):
+    try:
+        handles = list(driver.window_handles)
+    except Exception as e:
+        if logger:
+            logger.info("Post-login window scan skipped: %s", e)
+        return None
+
+    fallback_handle = None
+    for handle in reversed(handles):
+        try:
+            driver.switch_to.window(handle)
+            current_url = driver.current_url
+            title = driver.title or ""
+            title_l = title.lower()
+            if "flexmls" in current_url or "flexmls" in title_l:
+                if logger:
+                    logger.info("Using post-login Flexmls window: %s url=%s", handle, current_url)
+                return "flexmls"
+            if RESOURCE_PANELS_URL_FRAGMENT in current_url or "resource panels" in title_l:
+                fallback_handle = handle
+        except Exception:
+            continue
+
+    if fallback_handle:
+        driver.switch_to.window(fallback_handle)
+        if logger:
+            logger.info("Using post-login Resource Panels window: %s url=%s", fallback_handle, driver.current_url)
+        return "resource_panels"
+    return None
+
+
 def _wait_for_top_frame(driver, timeout_sec=45):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -435,6 +836,63 @@ def _wait_for_top_frame(driver, timeout_sec=45):
             return True
         except Exception:
             pass
+        time.sleep(0.5)
+    return False
+
+
+def _wait_for_authenticated_shell(driver, timeout_sec=45):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            current_url = driver.current_url
+            title = (driver.title or "").lower()
+            if (
+                "authenticate" not in current_url
+                and "mysolidearth.com" not in current_url
+                and "flexmls" in current_url
+            ):
+                return True
+            if "flexmls" in title and "sign in" not in title:
+                return True
+        except Exception:
+            pass
+
+        try:
+            if _wait_for_top_frame(driver, timeout_sec=1):
+                driver.switch_to.default_content()
+                return True
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+    return False
+
+
+def _wait_for_post_login_destination(driver, wait, username, password, logger=None, debug_dir=None, timeout_sec=45):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        state = _switch_to_post_login_window(driver, logger=logger)
+        if state == "resource_panels":
+            launched = _launch_flexmls_from_resource_panels(
+                driver,
+                wait,
+                logger=logger,
+                debug_dir=debug_dir,
+                timeout_sec=15,
+            )
+            if launched:
+                _switch_to_post_login_window(driver, logger=logger)
+        if "apps.flexmls.com/ticket" in driver.current_url:
+            _handle_ticket_login_if_present(
+                driver,
+                wait,
+                username=username,
+                password=password,
+                logger=logger,
+                debug_dir=debug_dir,
+            )
+        if _wait_for_authenticated_shell(driver, timeout_sec=1):
+            return True
         time.sleep(0.5)
     return False
 
@@ -465,14 +923,18 @@ def _handle_ticket_login_if_present(driver, wait, username, password, logger=Non
         logger.info("Ticket login detected, attempting secondary auth flow")
     _capture_debug(driver, debug_dir, "ticket_login_page")
 
+    ticket_username = str(username or "").strip()
+    if ticket_username and not ticket_username.lower().startswith("flr."):
+        ticket_username = f"flr.{ticket_username}"
+
     try:
         user_input = _first_present(wait, [(By.CSS_SELECTOR, "#user"), (By.NAME, "user")])
         user_input.clear()
-        user_input.send_keys(username)
+        user_input.send_keys(ticket_username)
         if logger:
             logger.info("Filled ticket username")
     except Exception:
-        if not _set_value_via_js(driver, ["#user", "input[name='user']"], username):
+        if not _set_value_via_js(driver, ["#user", "input[name='user']"], ticket_username):
             raise
         if logger:
             logger.info("Filled ticket username via JS")
@@ -511,22 +973,79 @@ def _handle_ticket_login_if_present(driver, wait, username, password, logger=Non
     return True
 
 
+def _launch_flexmls_from_resource_panels(driver, wait, logger=None, debug_dir=None, timeout_sec=45):
+    if RESOURCE_PANELS_URL_FRAGMENT not in driver.current_url:
+        return False
+
+    if logger:
+        logger.info("Resource Panels detected, opening NEW Flexmls href directly")
+    _capture_debug(driver, debug_dir, "resource_panels")
+
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", FLEXMLS_RESOURCE_CARD_HREF)
+        _switch_to_latest_window(driver, logger=logger)
+        if logger:
+            logger.info("Opened Flexmls resource href directly in a new tab: %s", FLEXMLS_RESOURCE_CARD_HREF)
+    except Exception as e:
+        if logger:
+            logger.info("Direct new-tab open failed, retrying same-tab navigation: %s", e)
+        try:
+            driver.get(FLEXMLS_RESOURCE_CARD_HREF)
+            if logger:
+                logger.info("Opened Flexmls resource href in current tab: %s", FLEXMLS_RESOURCE_CARD_HREF)
+        except Exception as inner:
+            if logger:
+                logger.info("Direct same-tab navigation failed: %s", inner)
+            return False
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            current_url = driver.current_url
+            title = (driver.title or "").lower()
+            if "flexmls" in current_url or "flexmls" in title:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    for handle in reversed(driver.window_handles):
+        try:
+            driver.switch_to.window(handle)
+            current_url = driver.current_url
+            title = (driver.title or "").lower()
+            if "flexmls" in current_url or "flexmls" in title:
+                if logger:
+                    logger.info("Recovered Flexmls window after direct href open: %s url=%s", handle, current_url)
+                return True
+        except Exception:
+            continue
+
+    if logger:
+        logger.info("Flexmls did not appear after direct href open: %s", FLEXMLS_RESOURCE_CARD_HREF)
+    return False
+
+
 def _login(driver, wait, email, password, logger=None, debug_dir=None):
     previous_url = driver.current_url
-    driver.get(START_URL)
+    driver.get(LOGIN_URL)
     if logger:
         previous_url = _log_url_change(logger, previous_url, driver, "open start url")
         _log_state(logger, driver, "Opened start URL")
     try:
-        wait.until(EC.url_contains(LOGIN_PAGE_URL_FRAGMENT))
+        wait.until(lambda d: any(fragment in d.current_url for fragment in LOGIN_PAGE_URL_FRAGMENTS))
     except Exception:
-        # If already logged in, this redirect might not occur.
-        pass
+        # Fall back to the app host when the direct auth URL immediately redirects.
+        driver.get(START_URL)
+        try:
+            wait.until(lambda d: any(fragment in d.current_url for fragment in LOGIN_PAGE_URL_FRAGMENTS))
+        except Exception:
+            pass
     if logger:
         _log_state(logger, driver, "On login/auth page")
     _capture_debug(driver, debug_dir, "login_page")
 
-    # Fill both MLS Username and Email fields if they exist.
+    auth_mode = (os.getenv("MLS_AUTH_MODE") or "email").strip().lower()
     _first_present(
         wait,
         [
@@ -536,14 +1055,22 @@ def _login(driver, wait, email, password, logger=None, debug_dir=None):
             (By.CSS_SELECTOR, "input[aria-label='Email']"),
         ],
     )
-    _fill_identity_fields(driver, email, logger=logger)
+    username = os.getenv("MLS_USERNAME", email)
+    if auth_mode == "email":
+        fill_value = email
+        fill_method = _fill_first_page_email(driver, wait, email=email, logger=logger)
+        identity_selector = "input[name='email'], input[aria-label='Email'], input[type='email']"
+    else:
+        fill_value = username
+        fill_method = _fill_first_page_username(driver, wait, username=username, logger=logger)
+        identity_selector = "input[name='member_login_id'], input[aria-label='MLS Username']"
     try:
-        first_identity = driver.find_element(By.CSS_SELECTOR, "input[name='member_login_id'], input[name='email'], input[aria-label='MLS Username'], input[aria-label='Email']")
+        first_identity = driver.find_element(By.CSS_SELECTOR, identity_selector)
         first_identity.send_keys(Keys.TAB)
     except Exception:
         pass
     if logger:
-        logger.info("Filled login identity with value: %s", email)
+        logger.info("Filled login identity with mode=%s value=%s via %s", auth_mode, fill_value, fill_method)
 
     fill_method = _fill_password(driver, wait, password, logger=logger, timeout_sec=40)
     if logger:
@@ -571,18 +1098,35 @@ def _login(driver, wait, email, password, logger=None, debug_dir=None):
     if logger:
         logger.info("Clicked LOG IN")
 
-    wait.until(lambda d: "authenticate" not in d.current_url)
-    _switch_to_latest_window(driver, logger=logger)
-    _handle_ticket_login_if_present(
+    wait.until(
+        lambda d: (
+            "authenticate" not in d.current_url
+            or "flexmls" in d.current_url
+            or RESOURCE_PANELS_URL_FRAGMENT in d.current_url
+            or len(d.window_handles) > 1
+        )
+    )
+    post_login_state = _switch_to_post_login_window(driver, logger=logger)
+    if post_login_state == "resource_panels":
+        _launch_flexmls_from_resource_panels(
+            driver,
+            wait,
+            logger=logger,
+            debug_dir=debug_dir,
+        )
+        post_login_state = _switch_to_post_login_window(driver, logger=logger)
+    if post_login_state is None:
+        _switch_to_latest_window(driver, logger=logger)
+    if not _wait_for_post_login_destination(
         driver,
         wait,
-        username=email,
+        username=username,
         password=password,
         logger=logger,
         debug_dir=debug_dir,
-    )
-    if not _wait_for_top_frame(driver, timeout_sec=45):
-        raise TimeoutException("Login submitted but top_frame did not appear.")
+        timeout_sec=45,
+    ):
+        raise TimeoutException("Login submitted but a Flexmls app shell did not appear.")
     driver.switch_to.default_content()
     if logger:
         _log_url_change(logger, previous_url, driver, "log in submit")
@@ -593,6 +1137,7 @@ def _login(driver, wait, email, password, logger=None, debug_dir=None):
 
 
 def export_saved_search(
+    username,
     email,
     password,
     search_name,
@@ -647,7 +1192,7 @@ def export_saved_search(
         _handle_ticket_login_if_present(
             driver,
             wait,
-            username=email,
+            username=username,
             password=password,
             logger=logger,
             debug_dir=debug_dir,
@@ -738,14 +1283,54 @@ def export_saved_search(
         export_listings = _first_clickable(
             wait,
             [
+                (By.CSS_SELECTOR, "a[title='Export Listings']"),
                 (By.CSS_SELECTOR, "li#export-listings a"),
+                (By.XPATH, "//a[@title='Export Listings' and normalize-space()='Export']"),
                 (By.XPATH, "//li[@id='export-listings']//a[contains(normalize-space(.), 'Export')]"),
             ],
         )
         _click_logged(driver, export_listings, "export_listings", logger=logger, debug_dir=debug_dir)
         logger.info("Clicked Export Listings")
 
-        _switch_to_context_with_selector(driver, "label[for='type5'], #type5", logger=logger, timeout_sec=30)
+        if not _wait_for_export_page(driver, wait, logger=logger, debug_dir=debug_dir, timeout_sec=8):
+            try:
+                export_listings = driver.find_element(By.CSS_SELECTOR, "a[title='Export Listings']")
+                driver.execute_script("arguments[0].click();", export_listings)
+                logger.info("Retried Export Listings via JS click")
+            except Exception as e:
+                logger.info("Export Listings retry skipped: %s", e)
+            _wait_for_export_page(driver, wait, logger=logger, debug_dir=debug_dir, timeout_sec=6)
+
+        # Newer Flexmls can route to a dedicated export page instead of the legacy modal.
+        if _run_new_export_page(
+            driver,
+            wait,
+            export_template=export_template,
+            logger=logger,
+            debug_dir=debug_dir,
+            timeout_sec=10,
+        ):
+            csv_path = _wait_for_csv(download_dir=download_dir, timeout_sec=download_timeout, logger=logger)
+            print(f"Export completed. CSV downloaded to: {csv_path}")
+            logger.info("Export completed successfully via new export page: %s", csv_path)
+            return str(csv_path)
+
+        # Prefer direct form submission when the results page already has export context.
+        if _submit_export_form_fallback(
+            driver,
+            export_template=export_template,
+            logger=logger,
+            debug_dir=debug_dir,
+        ):
+            csv_path = _wait_for_csv(download_dir=download_dir, timeout_sec=download_timeout, logger=logger)
+            print(f"Export completed. CSV downloaded to: {csv_path}")
+            logger.info("Export completed successfully via fallback submit: %s", csv_path)
+            return str(csv_path)
+
+        # Fall back to the legacy export modal flow when direct submit is unavailable.
+        dialog_ready = _wait_for_export_dialog(driver, logger=logger, timeout_sec=30)
+        if not dialog_ready:
+            raise TimeoutException("Export dialog did not finish loading known controls.")
 
         try:
             custom_export = _first_clickable(
@@ -855,6 +1440,7 @@ def export_saved_search(
 
 def _build_args():
     parser = argparse.ArgumentParser(description="Export a Flexmls saved search to CSV.")
+    parser.add_argument("--username", default=os.getenv("MLS_USERNAME"), help="MLS member login / username")
     parser.add_argument("--email", default=os.getenv("MLS_EMAIL"), help="MLS account email")
     parser.add_argument("--password", default=os.getenv("MLS_PASSWORD"), help="MLS account password")
     parser.add_argument(
@@ -916,13 +1502,15 @@ def _build_args():
 if __name__ == "__main__":
     args = _build_args()
 
+    username = args.username or os.getenv("MLS_EMAIL") or input("MLS username/member id: ").strip()
     email = args.email or input("MLS email: ").strip()
     password = args.password or getpass.getpass("MLS password: ").strip()
 
-    if not email or not password:
-        raise SystemExit("Email and password are required.")
+    if not username or not email or not password:
+        raise SystemExit("Username, email, and password are required.")
 
     export_saved_search(
+        username=username,
         email=email,
         password=password,
         search_name=args.search_name,

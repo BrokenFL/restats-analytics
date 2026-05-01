@@ -1,0 +1,2 @@
+"""ReStats command-line package."""
+

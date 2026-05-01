@@ -6,8 +6,10 @@ import requests
 import sys
 import sqlite3
 import argparse
+import socket
 from datetime import datetime, timedelta
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
@@ -111,16 +113,58 @@ def get_existing_sales_from_db():
     
     return existing
 
-def get_latest_csv():
-    """Finds the most recently downloaded CSV file in the Downloads folder."""
-    list_of_files = glob.glob(os.path.join(DOWNLOAD_FOLDER, '*.csv'))
+def get_latest_csv(download_folder=None):
+    """Finds the most recently downloaded CSV file in the target download folder."""
+    folder = download_folder or DOWNLOAD_FOLDER
+    list_of_files = glob.glob(os.path.join(folder, '*.csv'))
     if not list_of_files:
         return None
     return max(list_of_files, key=os.path.getctime)
 
+
+def pick_chromedriver_port(preferred_port, attempts=10):
+    for offset in range(max(attempts, 1)):
+        port = preferred_port + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
 def clean_pcn(pcn_with_dashes):
     """Removes dashes from PCN to make it URL-ready."""
     return pcn_with_dashes.replace("-", "").strip()
+
+def normalize_sale_date_for_compare(raw_date):
+    """
+    Normalize sale date into YYYY-MM-DD for duplicate matching.
+    Accepts common county formats (MM/DD/YYYY, MM/DD/YY, YYYY-MM-DD).
+    """
+    if raw_date is None:
+        return None
+    s = str(raw_date).strip()
+    if not s:
+        return None
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 def get_detail_value(driver, label):
     """
@@ -313,6 +357,42 @@ def _switch_to_municipality_mode(driver):
         print(f"Note: Could not switch search mode automatically: {e}")
 
 
+def _switch_to_subdivision_mode(driver):
+    """
+    Attempt to switch search type to subdivisions.
+    Works across minor DOM changes.
+    """
+    try:
+        search_type_js = """
+            var selects = document.querySelectorAll('select');
+            for (var s of selects) {
+                var subdivisionIdx = -1;
+                var hasMunicipality = false;
+                for (var i = 0; i < s.options.length; i++) {
+                    var txt = (s.options[i].text || '').toLowerCase();
+                    if (txt.includes('subdiv')) {
+                        subdivisionIdx = i;
+                    }
+                    if (txt.includes('municipalit')) {
+                        hasMunicipality = true;
+                    }
+                }
+                if (subdivisionIdx >= 0 && hasMunicipality) {
+                    s.selectedIndex = subdivisionIdx;
+                    s.dispatchEvent(new Event('change', { bubbles: true }));
+                    return s.id || 'search-type-select';
+                }
+            }
+            return null;
+        """
+        result = driver.execute_script(search_type_js)
+        if result:
+            print("✓ Switched to Subdivision search mode")
+            time.sleep(2)
+    except Exception as e:
+        print(f"Note: Could not switch to subdivision mode automatically: {e}")
+
+
 def _force_click_municipality_mode(driver):
     """
     Fallbacks for UIs where municipality mode is a tab/radio/button rather than select.
@@ -368,12 +448,90 @@ def _force_click_municipality_mode(driver):
     return False
 
 
+def _force_click_subdivision_mode(driver):
+    """
+    Fallbacks for UIs where subdivision mode is a tab/radio/button.
+    """
+    try:
+        sub_radio = driver.find_element(By.CSS_SELECTOR, "input[type='radio'][name='SaleSrchType'][value='SUB']")
+        driver.execute_script("arguments[0].click();", sub_radio)
+        time.sleep(0.6)
+        return True
+    except Exception:
+        pass
+
+    try:
+        sub_js = """
+            var el = document.evaluate(
+                "/html/body/main/div/div/div/form/div/div[2]/div/input[1]",
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+            if (el) {
+                el.click();
+                el.checked = true;
+                if (el.value !== 'SUB') { el.value = 'SUB'; }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }
+            return false;
+        """
+        if driver.execute_script(sub_js):
+            time.sleep(0.6)
+            return True
+    except Exception:
+        pass
+
+    selector_candidates = [
+        (By.CSS_SELECTOR, "input[type='radio'][value='SUB']"),
+        (By.ID, "Subdivision"),
+        (By.ID, "Subdivisions"),
+        (By.CSS_SELECTOR, "input[value*='Subdiv']"),
+        (By.CSS_SELECTOR, "button[id*='Subdiv']"),
+        (By.CSS_SELECTOR, "a[id*='Subdiv']"),
+        (By.XPATH, "//*[contains(normalize-space(text()), 'Subdivision')]"),
+        (By.XPATH, "//*[contains(normalize-space(text()), 'Subdivisions')]"),
+    ]
+
+    for by, sel in selector_candidates:
+        try:
+            elems = driver.find_elements(by, sel)
+            for elem in elems:
+                try:
+                    driver.execute_script("arguments[0].click();", elem)
+                    time.sleep(0.4)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
 def _wait_for_municipality_options(driver, timeout_sec=12):
     """Wait until Municipality select has real options."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
             elem = driver.find_element(By.ID, "Municipality")
+            options = Select(elem).options
+            real = [o.text.strip() for o in options if o.text and o.text.strip()]
+            if real:
+                return real
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return []
+
+
+def _wait_for_subdivision_options(driver, timeout_sec=12):
+    """Wait until Subdivision select has real options."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            elem = driver.find_element(By.ID, "Subdivision")
             options = Select(elem).options
             real = [o.text.strip() for o in options if o.text and o.text.strip()]
             if real:
@@ -431,20 +589,133 @@ def _select_municipality(driver, wait, target_city):
     print(f"✓ Selected municipality: {selected_text}")
 
 
-def run_scraper(target_city=None, start_date=None, end_date=None, use_last_imported=False, prompt_for_missing=True):
+def _ensure_sales_search_form(driver, wait):
+    """
+    Ensure we are on the advanced sales search form, not a stale results page.
+    """
+    def _has_form_controls():
+        try:
+            has_date = len(driver.find_elements(By.ID, "SaleDateFrom")) > 0
+            has_submit = len(driver.find_elements(By.ID, "btnFormSearch")) > 0
+            has_target = (
+                len(driver.find_elements(By.ID, "autocomplete-subdivision")) > 0
+                or len(driver.find_elements(By.ID, "Municipality")) > 0
+            )
+            return has_date and has_submit and has_target
+        except Exception:
+            return False
+
+    if _has_form_controls():
+        return
+
+    try:
+        wait.until(EC.presence_of_element_located((By.ID, "btnFormSearch")))
+        if _has_form_controls():
+            return
+    except Exception:
+        pass
+
+    back_selectors = [
+        (By.LINK_TEXT, "Back to search"),
+        (By.PARTIAL_LINK_TEXT, "Back to search"),
+        (By.XPATH, "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'back to search')]"),
+    ]
+    navigated = False
+    for by, sel in back_selectors:
+        try:
+            links = driver.find_elements(by, sel)
+            if links:
+                href = links[0].get_attribute("href")
+                if href:
+                    driver.get(href)
+                    navigated = True
+                else:
+                    driver.execute_script("arguments[0].click();", links[0])
+                    navigated = True
+                time.sleep(1.5)
+                break
+        except Exception:
+            continue
+
+    if not navigated:
+        driver.get("https://pbcpao.gov/AdvSearch/SalesSearch")
+        time.sleep(1.5)
+
+    wait.until(EC.presence_of_element_located((By.ID, "btnFormSearch")))
+    if not _has_form_controls():
+        driver.get("https://pbcpao.gov/AdvSearch/SalesSearch")
+        time.sleep(1.5)
+        wait.until(EC.presence_of_element_located((By.ID, "SaleDateFrom")))
+
+
+def _select_subdivision(driver, wait, target_subdivision):
+    """Select subdivision robustly; PAPA SUB mode uses text autocomplete input."""
+    target = str(target_subdivision or "").strip()
+    if not target:
+        raise ValueError("Subdivision is required.")
+    ok = driver.execute_script(
+        """
+        var target = arguments[0];
+        var el = document.querySelector('#autocomplete-subdivision') || document.querySelector(\"input[name='SubDivision']\");
+        if (!el) return false;
+        el.focus();
+        el.value = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.value = target;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        return true;
+        """,
+        target,
+    )
+    if not ok:
+        raise ValueError("Subdivision input field not found in SUB mode.")
+    print(f"✓ Entered subdivision: {target}")
+
+
+def run_scraper(
+    target_city=None,
+    target_subdivision=None,
+    start_date=None,
+    end_date=None,
+    use_last_imported=False,
+    prompt_for_missing=True,
+    search_mode="municipality",
+    headless=False,
+    download_folder=None,
+    chromedriver_port=9516,
+):
     # --- PHASE 0: USER INPUTS ---
     print("\n--- PBC Property Scraper Configuration ---")
 
-    # 1. Get Municipality
-    if not target_city:
-        target_city = input("Enter Municipality (Press Enter for 'Palm Beach'): ").strip()
+    search_mode = (search_mode or "municipality").strip().lower()
+    if search_mode not in ("municipality", "subdivision"):
+        print(f"Invalid search mode '{search_mode}'. Falling back to municipality.")
+        search_mode = "municipality"
+
+    # 1. Get target selector
+    if search_mode == "municipality":
         if not target_city:
-            target_city = "Palm Beach"
+            target_city = input("Enter Municipality (Press Enter for 'Palm Beach'): ").strip()
+            if not target_city:
+                target_city = "Palm Beach"
+        target_label = target_city
+    else:
+        if not target_subdivision:
+            if prompt_for_missing:
+                target_subdivision = input("Enter Official Subdivision Name: ").strip()
+            else:
+                target_subdivision = ""
+        if not target_subdivision:
+            print("Subdivision name is required in subdivision search mode.")
+            return
+        target_label = target_subdivision
 
     # 2. Get Start Date (with optional last-imported mode)
     default_date = (datetime.now() - timedelta(days=180)).strftime("%m/%d/%Y")
     if use_last_imported and not start_date:
-        latest = get_last_imported_pbc_sale_date(target_city)
+        latest = get_last_imported_pbc_sale_date(target_city if search_mode == "municipality" else None)
         if latest:
             start_date = (latest + timedelta(days=1)).strftime("%m/%d/%Y")
             print(f"✓ Using last imported PBC date +1 day: {start_date}")
@@ -490,43 +761,111 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
             formatted_end_date = None
 
     if formatted_end_date:
-        print(f"\n-> Starting Search for '{target_city}' sales from {formatted_date} to {formatted_end_date}...\n")
+        print(f"\n-> Starting {search_mode} search for '{target_label}' sales from {formatted_date} to {formatted_end_date}...\n")
     else:
-        print(f"\n-> Starting Search for '{target_city}' sales since {formatted_date}...\n")
+        print(f"\n-> Starting {search_mode} search for '{target_label}' sales since {formatted_date}...\n")
 
     # --- PHASE 1: SEARCH & DOWNLOAD ---
     
+    download_folder = download_folder or DOWNLOAD_FOLDER
+    os.makedirs(download_folder, exist_ok=True)
+
     options = webdriver.ChromeOptions()
-    # options.add_argument("--headless") 
-    driver = webdriver.Chrome(options=options)
+    if headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1502,900")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_experimental_option(
+        "prefs",
+        {
+            "download.default_directory": os.path.abspath(download_folder),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": True,
+        },
+    )
+    service_port = pick_chromedriver_port(chromedriver_port)
+    print(f"chromedriver_port={service_port}")
+    driver = webdriver.Chrome(service=Service(port=service_port), options=options)
     
     try:
         # 1. Navigate and Search
         url = "https://pbcpao.gov/AdvSearch/SalesSearch"
         driver.get(url)
-        driver.maximize_window()
+        if not headless:
+            driver.maximize_window()
 
         wait = WebDriverWait(driver, 15)
         
         # Wait for page to fully load
         time.sleep(2)
+        _ensure_sales_search_form(driver, wait)
 
-        # FIRST: ensure we are in municipality search mode
-        _switch_to_municipality_mode(driver)
-        if not _wait_for_municipality_options(driver, timeout_sec=3):
-            _force_click_municipality_mode(driver)
-
-        # SECOND: select municipality robustly
-        try:
-            _select_municipality(driver, wait, target_city)
-        except Exception as e:
-            print(f"ERROR selecting municipality: {e}")
-            driver.quit()
-            return
+        # FIRST: ensure the expected search mode is active.
+        if search_mode == "municipality":
+            _switch_to_municipality_mode(driver)
+            if not _wait_for_municipality_options(driver, timeout_sec=3):
+                _force_click_municipality_mode(driver)
+            try:
+                _select_municipality(driver, wait, target_city)
+            except Exception as e:
+                print(f"ERROR selecting municipality: {e}")
+                driver.quit()
+                return {"status": "error", "reason": f"municipality_select_failed: {e}"}
+        else:
+            _switch_to_subdivision_mode(driver)
+            _force_click_subdivision_mode(driver)
+            try:
+                wait.until(EC.presence_of_element_located((By.ID, "autocomplete-subdivision")))
+            except Exception:
+                # One hard reset if page state is stale.
+                driver.get("https://pbcpao.gov/AdvSearch/SalesSearch")
+                time.sleep(1.5)
+                _force_click_subdivision_mode(driver)
+                wait.until(EC.presence_of_element_located((By.ID, "autocomplete-subdivision")))
+            try:
+                _select_subdivision(driver, wait, target_subdivision)
+            except Exception as e:
+                print(f"ERROR selecting subdivision: {e}")
+                try:
+                    dbg = os.path.join(DOWNLOAD_FOLDER, "debug_subdivision_select_failure.png")
+                    driver.save_screenshot(dbg)
+                    print(f"Saved screenshot: {dbg}")
+                except Exception:
+                    pass
+                driver.quit()
+                return {"status": "error", "reason": f"subdivision_select_failed: {e}"}
         
         # Select "Qualified Sales" (QS)
-        qs_radio = driver.find_element(By.CSS_SELECTOR, "input[value='QS']")
-        driver.execute_script("arguments[0].click();", qs_radio)
+        qs_radio = None
+        qs_candidates = [
+            (By.CSS_SELECTOR, "input[type='radio'][name='SaleFilter'][value='QS']"),
+            (By.CSS_SELECTOR, "input[value='QS']"),
+        ]
+        for by, sel in qs_candidates:
+            try:
+                qs_radio = driver.find_element(by, sel)
+                if qs_radio:
+                    break
+            except Exception:
+                continue
+        if qs_radio is not None:
+            driver.execute_script("arguments[0].click();", qs_radio)
+        else:
+            # JS fallback if DOM binding is slightly different.
+            driver.execute_script(
+                """
+                var el = document.querySelector("input[type='radio'][name='SaleFilter'][value='QS']")
+                      || document.querySelector("input[value='QS']");
+                if (el) {
+                    el.click();
+                    el.checked = true;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                """
+            )
 
         # Set Date based on USER INPUT
         date_from_input = driver.find_element(By.ID, "SaleDateFrom")
@@ -582,17 +921,22 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
             except:
                 print("No CSV button found. The page structure may have changed.")
                 # Take a screenshot for debugging
-                driver.save_screenshot(os.path.join(DOWNLOAD_FOLDER, "debug_screenshot.png"))
-                print(f"Screenshot saved to {DOWNLOAD_FOLDER}/debug_screenshot.png")
+                driver.save_screenshot(os.path.join(download_folder, "debug_screenshot.png"))
+                print(f"Screenshot saved to {download_folder}/debug_screenshot.png")
             driver.quit()
-            return
+            return {
+                "status": "no_results",
+                "target": target_label,
+                "start_date": formatted_date,
+                "end_date": formatted_end_date,
+            }
         
         # Wait for file to appear (poll for up to 30 seconds)
         print("Waiting for CSV download to complete...")
         input_csv_path = None
         for _ in range(30):
             time.sleep(1)
-            candidate = get_latest_csv()
+            candidate = get_latest_csv(download_folder=download_folder)
             if candidate:
                 # Check if file was modified in last 30 seconds (i.e., just downloaded)
                 if time.time() - os.path.getctime(candidate) < 30:
@@ -601,7 +945,7 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
         
         if not input_csv_path:
             print("Error: Could not find the downloaded CSV file after 30 seconds.")
-            return
+            return {"status": "error", "reason": "download_not_found"}
         
         # --- PHASE 2: PROCESS CSV & ENHANCE ---
 
@@ -609,13 +953,14 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
         print("--- 2. Extracting Property Details & Geocoding ---")
         
         # Output file name includes city and date for clarity
-        safe_city = target_city.replace(" ", "_")
+        safe_target = target_label.replace(" ", "_")
+        mode_prefix = "SUBDIV" if search_mode == "subdivision" else "CITY"
         safe_start = formatted_date.replace("/", "-")
         if formatted_end_date:
             safe_end = formatted_end_date.replace("/", "-")
-            output_csv_path = os.path.join(DOWNLOAD_FOLDER, f"ENHANCED_{safe_city}_{safe_start}_to_{safe_end}.csv")
+            output_csv_path = os.path.join(download_folder, f"ENHANCED_{mode_prefix}_{safe_target}_{safe_start}_to_{safe_end}.csv")
         else:
-            output_csv_path = os.path.join(DOWNLOAD_FOLDER, f"ENHANCED_{safe_city}_{safe_start}.csv")
+            output_csv_path = os.path.join(download_folder, f"ENHANCED_{mode_prefix}_{safe_target}_{safe_start}.csv")
 
         with open(input_csv_path, 'r', encoding='utf-8-sig') as f_in, \
              open(output_csv_path, 'w', newline='', encoding='utf-8') as f_out:
@@ -642,8 +987,11 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
                     return False
                 if clean_pcn_val not in existing_sales:
                     return False
+                normalized_sale_date = normalize_sale_date_for_compare(sale_date)
+                if not normalized_sale_date:
+                    return False
                 try:
-                    pbc_date = datetime.strptime(sale_date, "%Y-%m-%d")
+                    pbc_date = datetime.strptime(normalized_sale_date, "%Y-%m-%d")
                     for db_date_str in existing_sales[clean_pcn_val]:
                         db_date = datetime.strptime(db_date_str, "%Y-%m-%d")
                         if abs((pbc_date - db_date).days) <= 7:
@@ -674,8 +1022,9 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
                     continue
 
                 sale_date = row.get('Sale Date', '').strip()
+                sale_date_norm = normalize_sale_date_for_compare(sale_date) or sale_date
                 clean_pcn_val = clean_pcn(pcn)
-                row_key = (clean_pcn_val, sale_date)
+                row_key = (clean_pcn_val, sale_date_norm)
                 if row_key in seen_row_keys:
                     skipped_in_csv_dupes += 1
                     continue
@@ -737,11 +1086,26 @@ def run_scraper(target_city=None, start_date=None, end_date=None, use_last_impor
         # Post-process: Combine cabana + condo same-day sales
         print("\n--- 3. Checking for Cabana + Condo Same-Day Sales ---")
         final_path = combine_cabana_sales(output_csv_path)
+        return {
+            "status": "ok",
+            "target": target_label,
+            "start_date": formatted_date,
+            "end_date": formatted_end_date,
+            "raw_csv": input_csv_path,
+            "enhanced_csv": output_csv_path,
+            "final_csv": final_path,
+            "processed_count": count,
+            "prefilter_skipped": total_skipped_prefilter,
+            "skipped_no_pcn": skipped_no_pcn,
+            "skipped_csv_dupes": skipped_in_csv_dupes,
+            "skipped_in_db": skipped_in_db,
+        }
 
     except Exception as e:
         print(f"An error occurred: {e}")
         import traceback
         traceback.print_exc()
+        return {"status": "error", "reason": str(e)}
     finally:
         driver.quit()
         print("Browser closed.")
@@ -769,10 +1133,15 @@ def combine_cabana_sales(csv_path):
             axis=1
         )
         
-        # Clean sale price for comparison
-        df['Sale_Price_Clean'] = df['Sale Price'].apply(
-            lambda x: float(str(x).replace('$', '').replace(',', '')) if pd.notna(x) else 0
+        # Clean sale price for comparison (robust to blanks/text/placeholders)
+        sale_price_clean = (
+            df['Sale Price']
+            .astype(str)
+            .str.replace(r'[\$,]', '', regex=True)
+            .str.strip()
+            .replace({'': None, 'N/A': None, 'NA': None, 'NONE': None, '-': None})
         )
+        df['Sale_Price_Clean'] = pd.to_numeric(sale_price_clean, errors='coerce').fillna(0.0)
         
         # Group by Sale Date and Owner Name to find same-day sales
         combined_rows = []
@@ -847,6 +1216,13 @@ def combine_cabana_sales(csv_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PBC off-market scraper")
     parser.add_argument("--city", help="Municipality (example: Palm Beach)")
+    parser.add_argument("--subdivision", help="Official subdivision name for subdivision mode search")
+    parser.add_argument(
+        "--search-mode",
+        choices=["municipality", "subdivision"],
+        default="municipality",
+        help="Search mode on PAPA sales page.",
+    )
     parser.add_argument("--start-date", help="Start date MM/DD/YYYY")
     parser.add_argument("--end-date", help="End date MM/DD/YYYY")
     parser.add_argument(
@@ -859,12 +1235,33 @@ if __name__ == "__main__":
         action="store_true",
         help="Do not prompt for missing inputs; use defaults."
     )
+    parser.add_argument("--headless", action="store_true", help="Run Chrome headlessly.")
+    parser.add_argument(
+        "--download-dir",
+        default=DOWNLOAD_FOLDER,
+        help="Directory for downloaded/exported CSVs.",
+    )
+    parser.add_argument(
+        "--chromedriver-port",
+        type=int,
+        default=9516,
+        help="Preferred local port for the ChromeDriver service; falls back to nearby ports if needed.",
+    )
     args = parser.parse_args()
 
-    run_scraper(
+    result = run_scraper(
         target_city=args.city,
+        target_subdivision=args.subdivision,
         start_date=args.start_date,
         end_date=args.end_date,
         use_last_imported=args.from_last_imported,
-        prompt_for_missing=(not args.non_interactive)
+        prompt_for_missing=(not args.non_interactive),
+        search_mode=args.search_mode,
+        headless=args.headless,
+        download_folder=args.download_dir,
+        chromedriver_port=args.chromedriver_port,
     )
+    if isinstance(result, dict):
+        print(f"result_status={result.get('status')}")
+        if result.get("final_csv"):
+            print(f"final_csv={result['final_csv']}")

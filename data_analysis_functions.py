@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from cabana_utils import likely_cabana_mask
 
 # ================================================================
 # PERIOD INDEX HELPERS
@@ -62,20 +63,63 @@ def _empty_stat_shell(freq, start, end, col):
         col: pd.NA
     })
 
+ACTIVE_LIKE_STATUSES = {"A", "ACTIVE", "ACT", "COMING SOON", "CS"}
+
+
+def _status_upper(df):
+    return df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+
+
+def _primary_inventory_mask(df):
+    """
+    Inventory metrics should use primary MLS-style listing ids only.
+    Exclude legacy/secondary feed ids that overcount active supply.
+    """
+    listing_numbers = df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+    return ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+
+
+def _non_cabana_mask(df):
+    if "cabana_flag" in df.columns:
+        return pd.to_numeric(df["cabana_flag"], errors="coerce").fillna(0).eq(0)
+    return ~likely_cabana_mask(df)
+
+
+def is_active_now(df, as_of_date=None):
+    """
+    Current-state inventory:
+    listing is active-like and either has no active-end date or active-end is after as_of_date.
+    """
+    as_of = pd.Timestamp(as_of_date) if as_of_date is not None else pd.Timestamp.now()
+    if "effective_active_end_date" not in df.columns:
+        return pd.Series(False, index=df.index)
+    status_active = _status_upper(df).isin(ACTIVE_LIKE_STATUSES)
+    return _primary_inventory_mask(df) & _non_cabana_mask(df) & status_active & (
+        df["effective_active_end_date"].isna() | (df["effective_active_end_date"] > as_of)
+    )
+
+
+def is_active_as_of(df, snapshot_date):
+    """
+    Historical snapshot inventory:
+    listing started by snapshot date and has not ended by snapshot date.
+    For NULL end-dates, require active-like status to avoid closed rows leaking into inventory.
+    """
+    snapshot_ts = pd.Timestamp(snapshot_date)
+    if "listing_date" not in df.columns or "effective_active_end_date" not in df.columns:
+        return pd.Series(False, index=df.index)
+    status_active = _status_upper(df).isin(ACTIVE_LIKE_STATUSES)
+    return _primary_inventory_mask(df) & _non_cabana_mask(df) & (df["listing_date"] <= snapshot_ts) & (
+        (df["effective_active_end_date"] > snapshot_ts)
+        | (df["effective_active_end_date"].isna() & status_active)
+    )
+
 
 def _active_snapshot_mask(df, snapshot_date):
     """
-    Active-at-snapshot mask with protection against bad NULL end-dates.
-    - If effective_active_end_date > snapshot -> include.
-    - If effective_active_end_date is NULL, include only if status is active-ish.
+    Backward-compatible alias for historical snapshot inventory.
     """
-    activeish = df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().isin(
-        ["A", "ACTIVE", "ACT", "COMING SOON", "CS"]
-    )
-    return (df["listing_date"] <= snapshot_date) & (
-        (df["effective_active_end_date"] > snapshot_date)
-        | (df["effective_active_end_date"].isna() & activeish)
-    )
+    return is_active_as_of(df, snapshot_date)
 
 # ================================================================
 # CORE METRIC FUNCTIONS
@@ -83,7 +127,7 @@ def _active_snapshot_mask(df, snapshot_date):
 
 def median_sold_price(df, freq, start, end):
     # Only sold items
-    df = df[df["sold_price"].notna() & df["sold_date"].notna()].copy()
+    df = df[df["sold_price"].notna() & df["sold_date"].notna() & _non_cabana_mask(df)].copy()
     return safe_group_aggregation(df, "sold_date", "sold_price", "median", freq, start, end, "Median Sold Price")
 
 def median_price_per_sqft(df, freq, start, end):
@@ -96,7 +140,8 @@ def median_price_per_sqft(df, freq, start, end):
         (df["sold_price"].notna()) & 
         (df["sqft_living"].notna()) & 
         (df["sqft_living"] > 0) & 
-        (df["sold_date"].notna())
+        (df["sold_date"].notna()) &
+        _non_cabana_mask(df)
     ]
     df["PPSF"] = df["sold_price"] / df["sqft_living"]
 
@@ -124,7 +169,7 @@ def median_list_price(df, freq, start, end):
         snapshot_date = period.to_timestamp(how='end')
         
         # Identify Active Listings at snapshot date
-        active_mask = _active_snapshot_mask(df, snapshot_date)
+        active_mask = is_active_as_of(df, snapshot_date)
         
         # Calculate Median of those active listings
         active_prices = df.loc[active_mask, "list_price"]
@@ -154,7 +199,7 @@ def median_list_price_per_sqft(df, freq, start, end):
         snapshot_date = period.to_timestamp(how='end')
         
         # Identify Active Listings at snapshot date
-        active_mask = _active_snapshot_mask(df, snapshot_date)
+        active_mask = is_active_as_of(df, snapshot_date)
         
         # Calculate Median of those active listings
         active_ppsf = df.loc[active_mask, "ListPPSF"]
@@ -174,7 +219,7 @@ def sales_count(df, freq, start, end):
     Counts ALL sales with a sold_date within the period.
     Example: Q1 Sales = Jan Sales + Feb Sales + Mar Sales.
     """
-    df = df[df["sold_date"].notna()].copy()
+    df = df[df["sold_date"].notna() & _non_cabana_mask(df)].copy()
     # Count rows (listing_number)
     return safe_group_aggregation(df, "sold_date", "listing_number", "count", freq, start, end, "Sales Count")
 
@@ -184,7 +229,7 @@ def total_sales_volume(df, freq, start, end):
     Sums sold_price for all sales within the period.
     Example: Q1 Volume = Sum of all sold prices in Jan, Feb, Mar.
     """
-    df = df[df["sold_date"].notna() & df["sold_price"].notna()].copy()
+    df = df[df["sold_date"].notna() & df["sold_price"].notna() & _non_cabana_mask(df)].copy()
     # Sum sold_price
     return safe_group_aggregation(df, "sold_date", "sold_price", "sum", freq, start, end, "Total Sales Volume")
 
@@ -195,7 +240,7 @@ def new_listings(df, freq, start, end):
     Current status does NOT matter (it could be Sold, Cancelled, Active now).
     As long as listing_date is in the period, it counts as a New Listing.
     """
-    df = df[df["listing_date"].notna()].copy()
+    df = df[df["listing_date"].notna() & _non_cabana_mask(df)].copy()
     return safe_group_aggregation(df, "listing_date", "listing_number", "count", freq, start, end, "New Listings")
 
 # --- NEW: PENDING SALES (New Contracts in Period) ---
@@ -204,7 +249,7 @@ def pending_sales(df, freq, start, end):
     Counts listings that went under contract (under_contract_date) within the period.
     This represents new pending sales / contracts signed.
     """
-    df = df[df["under_contract_date"].notna()].copy()
+    df = df[df["under_contract_date"].notna() & _non_cabana_mask(df)].copy()
     return safe_group_aggregation(df, "under_contract_date", "listing_number", "count", freq, start, end, "Pending Sales")
 
 def active_inventory(df, freq, start, end):
@@ -228,7 +273,7 @@ def active_inventory(df, freq, start, end):
     for period in period_idx:
         # Snapshot is END of period
         snapshot_date = period.to_timestamp(how='end')
-        mask = _active_snapshot_mask(df, snapshot_date)
+        mask = is_active_as_of(df, snapshot_date)
         out.append([period, mask.sum()])
     return pd.DataFrame(out, columns=["PeriodIndex", "Active Inventory"])
 
@@ -244,7 +289,7 @@ def pending_inventory(df, freq, start, end):
         else:
             df[c] = pd.NaT
 
-    df = df[df["under_contract_date"].notna()]
+    df = df[df["under_contract_date"].notna() & _primary_inventory_mask(df) & _non_cabana_mask(df)]
 
     # Determine Pending End Date (Earliest of Sold/Fallthrough/Cancel/Withdraw)
     df["calc_pending_end"] = pd.NaT
@@ -314,7 +359,7 @@ def new_pending_sales(df, freq, start, end):
     
     df = df.copy()
     df["under_contract_date"] = pd.to_datetime(df["under_contract_date"], errors="coerce")
-    df = df[df["under_contract_date"].notna()]
+    df = df[df["under_contract_date"].notna() & _non_cabana_mask(df)]
     
     # Filter to date range
     start_ts = pd.Timestamp(start)
@@ -339,7 +384,7 @@ def median_dom(df, freq, start, end):
     df = df.copy()
     df["listing_date"] = pd.to_datetime(df["listing_date"], errors="coerce")
     df["effective_active_end_date"] = pd.to_datetime(df["effective_active_end_date"], errors="coerce")
-    df = df[df["listing_date"].notna() & df["effective_active_end_date"].notna()].copy()
+    df = df[df["listing_date"].notna() & df["effective_active_end_date"].notna() & _non_cabana_mask(df)].copy()
     df["DOM"] = (df["effective_active_end_date"] - df["listing_date"]).dt.days
     # Group by when listing ended (sold/closed), not when it was listed
     return safe_group_aggregation(df, "effective_active_end_date", "DOM", "median", freq, start, end, "Median DOM")
@@ -350,7 +395,7 @@ def listing_discount(df, freq, start, end):
     df["sold_price"] = pd.to_numeric(df["sold_price"], errors="coerce")
     df["sold_date"] = pd.to_datetime(df["sold_date"], errors="coerce")
     
-    df = df[(df["sold_price"].notna()) & (df["original_list_price"] > 0)]
+    df = df[(df["sold_price"].notna()) & (df["original_list_price"] > 0) & _non_cabana_mask(df)]
     df["ListingDiscount"] = ((df["original_list_price"] - df["sold_price"]) / df["original_list_price"]) * 100
     
     return safe_group_aggregation(df, "sold_date", "ListingDiscount", "median", freq, start, end, "Listing Discount")
@@ -358,14 +403,14 @@ def listing_discount(df, freq, start, end):
 def subdivision_median_price(df, freq, start, end):
     df = df.copy()
     df["sold_date"] = pd.to_datetime(df["sold_date"], errors="coerce")
-    df = df[df["sold_price"].notna() & df["final_subdivision"].notna()]
+    df = df[df["sold_price"].notna() & df["final_subdivision"].notna() & _non_cabana_mask(df)]
     df["PeriodIndex"] = df["sold_date"].dt.to_period({"monthly": "M", "quarterly": "Q", "annually": "A"}[freq])
     return df.groupby(["PeriodIndex", "final_subdivision"])["sold_price"].median().reset_index().rename(columns={"sold_price": "Median Sold Price"})
 
 def cash_sales_percentage(df, freq, start, end):
     df = df.copy()
     df["sold_date"] = pd.to_datetime(df["sold_date"], errors="coerce")
-    df = df[df["sold_date"].notna()]
+    df = df[df["sold_date"].notna() & _non_cabana_mask(df)]
     df["terms_of_sale"] = df["terms_of_sale"].astype(str).str.upper()
     df["IsCash"] = df["terms_of_sale"].str.contains("CASH", na=False)
     
@@ -387,6 +432,7 @@ def months_supply(df, freq, start, end):
     df["listing_date"] = pd.to_datetime(df["listing_date"], errors="coerce")
     df["sold_date"] = pd.to_datetime(df["sold_date"], errors="coerce")
     df["effective_active_end_date"] = pd.to_datetime(df["effective_active_end_date"], errors="coerce")
+    df = df[_non_cabana_mask(df)].copy()
     
     # Determine the latest data point to avoid "future" windows
     max_sold_date = df["sold_date"].max()
@@ -400,7 +446,7 @@ def months_supply(df, freq, start, end):
         
         # 1. Active Count (Snapshot at End of Period)
         # We use the end of the period for consistent "projected" inventory
-        active_mask = _active_snapshot_mask(df, snapshot_date)
+        active_mask = is_active_as_of(df, snapshot_date)
         active_count = active_mask.sum()
         
         # 2. Sales Rate (Last 12 Months of ACTUAL Data)

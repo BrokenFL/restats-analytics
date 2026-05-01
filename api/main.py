@@ -2,20 +2,51 @@ import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, Literal
 import calendar
 import json
+from dataclasses import asdict
 
 import pandas as pd
+from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import data_analysis_functions as daf
+from cabana_utils import likely_cabana_mask
+from cma_module.db import (
+    build_pending_pressure_guardrail,
+    get_subject_by_parcel,
+    pull_candidate_sales,
+    pull_market_activity,
+    pull_pending_projection,
+    pull_surrounding_discount_metrics,
+)
+from cma_module.expansion import resolve_market_scope
+from cma_module.insights import build_closing_trends, build_community_insights
+from cma_module.scoring import build_candidate_pool, confidence_grade, score_candidates
+from cma_module.valuation import value_from_comps
+
+
+def _single_family_property_type_clause(column_name: str = "property_type") -> str:
+    normalized = f"UPPER(TRIM(COALESCE({column_name}, '')))"
+    return (
+        f"({normalized} IN ('SF','SFH','SINGLE FAMILY','SINGLE-FAMILY','SINGLE FAMILY HOME','SINGLE FAMILY RESIDENCE') "
+        f"OR {normalized} LIKE 'SINGLE FAMILY%')"
+    )
 
 
 def _default_db_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(here)
     return os.path.join(project_root, "mls.db")
+
+
+def _ops_project_root() -> str:
+    env_root = os.getenv("RESTATS_OPS_ROOT")
+    if env_root:
+        return env_root
+    return os.path.dirname(os.path.realpath(DB_PATH))
 
 
 DB_PATH = os.getenv("RESTATS_DB_PATH", _default_db_path())
@@ -35,6 +66,185 @@ app.add_middleware(
 )
 
 
+class KpiSummaryResponse(BaseModel):
+    total_records: Optional[int] = None
+    closed_count: Optional[int] = None
+    active_count: Optional[int] = None
+    active_inventory_current: Optional[int] = None
+    active_inventory_snapshot: Optional[int] = None
+    active_inventory_snapshot_date: Optional[str] = None
+    avg_sold_price: Optional[float] = None
+    avg_list_price: Optional[float] = None
+    avg_sp_lp_ratio: Optional[float] = None
+
+
+class ReportPeriodMetricsResponse(BaseModel):
+    sold_count: Optional[float] = None
+    total_sales_volume: Optional[float] = None
+    median_sold_price: Optional[float] = None
+    avg_sold_price: Optional[float] = None
+    median_price_per_sqft: Optional[float] = None
+    avg_list_price: Optional[float] = None
+    avg_sp_lp: Optional[float] = None
+    new_listings: Optional[float] = None
+    pending_sales: Optional[float] = None
+    pending_inventory: Optional[float] = None
+    active_inventory: Optional[float] = None
+    months_supply: Optional[float] = None
+    median_dom: Optional[float] = None
+    median_listing_discount: Optional[float] = None
+    cash_sales_percent: Optional[float] = None
+
+
+class ReportSummaryResponse(BaseModel):
+    report_mode: Literal["rolling", "monthly", "quarterly", "annual", "custom"]
+    period_days: int
+    period_label: str
+    current_start: str
+    current_end: str
+    previous_start: str
+    previous_end: str
+    current: ReportPeriodMetricsResponse
+    previous: ReportPeriodMetricsResponse
+    delta_pct: ReportPeriodMetricsResponse
+
+
+class PeriodSeriesRowResponse(BaseModel):
+    period: str
+    start_date: str
+    end_date: str
+    sold_count: Optional[float] = None
+    total_sales_volume: Optional[float] = None
+    median_sold_price: Optional[float] = None
+    avg_sold_price: Optional[float] = None
+    median_price_per_sqft: Optional[float] = None
+    avg_list_price: Optional[float] = None
+    avg_sp_lp: Optional[float] = None
+    new_listings: Optional[float] = None
+    pending_sales: Optional[float] = None
+    pending_inventory: Optional[float] = None
+    active_inventory: Optional[float] = None
+    months_supply: Optional[float] = None
+    median_dom: Optional[float] = None
+    median_listing_discount: Optional[float] = None
+    cash_sales_percent: Optional[float] = None
+
+
+class PeriodSeriesResponse(BaseModel):
+    frequency: Literal["monthly", "quarterly", "annual"]
+    periods: int
+    rows: list[PeriodSeriesRowResponse]
+
+
+class ReportListingRowResponse(BaseModel):
+    listing_number: str
+    parcel_id: Optional[str] = None
+    short_address: Optional[str] = None
+    city: Optional[str] = None
+    geo_zone: Optional[str] = None
+    final_subdivision: Optional[str] = None
+    property_type: Optional[str] = None
+    status: Optional[str] = None
+    unit_number: Optional[str] = None
+    listing_date: Optional[str] = None
+    under_contract_date: Optional[str] = None
+    sold_date: Optional[str] = None
+    effective_active_end_date: Optional[str] = None
+    list_price: Optional[float] = None
+    original_list_price: Optional[float] = None
+    sold_price: Optional[float] = None
+    sold_ppsf: Optional[float] = None
+    sp_lp_ratio: Optional[float] = None
+    total_bedrooms: Optional[float] = None
+    baths_total: Optional[float] = None
+    sqft_living: Optional[float] = None
+    geo_lat: Optional[float] = None
+    geo_lon: Optional[float] = None
+    terms_of_sale: Optional[str] = None
+    cabana_flag: bool = False
+    new_listing_in_period: bool
+    pending_in_period: bool
+    sold_in_period: bool
+    active_at_period_end: bool
+    pending_at_period_end: bool
+
+
+class ReportListingsResponse(BaseModel):
+    report_mode: Literal["rolling", "monthly", "quarterly", "annual", "custom"]
+    period_label: str
+    current_start: str
+    current_end: str
+    row_count: int
+    rows: list[ReportListingRowResponse]
+
+
+class ParityMetricRowResponse(BaseModel):
+    metric: str
+    legacy_value: Optional[float] = None
+    api_value: Optional[float] = None
+    delta: Optional[float] = None
+    delta_pct: Optional[float] = None
+    in_tolerance: bool
+
+
+class ParityResponse(BaseModel):
+    mode: Literal["monthly", "quarterly", "annual"]
+    current_start: str
+    current_end: str
+    tolerance_pct: float
+    metrics: list[ParityMetricRowResponse]
+    mismatch_count: int
+
+
+class CmaRunRequest(BaseModel):
+    parcel: str
+    as_of_date: Optional[str] = None
+    top_n: int = 10
+
+
+class CmaCompRow(BaseModel):
+    listing_number: str
+    bucket: Optional[str] = None
+    final_score: Optional[float] = None
+    similarity_score: Optional[float] = None
+    recency_multiplier: Optional[float] = None
+    location_points: Optional[float] = None
+    base_points: Optional[float] = None
+    feature_points: Optional[float] = None
+    recency_days: Optional[int] = None
+    distance_miles: Optional[float] = None
+    sold_date: Optional[str] = None
+    sold_price: Optional[float] = None
+    list_price: Optional[float] = None
+    ppsf: Optional[float] = None
+    short_address: Optional[str] = None
+    city: Optional[str] = None
+    final_subdivision: Optional[str] = None
+    property_type: Optional[str] = None
+    geo_lat: Optional[float] = None
+    geo_lon: Optional[float] = None
+    total_bedrooms: Optional[float] = None
+    baths_total: Optional[float] = None
+    sqft_living: Optional[float] = None
+    year_built: Optional[float] = None
+
+
+class CmaRunResponse(BaseModel):
+    subject: dict
+    as_of_date: str
+    valuation: dict
+    confidence_grade: str
+    confidence_reason: str
+    pending_projection: dict
+    surrounding_discount_metrics: dict
+    pending_pressure_guardrail: dict
+    closing_trends: dict
+    community_insights: dict
+    surrounding_area_context: dict
+    community_scope: dict
+    comps: list[CmaCompRow]
+
+
 def get_connection() -> sqlite3.Connection:
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=500, detail=f"Database not found: {DB_PATH}")
@@ -44,7 +254,35 @@ def get_connection() -> sqlite3.Connection:
 
 
 def _read_latest_audit_summary() -> dict:
-    path = os.path.join(os.path.dirname(_default_db_path()), "output", "audits", "latest_audit_summary.json")
+    path = os.path.join(_ops_project_root(), "output", "audits", "latest_audit_summary.json")
+    if not os.path.exists(path):
+        return {"available": False, "path": path}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        payload["available"] = True
+        payload["path"] = path
+        return payload
+    except Exception as e:
+        return {"available": False, "path": path, "error": str(e)}
+
+
+def _read_latest_guardrail_summary() -> dict:
+    path = os.path.join(_ops_project_root(), "output", "audits", "latest_guardrail_summary.json")
+    if not os.path.exists(path):
+        return {"available": False, "path": path}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        payload["available"] = True
+        payload["path"] = path
+        return payload
+    except Exception as e:
+        return {"available": False, "path": path, "error": str(e)}
+
+
+def _read_last_run_metadata() -> dict:
+    path = os.path.join(_ops_project_root(), "output", "ops", "last_run.json")
     if not os.path.exists(path):
         return {"available": False, "path": path}
     try:
@@ -167,41 +405,122 @@ def _safe_number(value) -> Optional[float]:
         return None
 
 
-def _active_snapshot_mask(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.Series:
-    activeish = df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().isin(
-        ["A", "ACTIVE", "ACT", "COMING SOON", "CS"]
+def _non_cabana_mask(df: pd.DataFrame) -> pd.Series:
+    if "cabana_flag" in df.columns:
+        return pd.to_numeric(df["cabana_flag"], errors="coerce").fillna(0).eq(0)
+    return ~likely_cabana_mask(df)
+
+
+STATUS_BUCKETS: dict[str, set[str]] = {
+    "Active": {"A", "ACTIVE", "ACT", "COMING SOON", "CS"},
+    "Pending": {"P", "PENDING", "U", "UNDER CONTRACT", "D", "BACKUP", "L"},
+    "Closed": {"C", "CLOSED", "SOLD", "S"},
+    "Expired": {"E", "EXPIRED"},
+    "Withdrawn": {"W", "WITHDRAWN"},
+    "Temp Off Market": {"O", "TEMP OFF MARKET", "TOM"},
+    "Hold": {"H", "HOLD"},
+    "Cancelled": {"X", "CANCELLED", "CANCELED"},
+}
+ACTIVE_BUCKET = "Active"
+
+
+def _status_upper(df: pd.DataFrame) -> pd.Series:
+    return df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+
+
+def _status_bucket(value: object) -> str:
+    s = str(value).upper().strip()
+    if not s or s == "NAN":
+        return "Unknown"
+    for bucket, values in STATUS_BUCKETS.items():
+        if s in values:
+            return bucket
+    return s.title()
+
+
+def _status_bucket_series(df: pd.DataFrame) -> pd.Series:
+    return _status_upper(df).map(_status_bucket)
+
+
+def _is_active_now_mask(df: pd.DataFrame, as_of_date: Optional[pd.Timestamp] = None) -> pd.Series:
+    if "effective_active_end_date" not in df.columns:
+        return pd.Series(False, index=df.index)
+    as_of = pd.Timestamp(as_of_date) if as_of_date is not None else pd.Timestamp.now()
+    status_active = _status_bucket_series(df).eq(ACTIVE_BUCKET)
+    listing_numbers = df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+    primary_inventory = ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+    return primary_inventory & _non_cabana_mask(df) & status_active & (
+        df["effective_active_end_date"].isna() | (df["effective_active_end_date"] > as_of)
     )
-    return (df["listing_date"].notna()) & (df["listing_date"] <= snapshot_date) & (
+
+
+def _is_active_as_of_mask(df: pd.DataFrame, snapshot_date: pd.Timestamp) -> pd.Series:
+    if "listing_date" not in df.columns or "effective_active_end_date" not in df.columns:
+        return pd.Series(False, index=df.index)
+    status_active = _status_bucket_series(df).eq(ACTIVE_BUCKET)
+    listing_numbers = df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+    primary_inventory = ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+    return primary_inventory & _non_cabana_mask(df) & (df["listing_date"].notna()) & (df["listing_date"] <= snapshot_date) & (
         (df["effective_active_end_date"] > snapshot_date)
-        | (df["effective_active_end_date"].isna() & activeish)
+        | (df["effective_active_end_date"].isna() & status_active)
     )
 
 
 def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> dict:
     start_ts = pd.Timestamp(start_iso).normalize()
     end_ts = pd.Timestamp(end_iso).normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    non_cabana = _non_cabana_mask(df)
 
-    sold = df[(df["sold_date"].notna()) & (df["sold_date"] >= start_ts) & (df["sold_date"] <= end_ts)].copy()
-    listed = df[(df["listing_date"].notna()) & (df["listing_date"] >= start_ts) & (df["listing_date"] <= end_ts)].copy()
+    sold = df[non_cabana & (df["sold_date"].notna()) & (df["sold_date"] >= start_ts) & (df["sold_date"] <= end_ts)].copy()
+    listed = df[non_cabana & (df["listing_date"].notna()) & (df["listing_date"] >= start_ts) & (df["listing_date"] <= end_ts)].copy()
     pending = df[
+        non_cabana
+        &
         (df["under_contract_date"].notna())
         & (df["under_contract_date"] >= start_ts)
         & (df["under_contract_date"] <= end_ts)
     ].copy()
 
     snapshot_date = end_ts
-    active_mask = _active_snapshot_mask(df, snapshot_date)
+    active_mask = _is_active_as_of_mask(df, snapshot_date)
     active_inventory = int(active_mask.sum())
+    pending_bucket = _status_bucket_series(df).eq("Pending")
+    listing_numbers = df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+    primary_inventory = ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+    pending_inventory_mask = (
+        primary_inventory
+        & non_cabana
+        &
+        df["under_contract_date"].notna()
+        & (df["under_contract_date"] <= snapshot_date)
+        & (df["sold_date"].isna() | (df["sold_date"] > snapshot_date))
+        & (
+            df["effective_active_end_date"].isna()
+            | (df["effective_active_end_date"] > snapshot_date)
+            | pending_bucket
+        )
+    )
+    pending_inventory = int(pending_inventory_mask.sum())
 
     sales_count = int(len(sold))
-    # Match legacy months-supply logic: active snapshot / (trailing 12mo sales / 12)
-    twelve_months_ago = end_ts - pd.DateOffset(months=12)
-    sales_12mo = int(((df["sold_date"].notna()) & (df["sold_date"] > twelve_months_ago) & (df["sold_date"] <= end_ts)).sum())
+    # Match legacy months-supply logic including clamp to latest known sold_date.
+    max_sold_date = df["sold_date"].max()
+    if pd.isna(max_sold_date):
+        max_sold_date = pd.Timestamp.now()
+    period_start_ts = pd.Timestamp(start_iso).normalize()
+    effective_sales_end = min(snapshot_date, max_sold_date)
+    if effective_sales_end < snapshot_date and effective_sales_end < period_start_ts:
+        effective_sales_end = snapshot_date
+
+    twelve_months_ago = effective_sales_end - pd.DateOffset(months=12)
+    sales_12mo = int(
+        (non_cabana & (df["sold_date"].notna()) & (df["sold_date"] > twelve_months_ago) & (df["sold_date"] <= effective_sales_end)).sum()
+    )
     sales_rate = sales_12mo / 12.0
     months_supply = (active_inventory / sales_rate) if sales_rate > 0 else (0 if active_inventory == 0 else 999)
 
     # Match legacy median_dom logic: listing_date/effective_active_end_date where end date falls in period.
-    dom_df = df[df["listing_date"].notna() & df["effective_active_end_date"].notna()].copy()
+    dom_df = df[non_cabana & df["listing_date"].notna() & df["effective_active_end_date"].notna()].copy()
     dom_df = dom_df[(dom_df["effective_active_end_date"] >= start_ts) & (dom_df["effective_active_end_date"] <= end_ts)]
     dom_series = (dom_df["effective_active_end_date"] - dom_df["listing_date"]).dt.days
 
@@ -237,12 +556,111 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
         ) if "sold_price" in sold.columns and "list_price" in sold.columns else None,
         "new_listings": int(len(listed)),
         "pending_sales": int(len(pending)),
+        "pending_inventory": pending_inventory,
         "active_inventory": active_inventory,
         "months_supply": _safe_number(months_supply),
         "median_dom": _safe_number(dom_series.median()) if dom_series is not None and not dom_series.empty else None,
         "median_listing_discount": _safe_number(discount_series.median()) if discount_series is not None and not discount_series.empty else None,
         "cash_sales_percent": cash_sales_percent,
     }
+
+
+def _build_report_listing_rows(df: pd.DataFrame, start_iso: str, end_iso: str) -> list[dict]:
+    start_ts = pd.Timestamp(start_iso).normalize()
+    end_ts = pd.Timestamp(end_iso).normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+    rows = df.copy()
+    rows["cabana_flag"] = ~_non_cabana_mask(rows)
+    rows["new_listing_in_period"] = (
+        rows["listing_date"].notna() & (rows["listing_date"] >= start_ts) & (rows["listing_date"] <= end_ts)
+    )
+    rows["pending_in_period"] = (
+        rows["under_contract_date"].notna()
+        & (rows["under_contract_date"] >= start_ts)
+        & (rows["under_contract_date"] <= end_ts)
+    )
+    rows["sold_in_period"] = (
+        rows["sold_date"].notna() & (rows["sold_date"] >= start_ts) & (rows["sold_date"] <= end_ts)
+    )
+    rows["active_at_period_end"] = _is_active_as_of_mask(rows, end_ts)
+
+    pending_bucket = _status_bucket_series(rows).eq("Pending")
+    listing_numbers = rows.get("listing_number", pd.Series(index=rows.index, dtype="object")).astype(str).str.upper().str.strip()
+    primary_inventory = ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+    rows["pending_at_period_end"] = (
+        primary_inventory
+        & rows["under_contract_date"].notna()
+        & (rows["under_contract_date"] <= end_ts)
+        & (rows["sold_date"].isna() | (rows["sold_date"] > end_ts))
+        & (
+            rows["effective_active_end_date"].isna()
+            | (rows["effective_active_end_date"] > end_ts)
+            | pending_bucket
+        )
+    )
+
+    contributor_mask = (
+        rows["new_listing_in_period"]
+        | rows["pending_in_period"]
+        | rows["sold_in_period"]
+        | rows["active_at_period_end"]
+        | rows["pending_at_period_end"]
+    )
+    rows = rows[contributor_mask].copy()
+
+    def _date_col(series: pd.Series) -> pd.Series:
+        return pd.to_datetime(series, errors="coerce").dt.date.astype("string")
+
+    for col in ["listing_date", "under_contract_date", "sold_date", "effective_active_end_date"]:
+        rows[col] = _date_col(rows[col])
+
+    rows["sold_ppsf"] = None
+    valid_ppsf = (rows["sqft_living"] > 0) & (rows["sold_price"] > 0)
+    rows.loc[valid_ppsf, "sold_ppsf"] = (rows.loc[valid_ppsf, "sold_price"] / rows.loc[valid_ppsf, "sqft_living"]).round(2)
+
+    rows["sp_lp_ratio"] = None
+    valid_ratio = (rows["list_price"] > 0) & (rows["sold_price"] > 0)
+    rows.loc[valid_ratio, "sp_lp_ratio"] = ((rows.loc[valid_ratio, "sold_price"] / rows.loc[valid_ratio, "list_price"]) * 100).round(2)
+
+    rows = rows.sort_values(
+        by=["sold_in_period", "sold_date", "pending_in_period", "under_contract_date", "new_listing_in_period", "listing_date", "sold_price"],
+        ascending=[False, False, False, False, False, False, False],
+        na_position="last",
+    )
+
+    cols = [
+        "listing_number",
+        "parcel_id",
+        "short_address",
+        "city",
+        "geo_zone",
+        "final_subdivision",
+        "property_type",
+        "status",
+        "unit_number",
+        "listing_date",
+        "under_contract_date",
+        "sold_date",
+        "effective_active_end_date",
+        "list_price",
+        "original_list_price",
+        "sold_price",
+        "sold_ppsf",
+        "sp_lp_ratio",
+        "total_bedrooms",
+        "baths_total",
+        "sqft_living",
+        "geo_lat",
+        "geo_lon",
+        "terms_of_sale",
+        "cabana_flag",
+        "new_listing_in_period",
+        "pending_in_period",
+        "sold_in_period",
+        "active_at_period_end",
+        "pending_at_period_end",
+    ]
+    return rows[cols].replace({pd.NA: None}).where(pd.notna(rows[cols]), None).to_dict(orient="records")
 
 
 def _resolve_anchor_period(
@@ -265,6 +683,57 @@ def _resolve_anchor_period(
         return pd.Period(f"{y}Q{q}", freq="Q")
     y = end_year or (end_dt.year if end_dt else today.year)
     return pd.Period(str(y), freq="Y")
+
+
+def _series_last_value(df: pd.DataFrame, col: str) -> Optional[float]:
+    if df is None or df.empty or col not in df.columns:
+        return None
+    return _safe_number(df.iloc[-1][col])
+
+
+def _compute_legacy_period_metrics(df: pd.DataFrame, mode: str, start_iso: str, end_iso: str) -> dict:
+    freq = "annually" if mode == "annual" else mode
+    sales_df = daf.sales_count(df, freq, start_iso, end_iso)
+    volume_df = daf.total_sales_volume(df, freq, start_iso, end_iso)
+    median_price_df = daf.median_sold_price(df, freq, start_iso, end_iso)
+    ppsf_df = daf.median_price_per_sqft(df, freq, start_iso, end_iso)
+    new_listings_df = daf.new_listings(df, freq, start_iso, end_iso)
+    pending_df = daf.pending_sales(df, freq, start_iso, end_iso)
+    active_df = daf.active_inventory(df, freq, start_iso, end_iso)
+    msi_df = daf.months_supply(df, freq, start_iso, end_iso)
+    dom_df = daf.median_dom(df, freq, start_iso, end_iso)
+    discount_df = daf.listing_discount(df, freq, start_iso, end_iso)
+    cash_df = daf.cash_sales_percentage(df, freq, start_iso, end_iso)
+
+    sold_slice = df[
+        (df["sold_date"].notna())
+        & (df["sold_date"] >= pd.Timestamp(start_iso))
+        & (df["sold_date"] <= pd.Timestamp(end_iso) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1))
+    ]
+
+    sp_lp = None
+    if {"sold_price", "list_price"}.issubset(sold_slice.columns):
+        ratio = sold_slice[(sold_slice["sold_price"] > 0) & (sold_slice["list_price"] > 0)]
+        if not ratio.empty:
+            sp_lp = _safe_number(((ratio["sold_price"] / ratio["list_price"]) * 100).mean())
+
+    return {
+        "sold_count": _series_last_value(sales_df, "Sales Count"),
+        "total_sales_volume": _series_last_value(volume_df, "Total Sales Volume"),
+        "median_sold_price": _series_last_value(median_price_df, "Median Sold Price"),
+        "avg_sold_price": _safe_number(sold_slice["sold_price"].mean()) if "sold_price" in sold_slice.columns else None,
+        "median_price_per_sqft": _series_last_value(ppsf_df, "Median Price Per SqFt"),
+        "avg_list_price": _safe_number(sold_slice["list_price"].mean()) if "list_price" in sold_slice.columns else None,
+        "avg_sp_lp": sp_lp,
+        "new_listings": _series_last_value(new_listings_df, "New Listings"),
+        "pending_sales": _series_last_value(pending_df, "Pending Sales"),
+        "pending_inventory": None,
+        "active_inventory": _series_last_value(active_df, "Active Inventory"),
+        "months_supply": _series_last_value(msi_df, "Months Supply"),
+        "median_dom": _series_last_value(dom_df, "Median DOM"),
+        "median_listing_discount": _series_last_value(discount_df, "Listing Discount"),
+        "cash_sales_percent": _series_last_value(cash_df, "Cash Sales %"),
+    }
 
 
 def _append_common_filters(
@@ -292,13 +761,9 @@ def _append_common_filters(
     if property_group and property_group.upper() != "ALL":
         pg = property_group.upper()
         if pg == "SINGLE_FAMILY":
-            where_clauses.append(
-                "UPPER(COALESCE(property_type, '')) IN ('SF','SINGLE FAMILY','SINGLE-FAMILY','SINGLE FAMILY HOME')"
-            )
+            where_clauses.append(_single_family_property_type_clause())
         elif pg == "TOWNHOME_CONDO":
-            where_clauses.append(
-                "UPPER(COALESCE(property_type, '')) NOT IN ('SF','SINGLE FAMILY','SINGLE-FAMILY','SINGLE FAMILY HOME')"
-            )
+            where_clauses.append(f"NOT {_single_family_property_type_clause()}")
         elif pg == "ALL":
             pass
         else:
@@ -309,6 +774,39 @@ def _append_common_filters(
         params.append(sold_since)
 
 
+def _coerce_iso_date(value: Optional[str]) -> str:
+    if not value:
+        return date.today().isoformat()
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of_date must be YYYY-MM-DD") from exc
+
+
+def _load_comp_details_map(conn: sqlite3.Connection, listing_numbers: list[str]) -> dict[str, dict]:
+    if not listing_numbers:
+        return {}
+    placeholders = ",".join(["?"] * len(listing_numbers))
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT
+          listing_number, sold_date, sold_price, list_price,
+          short_address, city, final_subdivision, property_type,
+          geo_lat, geo_lon, total_bedrooms, baths_total, baths_full, baths_half, sqft_living, year_built
+        FROM listing_details
+        WHERE listing_number IN ({placeholders})
+        """,
+        listing_numbers,
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    out: dict[str, dict] = {}
+    for r in rows:
+        key = str(r.get("listing_number") or "")
+        out[key] = r
+    return out
+
+
 @app.get("/api/health")
 def health() -> dict:
     with closing(get_connection()) as conn:
@@ -316,6 +814,102 @@ def health() -> dict:
         cursor.execute("SELECT COUNT(*) AS cnt FROM listing_details")
         count = cursor.fetchone()["cnt"]
     return {"ok": True, "database": DB_PATH, "listing_count": count}
+
+
+@app.post("/api/cma/run", response_model=CmaRunResponse)
+def cma_run(payload: CmaRunRequest) -> dict:
+    as_of_date = _coerce_iso_date(payload.as_of_date)
+    top_n = max(5, min(int(payload.top_n or 15), 50))
+
+    try:
+        subject = get_subject_by_parcel(payload.parcel, as_of_date=as_of_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    scope = resolve_market_scope(subject.pcn_10_digit or subject.parcel_id, subject.final_subdivision or "")
+    sales_df = pull_candidate_sales(as_of_date=as_of_date, months_back=12)
+    candidates = build_candidate_pool(subject, sales_df, scope, as_of_date=as_of_date)
+    scored = score_candidates(subject, candidates, as_of_date=as_of_date, top_n=top_n)
+    conf_grade, conf_reason = confidence_grade(scored)
+
+    context = pull_market_activity(subject, as_of_date=as_of_date)
+    pending_projection = pull_pending_projection(subject, scope, as_of_date=as_of_date)
+    surrounding_discount_metrics = pull_surrounding_discount_metrics(subject, as_of_date=as_of_date)
+    pending_pressure_guardrail = build_pending_pressure_guardrail(
+        subject,
+        scope,
+        as_of_date=as_of_date,
+        pending_projection=pending_projection,
+        surrounding_discount_metrics=surrounding_discount_metrics,
+        surrounding_context=context,
+    )
+    community_insights = build_community_insights(subject, sales_df, scope, as_of_date=as_of_date)
+    closing_trends = build_closing_trends(subject, sales_df, scope, as_of_date=as_of_date)
+    valuation = value_from_comps(
+        subject,
+        scored,
+        community_insights=community_insights,
+        guardrail_context=pending_pressure_guardrail,
+    )
+    valuation["confidence_grade"] = conf_grade
+    valuation["confidence_reason"] = conf_reason
+
+    listing_numbers = [c.listing_number for c in scored]
+    with closing(get_connection()) as conn:
+        detail_map = _load_comp_details_map(conn, listing_numbers)
+
+    comps: list[dict] = []
+    for comp in scored:
+        d = asdict(comp)
+        more = detail_map.get(comp.listing_number, {})
+        baths_total = _safe_number(more.get("baths_total"))
+        if baths_total is None:
+            full = _safe_number(more.get("baths_full")) or 0.0
+            half = _safe_number(more.get("baths_half")) or 0.0
+            calc = full + (half * 0.5)
+            baths_total = calc if calc > 0 else None
+        merged = {
+            **d,
+            "short_address": more.get("short_address"),
+            "city": more.get("city", d.get("city")),
+            "final_subdivision": more.get("final_subdivision", d.get("final_subdivision")),
+            "property_type": more.get("property_type"),
+            "geo_lat": _safe_number(more.get("geo_lat")),
+            "geo_lon": _safe_number(more.get("geo_lon")),
+            "total_bedrooms": _safe_number(more.get("total_bedrooms")),
+            "baths_total": baths_total,
+            "sqft_living": _safe_number(more.get("sqft_living")),
+            "year_built": _safe_number(more.get("year_built")),
+            "sold_price": _safe_number(more.get("sold_price", d.get("sold_price"))),
+            "list_price": _safe_number(more.get("list_price")),
+            "sold_date": str(more.get("sold_date", d.get("sold_date") or ""))[:10] if (more.get("sold_date") or d.get("sold_date")) else None,
+        }
+        comps.append(merged)
+
+    same_community = sales_df[sales_df["final_subdivision"].isin(scope.get("final_subdivision_set", set()))].copy()
+    community_source_breakdown = (
+        same_community.groupby("source_type").size().to_dict() if not same_community.empty else {}
+    )
+
+    return {
+        "subject": asdict(subject),
+        "as_of_date": as_of_date,
+        "valuation": valuation,
+        "confidence_grade": conf_grade,
+        "confidence_reason": conf_reason,
+        "pending_projection": pending_projection,
+        "surrounding_discount_metrics": surrounding_discount_metrics,
+        "pending_pressure_guardrail": pending_pressure_guardrail,
+        "closing_trends": closing_trends,
+        "community_insights": community_insights,
+        "surrounding_area_context": context,
+        "community_scope": {
+            "final_subdivision_count": len(scope.get("final_subdivision_set", [])),
+            "community_sales_pool_count": int(len(same_community)),
+            "community_source_breakdown": community_source_breakdown,
+        },
+        "comps": comps,
+    }
 
 
 @app.get("/api/ops/status")
@@ -347,6 +941,9 @@ def ops_status() -> dict:
         )
         last_mls_status = cur.fetchone()["last_dt"]
 
+        cur.execute("SELECT MAX(DATE(sold_date)) AS dt FROM listing_details WHERE sold_date IS NOT NULL")
+        last_sold = cur.fetchone()["dt"]
+
         cur.execute(
             """
             SELECT property_type, COUNT(*) AS cnt
@@ -357,19 +954,146 @@ def ops_status() -> dict:
         )
         property_type_distribution = [dict(r) for r in cur.fetchall()]
 
+        cur.execute("SELECT status FROM listing_details")
+        status_df = pd.DataFrame([dict(r) for r in cur.fetchall()])
+        if status_df.empty:
+            status_distribution = []
+            status_bucket_distribution = []
+        else:
+            raw = (
+                _status_upper(status_df)
+                .replace({"": "Unknown", "NAN": "Unknown"})
+                .value_counts()
+                .reset_index()
+                .rename(columns={"index": "status", "count": "cnt"})
+            )
+            status_distribution = raw.to_dict(orient="records")
+            buckets = (
+                _status_bucket_series(status_df)
+                .value_counts()
+                .reset_index()
+                .rename(columns={"index": "status", "count": "cnt"})
+            )
+            status_bucket_distribution = buckets.to_dict(orient="records")
+
+    def _days_since(v: Optional[str]) -> Optional[int]:
+        if not v:
+            return None
+        d = _parse_iso_date(v)
+        if d is None:
+            return None
+        return (date.today() - d).days
+
     return {
         "database": {
             "path": DB_PATH,
             "listing_count": listing_count,
             "last_mls_status_date": last_mls_status,
             "last_off_market_sold_date": last_off_market_sold,
+            "last_sold_date": last_sold,
+            "mls_status_lag_days": _days_since(last_mls_status),
+            "sold_lag_days": _days_since(last_sold),
             "property_type_distribution": property_type_distribution,
+            "status_distribution": status_distribution,
+            "status_bucket_distribution": status_bucket_distribution,
         },
         "duplicate_audit": _read_latest_audit_summary(),
+        "guardrail_audit": _read_latest_guardrail_summary(),
+        "last_run": _read_last_run_metadata(),
     }
 
 
-@app.get("/api/summary/kpis")
+@app.get("/api/ops/parity", response_model=ParityResponse)
+def ops_parity(
+    mode: Literal["monthly", "quarterly", "annual"] = Query(default="monthly"),
+    year: int = Query(default_factory=lambda: date.today().year),
+    month: Optional[int] = Query(default=None, ge=1, le=12),
+    quarter: Optional[int] = Query(default=None, ge=1, le=4),
+    city: Optional[str] = Query(default=None),
+    final_subdivision: Optional[str] = Query(default=None),
+    property_type: Optional[str] = Query(default=None),
+    geo_zone: Optional[str] = Query(default=None),
+    property_group: Optional[str] = Query(default="ALL"),
+    tolerance_pct: float = Query(default=0.5, ge=0.0, le=100.0),
+) -> dict:
+    current_start, current_end, _, _, _ = _resolve_report_window(
+        report_mode=mode,
+        period_days=30,
+        ref_year=year,
+        ref_month=month,
+        ref_quarter=quarter,
+        start_date=None,
+        end_date=None,
+    )
+    where_clauses = ["1=1"]
+    params: list[str] = []
+    _append_common_filters(
+        where_clauses,
+        params,
+        city,
+        final_subdivision,
+        property_type,
+        geo_zone=geo_zone,
+        property_group=property_group,
+    )
+    where_sql = " AND ".join(where_clauses)
+
+    with closing(get_connection()) as conn:
+        df = pd.read_sql_query(
+            f"""
+            SELECT
+                listing_number, city, final_subdivision, geo_zone, property_type, status,
+                listing_date, effective_active_end_date, under_contract_date, sold_date,
+                list_price, original_list_price, sold_price, terms_of_sale, cabana_flag,
+                sqft_living, days_on_market, cumulative_dom
+            FROM listing_details
+            WHERE {where_sql}
+            """,
+            conn,
+            params=params,
+        )
+
+    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["days_on_market"] = df["days_on_market"].fillna(df["cumulative_dom"])
+
+    api_metrics = _compute_period_metrics(df, current_start, current_end)
+    legacy_metrics = _compute_legacy_period_metrics(df, mode, current_start, current_end)
+
+    metrics: list[dict] = []
+    mismatches = 0
+    for metric in sorted(set(api_metrics.keys()) | set(legacy_metrics.keys())):
+        legacy_v = _safe_number(legacy_metrics.get(metric))
+        api_v = _safe_number(api_metrics.get(metric))
+        delta = None if legacy_v is None or api_v is None else round(api_v - legacy_v, 6)
+        delta_pct = _pct_change(api_v, legacy_v)
+        in_tolerance = True if delta_pct is None else abs(delta_pct) <= tolerance_pct
+        if not in_tolerance:
+            mismatches += 1
+        metrics.append(
+            {
+                "metric": metric,
+                "legacy_value": legacy_v,
+                "api_value": api_v,
+                "delta": delta,
+                "delta_pct": delta_pct,
+                "in_tolerance": in_tolerance,
+            }
+        )
+
+    return {
+        "mode": mode,
+        "current_start": current_start,
+        "current_end": current_end,
+        "tolerance_pct": tolerance_pct,
+        "metrics": metrics,
+        "mismatch_count": mismatches,
+    }
+
+
+@app.get("/api/summary/kpis", response_model=KpiSummaryResponse)
 def summary_kpis(
     city: Optional[str] = Query(default=None),
     final_subdivision: Optional[str] = Query(default=None),
@@ -377,6 +1101,7 @@ def summary_kpis(
     geo_zone: Optional[str] = Query(default=None),
     property_group: Optional[str] = Query(default="ALL"),
     sold_since: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    snapshot_date: Optional[str] = Query(default=None, description="YYYY-MM-DD for as-of inventory snapshot"),
 ) -> dict:
     where_clauses = ["1=1"]
     params: list[str] = []
@@ -394,26 +1119,61 @@ def summary_kpis(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
+        active_df = pd.read_sql_query(
             f"""
-            SELECT
-                COUNT(*) AS total_records,
-                SUM(CASE WHEN status IN ('C', 'Closed', 'Sold') THEN 1 ELSE 0 END) AS closed_count,
-                SUM(CASE WHEN status IN ('A', 'Active', 'Coming Soon') THEN 1 ELSE 0 END) AS active_count,
-                ROUND(AVG(CASE WHEN sold_price > 0 THEN sold_price END), 2) AS avg_sold_price,
-                ROUND(AVG(CASE WHEN list_price > 0 THEN list_price END), 2) AS avg_list_price,
-                ROUND(AVG(CASE
-                    WHEN sold_price > 0 AND list_price > 0 THEN (sold_price / list_price) * 100
-                END), 2) AS avg_sp_lp_ratio
+            SELECT listing_number, listing_date, effective_active_end_date, status, sold_price, list_price
+                 , cabana_flag
             FROM listing_details
             WHERE {where_sql}
             """,
-            params,
+            conn,
+            params=params,
         )
-        row = cursor.fetchone()
 
-    return dict(row)
+    if active_df.empty:
+        row = {
+            "total_records": 0,
+            "closed_count": 0,
+            "avg_sold_price": None,
+            "avg_list_price": None,
+            "avg_sp_lp_ratio": None,
+        }
+    else:
+        active_df = active_df[_non_cabana_mask(active_df)].copy()
+        active_df["sold_price"] = pd.to_numeric(active_df["sold_price"], errors="coerce")
+        active_df["list_price"] = pd.to_numeric(active_df["list_price"], errors="coerce")
+        status_bucket = _status_bucket_series(active_df)
+        ratio_df = active_df[(active_df["sold_price"] > 0) & (active_df["list_price"] > 0)]
+        row = {
+            "total_records": int(len(active_df)),
+            "closed_count": int(status_bucket.eq("Closed").sum()),
+            "avg_sold_price": _safe_number(active_df.loc[active_df["sold_price"] > 0, "sold_price"].mean()),
+            "avg_list_price": _safe_number(active_df.loc[active_df["list_price"] > 0, "list_price"].mean()),
+            "avg_sp_lp_ratio": _safe_number(((ratio_df["sold_price"] / ratio_df["list_price"]) * 100).mean()) if not ratio_df.empty else None,
+        }
+
+    if active_df.empty:
+        active_current = 0
+        active_snapshot = 0
+    else:
+        active_df["listing_date"] = pd.to_datetime(active_df["listing_date"], errors="coerce")
+        active_df["effective_active_end_date"] = pd.to_datetime(active_df["effective_active_end_date"], errors="coerce")
+        active_current = int(_is_active_now_mask(active_df).sum())
+        if snapshot_date:
+            parsed_snapshot = _parse_iso_date(snapshot_date)
+            if parsed_snapshot is None:
+                raise HTTPException(status_code=400, detail="snapshot_date must be YYYY-MM-DD")
+            snapshot_ts = pd.Timestamp(parsed_snapshot)
+        else:
+            snapshot_ts = pd.Timestamp.now().normalize()
+        active_snapshot = int(_is_active_as_of_mask(active_df, snapshot_ts).sum())
+
+    row["active_inventory_current"] = active_current
+    row["active_inventory_snapshot"] = active_snapshot
+    row["active_inventory_snapshot_date"] = snapshot_date or date.today().isoformat()
+    # Backward compatibility for older clients expecting active_count.
+    row["active_count"] = active_current
+    return row
 
 
 @app.get("/api/market/trends")
@@ -430,6 +1190,7 @@ def market_trends(
 ) -> dict:
     where_clauses = [
         "sold_date IS NOT NULL",
+        "COALESCE(cabana_flag, 0) = 0",
     ]
     params: list[str] = []
     if start_date and end_date:
@@ -488,7 +1249,7 @@ def inventory_by_status(
     geo_zone: Optional[str] = Query(default=None),
     property_group: Optional[str] = Query(default="ALL"),
 ) -> dict:
-    where_clauses = ["1=1"]
+    where_clauses = ["COALESCE(cabana_flag, 0) = 0"]
     params: list[str] = []
     _append_common_filters(
         where_clauses,
@@ -503,41 +1264,20 @@ def inventory_by_status(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
+        df = pd.read_sql_query(
             f"""
-            SELECT
-                CASE
-                    WHEN status IN ('C', 'Closed', 'Sold') THEN 'Closed'
-                    WHEN status IN ('A', 'Active') THEN 'Active'
-                    WHEN status IN ('L') THEN 'Under Contract'
-                    WHEN status IN ('P') THEN 'Pending'
-                    WHEN status IN ('E') THEN 'Expired'
-                    WHEN status IN ('W') THEN 'Withdrawn'
-                    WHEN status IN ('O') THEN 'Temp Off Market'
-                    WHEN status IN ('H') THEN 'Hold'
-                    ELSE COALESCE(status, 'Unknown')
-                END AS status,
-                COUNT(*) AS count
+            SELECT status
             FROM listing_details
             WHERE {where_sql}
-            GROUP BY
-                CASE
-                    WHEN status IN ('C', 'Closed', 'Sold') THEN 'Closed'
-                    WHEN status IN ('A', 'Active') THEN 'Active'
-                    WHEN status IN ('L') THEN 'Under Contract'
-                    WHEN status IN ('P') THEN 'Pending'
-                    WHEN status IN ('E') THEN 'Expired'
-                    WHEN status IN ('W') THEN 'Withdrawn'
-                    WHEN status IN ('O') THEN 'Temp Off Market'
-                    WHEN status IN ('H') THEN 'Hold'
-                    ELSE COALESCE(status, 'Unknown')
-                END
-            ORDER BY count DESC
             """,
-            params,
+            conn,
+            params=params,
         )
-        rows = [dict(r) for r in cursor.fetchall()]
+    if df.empty:
+        rows = []
+    else:
+        counts = _status_bucket_series(df).value_counts()
+        rows = [{"status": str(k), "count": int(v)} for k, v in counts.items()]
 
     return {"rows": rows}
 
@@ -674,8 +1414,18 @@ def recent_listings(
                 geo_zone,
                 property_type,
                 status,
+                total_bedrooms,
+                baths_total,
+                sqft_living,
+                geo_lat,
+                geo_lon,
                 list_price,
                 sold_price,
+                cabana_flag,
+                CASE
+                    WHEN sqft_living > 0 AND sold_price > 0 THEN ROUND((sold_price / sqft_living), 2)
+                    ELSE NULL
+                END AS sold_ppsf,
                 CASE
                     WHEN list_price > 0 AND sold_price > 0 THEN ROUND((sold_price / list_price) * 100, 2)
                     ELSE NULL
@@ -692,7 +1442,7 @@ def recent_listings(
     return {"rows": rows, "limit": limit}
 
 
-@app.get("/api/market/report-summary")
+@app.get("/api/market/report-summary", response_model=ReportSummaryResponse)
 def market_report_summary(
     report_mode: str = Query(default="rolling", pattern="^(rolling|monthly|quarterly|annual|custom)$"),
     period_days: int = Query(default=30, ge=7, le=366),
@@ -747,6 +1497,7 @@ def market_report_summary(
                 list_price,
                 original_list_price,
                 sold_price,
+                cabana_flag,
                 terms_of_sale,
                 sqft_living,
                 days_on_market,
@@ -785,6 +1536,94 @@ def market_report_summary(
     }
 
 
+@app.get("/api/market/report-listings", response_model=ReportListingsResponse)
+def market_report_listings(
+    report_mode: str = Query(default="rolling", pattern="^(rolling|monthly|quarterly|annual|custom)$"),
+    period_days: int = Query(default=30, ge=7, le=366),
+    ref_year: Optional[int] = Query(default=None),
+    ref_month: Optional[int] = Query(default=None, ge=1, le=12),
+    ref_quarter: Optional[int] = Query(default=None, ge=1, le=4),
+    start_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    city: Optional[str] = Query(default=None),
+    final_subdivision: Optional[str] = Query(default=None),
+    property_type: Optional[str] = Query(default=None),
+    geo_zone: Optional[str] = Query(default=None),
+    property_group: Optional[str] = Query(default="ALL"),
+) -> dict:
+    current_start, current_end, _, _, period_label = _resolve_report_window(
+        report_mode=report_mode,
+        period_days=period_days,
+        ref_year=ref_year,
+        ref_month=ref_month,
+        ref_quarter=ref_quarter,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    where_clauses = ["1=1"]
+    params: list[str] = []
+    _append_common_filters(
+        where_clauses,
+        params,
+        city,
+        final_subdivision,
+        property_type,
+        geo_zone=geo_zone,
+        property_group=property_group,
+    )
+    where_sql = " AND ".join(where_clauses)
+
+    with closing(get_connection()) as conn:
+        df = pd.read_sql_query(
+            f"""
+            SELECT
+                listing_number,
+                parcel_id,
+                short_address,
+                city,
+                geo_zone,
+                final_subdivision,
+                property_type,
+                status,
+                unit_number,
+                listing_date,
+                effective_active_end_date,
+                under_contract_date,
+                sold_date,
+                list_price,
+                original_list_price,
+                sold_price,
+                total_bedrooms,
+                baths_total,
+                sqft_living,
+                geo_lat,
+                geo_lon,
+                cabana_flag,
+                terms_of_sale
+            FROM listing_details
+            WHERE {where_sql}
+            """,
+            conn,
+            params=params,
+        )
+
+    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["list_price", "original_list_price", "sold_price", "total_bedrooms", "baths_total", "sqft_living", "geo_lat", "geo_lon"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    rows = _build_report_listing_rows(df, current_start, current_end)
+    return {
+        "report_mode": report_mode,
+        "period_label": period_label,
+        "current_start": current_start,
+        "current_end": current_end,
+        "row_count": len(rows),
+        "rows": rows,
+    }
+
+
 @app.get("/api/market/subdivision-rankings")
 def subdivision_rankings(
     report_mode: str = Query(default="rolling", pattern="^(rolling|monthly|quarterly|annual|custom)$"),
@@ -813,6 +1652,7 @@ def subdivision_rankings(
 
     where_clauses = [
         "sold_date IS NOT NULL",
+        "COALESCE(cabana_flag, 0) = 0",
         "DATE(sold_date) >= DATE(?)",
         "DATE(sold_date) <= DATE(?)",
         "final_subdivision IS NOT NULL",
@@ -831,13 +1671,9 @@ def subdivision_rankings(
     if property_group and property_group.upper() != "ALL":
         pg = property_group.upper()
         if pg == "SINGLE_FAMILY":
-            where_clauses.append(
-                "UPPER(COALESCE(property_type, '')) IN ('SF','SINGLE FAMILY','SINGLE-FAMILY','SINGLE FAMILY HOME')"
-            )
+            where_clauses.append(_single_family_property_type_clause())
         elif pg == "TOWNHOME_CONDO":
-            where_clauses.append(
-                "UPPER(COALESCE(property_type, '')) NOT IN ('SF','SINGLE FAMILY','SINGLE-FAMILY','SINGLE FAMILY HOME')"
-            )
+            where_clauses.append(f"NOT {_single_family_property_type_clause()}")
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
@@ -875,7 +1711,7 @@ def subdivision_rankings(
     }
 
 
-@app.get("/api/market/period-series")
+@app.get("/api/market/period-series", response_model=PeriodSeriesResponse)
 def market_period_series(
     frequency: str = Query(default="monthly", pattern="^(monthly|quarterly|annual)$"),
     periods: int = Query(default=12, ge=2, le=60),
@@ -919,6 +1755,7 @@ def market_period_series(
                 list_price,
                 original_list_price,
                 sold_price,
+                cabana_flag,
                 terms_of_sale,
                 sqft_living,
                 days_on_market,

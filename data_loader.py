@@ -90,6 +90,7 @@ class DataLoader:
             taxes REAL,
             tax_year INTEGER,
             hoa_poa_coa_monthly REAL,
+            membership_fee REAL,
             short_address TEXT,
             city TEXT,
             zip_code TEXT,
@@ -151,11 +152,21 @@ class DataLoader:
             geo_lat REAL,
             geo_lon REAL,
             pcn_validated INTEGER,
+            cabana_flag INTEGER,
             geo_zone TEXT
         );
         """
         try:
             self.conn.execute(create_sql)
+            # Additive schema migrations for existing databases.
+            existing_cols = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(listing_details)").fetchall()
+            }
+            if "membership_fee" not in existing_cols:
+                self.conn.execute("ALTER TABLE listing_details ADD COLUMN membership_fee REAL")
+            if "cabana_flag" not in existing_cols:
+                self.conn.execute("ALTER TABLE listing_details ADD COLUMN cabana_flag INTEGER DEFAULT 0")
             # Guardrail/performance indexes for duplicate checks and forensic audits.
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_listing_details_parcel_sold_date "

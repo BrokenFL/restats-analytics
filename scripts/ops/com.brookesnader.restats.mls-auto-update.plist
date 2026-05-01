@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brookesnader.restats.mls-auto-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/scripts/ops/run_mls_auto_update.py</string>
+        <string>--headless</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/logs/launchagent_mls_auto_update.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/logs/launchagent_mls_auto_update.err.log</string>
+</dict>
+</plist>

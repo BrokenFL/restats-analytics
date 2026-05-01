@@ -2,6 +2,9 @@ export type KpisResponse = {
   total_records: number | null;
   closed_count: number | null;
   active_count: number | null;
+  active_inventory_current?: number | null;
+  active_inventory_snapshot?: number | null;
+  active_inventory_snapshot_date?: string | null;
   avg_sold_price: number | null;
   avg_list_price: number | null;
   avg_sp_lp_ratio: number | null;
@@ -53,9 +56,16 @@ export type RecentListing = {
   geo_zone: string | null;
   property_type: string | null;
   status: string | null;
+  total_bedrooms?: number | null;
+  baths_total?: number | null;
+  sqft_living?: number | null;
   list_price: number | null;
   sold_price: number | null;
+  sold_ppsf?: number | null;
+  geo_lat?: number | null;
+  geo_lon?: number | null;
   sp_lp_ratio: number | null;
+  cabana_flag?: boolean | null;
 };
 
 export type RecentListingsResponse = {
@@ -74,6 +84,7 @@ export type ReportPeriodMetrics = {
   cash_sales_percent: number | null;
   new_listings: number | null;
   pending_sales: number | null;
+  pending_inventory?: number | null;
   active_inventory: number | null;
   months_supply: number | null;
   median_dom: number | null;
@@ -91,6 +102,48 @@ export type ReportSummaryResponse = {
   current: ReportPeriodMetrics;
   previous: ReportPeriodMetrics;
   delta_pct: ReportPeriodMetrics;
+};
+
+export type ReportListing = {
+  listing_number: string;
+  parcel_id: string | null;
+  short_address: string | null;
+  city: string | null;
+  geo_zone: string | null;
+  final_subdivision: string | null;
+  property_type: string | null;
+  status: string | null;
+  unit_number: string | null;
+  listing_date: string | null;
+  under_contract_date: string | null;
+  sold_date: string | null;
+  effective_active_end_date: string | null;
+  list_price: number | null;
+  original_list_price: number | null;
+  sold_price: number | null;
+  sold_ppsf: number | null;
+  sp_lp_ratio: number | null;
+  total_bedrooms: number | null;
+  baths_total: number | null;
+  sqft_living: number | null;
+  geo_lat: number | null;
+  geo_lon: number | null;
+  terms_of_sale: string | null;
+  cabana_flag: boolean;
+  new_listing_in_period: boolean;
+  pending_in_period: boolean;
+  sold_in_period: boolean;
+  active_at_period_end: boolean;
+  pending_at_period_end: boolean;
+};
+
+export type ReportListingsResponse = {
+  report_mode: "rolling" | "monthly" | "quarterly" | "annual" | "custom";
+  period_label: string;
+  current_start: string;
+  current_end: string;
+  row_count: number;
+  rows: ReportListing[];
 };
 
 export type SubdivisionRankingRow = {
@@ -142,7 +195,12 @@ export type OpsStatusResponse = {
     listing_count: number;
     last_mls_status_date: string | null;
     last_off_market_sold_date: string | null;
+    last_sold_date?: string | null;
+    mls_status_lag_days?: number | null;
+    sold_lag_days?: number | null;
     property_type_distribution: Array<{ property_type: string | null; cnt: number }>;
+    status_distribution?: Array<{ status: string; cnt: number }>;
+    status_bucket_distribution?: Array<{ status: string; cnt: number }>;
   };
   duplicate_audit: {
     available: boolean;
@@ -153,6 +211,44 @@ export type OpsStatusResponse = {
     cross_source_count?: number;
     error?: string;
   };
+  guardrail_audit?: {
+    available: boolean;
+    path: string;
+    generated_at?: string;
+    checks?: Record<string, number>;
+    total_failures?: number;
+    passed?: boolean;
+    error?: string;
+  };
+  last_run?: {
+    available: boolean;
+    path: string;
+    pipeline?: string;
+    status?: string;
+    started_at?: string;
+    finished_at?: string;
+    updated_at?: string;
+    details?: Record<string, string | number | boolean | null>;
+    error?: string | null;
+  };
+};
+
+export type ParityMetricRow = {
+  metric: string;
+  legacy_value: number | null;
+  api_value: number | null;
+  delta: number | null;
+  delta_pct: number | null;
+  in_tolerance: boolean;
+};
+
+export type ParityResponse = {
+  mode: "monthly" | "quarterly" | "annual";
+  current_start: string;
+  current_end: string;
+  tolerance_pct: number;
+  metrics: ParityMetricRow[];
+  mismatch_count: number;
 };
 
 export type ReportConfig = {
@@ -165,12 +261,82 @@ export type ReportConfig = {
   endDate?: string;
 };
 
+export type CmaComp = {
+  listing_number: string;
+  bucket?: string | null;
+  final_score?: number | null;
+  similarity_score?: number | null;
+  recency_multiplier?: number | null;
+  location_points?: number | null;
+  base_points?: number | null;
+  feature_points?: number | null;
+  recency_days?: number | null;
+  distance_miles?: number | null;
+  sold_date?: string | null;
+  sold_price?: number | null;
+  list_price?: number | null;
+  ppsf?: number | null;
+  short_address?: string | null;
+  city?: string | null;
+  final_subdivision?: string | null;
+  property_type?: string | null;
+  geo_lat?: number | null;
+  geo_lon?: number | null;
+  total_bedrooms?: number | null;
+  baths_total?: number | null;
+  sqft_living?: number | null;
+  year_built?: number | null;
+};
+
+export type CmaRunResponse = {
+  subject: Record<string, unknown>;
+  as_of_date: string;
+  valuation: Record<string, unknown>;
+  confidence_grade: string;
+  confidence_reason: string;
+  pending_projection: Record<string, unknown>;
+  surrounding_discount_metrics: Record<string, unknown>;
+  pending_pressure_guardrail: Record<string, unknown>;
+  closing_trends: Record<string, unknown>;
+  community_insights: Record<string, unknown>;
+  surrounding_area_context: Record<string, unknown>;
+  community_scope: Record<string, unknown>;
+  comps: CmaComp[];
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`);
+  const url = `${API_BASE}${path}`;
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown network error";
+    throw new Error(`Cannot reach API at ${url}. ${msg}`);
+  }
   if (!response.ok) {
-    throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    throw new Error(`API request failed (${response.status} ${response.statusText}) at ${url}`);
+  }
+  return (await response.json()) as T;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const url = `${API_BASE}${path}`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown network error";
+    throw new Error(`Cannot reach API at ${url}. ${msg}`);
+  }
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`API request failed (${response.status} ${response.statusText}) at ${url}${detail ? `: ${detail}` : ""}`);
   }
   return (await response.json()) as T;
 }
@@ -303,6 +469,24 @@ export async function fetchReportSummary(config: ReportConfig, filters: Filters 
   return getJson<ReportSummaryResponse>(`/api/market/report-summary${query}`);
 }
 
+export async function fetchReportListings(config: ReportConfig, filters: Filters = {}): Promise<ReportListingsResponse> {
+  const query = buildQuery({
+    report_mode: config.reportMode,
+    period_days: config.periodDays,
+    ref_year: config.refYear,
+    ref_month: config.refMonth,
+    ref_quarter: config.refQuarter,
+    start_date: config.startDate,
+    end_date: config.endDate,
+    city: filters.city,
+    final_subdivision: filters.finalSubdivision,
+    property_type: filters.propertyType,
+    geo_zone: filters.geoZone,
+    property_group: filters.propertyGroup
+  });
+  return getJson<ReportListingsResponse>(`/api/market/report-listings${query}`);
+}
+
 export async function fetchSubdivisionRankings(
   config: ReportConfig,
   minSales: number,
@@ -331,6 +515,27 @@ export async function fetchOpsStatus(): Promise<OpsStatusResponse> {
   return getJson<OpsStatusResponse>("/api/ops/status");
 }
 
+export async function fetchParity(
+  mode: "monthly" | "quarterly" | "annual",
+  year: number,
+  month?: number,
+  quarter?: number,
+  filters: Filters = {}
+): Promise<ParityResponse> {
+  const query = buildQuery({
+    mode,
+    year,
+    month,
+    quarter,
+    city: filters.city,
+    final_subdivision: filters.finalSubdivision,
+    property_type: filters.propertyType,
+    geo_zone: filters.geoZone,
+    property_group: filters.propertyGroup,
+  });
+  return getJson<ParityResponse>(`/api/ops/parity${query}`);
+}
+
 export async function fetchMarketPeriodSeries(
   frequency: "monthly" | "quarterly" | "annual",
   periods: number,
@@ -354,4 +559,12 @@ export async function fetchMarketPeriodSeries(
     property_group: filters.propertyGroup
   });
   return getJson<PeriodSeriesResponse>(`/api/market/period-series${query}`);
+}
+
+export async function runCma(parcel: string, asOfDate?: string, topN = 15): Promise<CmaRunResponse> {
+  return postJson<CmaRunResponse>("/api/cma/run", {
+    parcel,
+    as_of_date: asOfDate,
+    top_n: topN,
+  });
 }

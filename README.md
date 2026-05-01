@@ -47,6 +47,7 @@ Starter endpoints:
 - `GET /api/market/subdivision-rankings`
 - `GET /api/market/period-series`
 - `GET /api/ops/status`
+- `POST /api/cma/run`
 
 Example:
 
@@ -68,6 +69,20 @@ Filterable query params (where supported):
 - `report_mode` (`rolling|monthly|quarterly|annual|custom`) for report endpoints
 - `ref_year`, `ref_month`, `ref_quarter` for monthly/quarterly/annual report modes
 - `start_date`, `end_date` (`YYYY-MM-DD`) for custom date-range mode
+
+`POST /api/cma/run` payload:
+
+- `parcel` (required)
+- `as_of_date` (`YYYY-MM-DD`, optional; defaults to today)
+- `top_n` (optional, default 10)
+
+Example:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/cma/run" \
+  -H "Content-Type: application/json" \
+  -d '{"parcel":"00424634100000390","as_of_date":"2026-03-02","top_n":10}'
+```
 
 Note: `GET /api/filters/options` now accepts context filters (`city`, `geo_zone`, `property_type`, `property_group`) so subdivision dropdown options can be narrowed to the selected area/type.
 
@@ -95,6 +110,11 @@ Example:
 VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 ```
 
+Current React includes two views:
+
+- `Market Dashboard` (period/report analytics + print workflows)
+- `CMA` (parcel run, subject details, comp map, comp adjustment breakdown)
+
 - `app.py`: Streamlit app (filters, KPI display, charting, export entry points).
 - `main.py`: Console menu for common operations.
 - `generate_db.py`: MLS batch entrypoint (`input_csvs/*.csv` -> cleaning -> DB upsert).
@@ -111,7 +131,7 @@ VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 
 ### MLS flow
 
-1. Drop raw MLS CSV files into `input_csvs/`.
+1. Drop raw MLS CSV files into `input_csvs/` (or `input_csvs/raw/` if you are organizing by stage).
 2. Run `generate_db.py` (or menu option in `main.py`).
 3. `data_cleaning.py`:
    - Renames raw columns to normalized schema names.
@@ -198,6 +218,10 @@ Current menu options:
   - `python3 mls_auto_login.py --timeout 45 --stay-open-seconds 20`
 - On login failure, screenshot is saved to:
   - `tmp/mls_login_error.png`
+- For Codex automations / unattended runs:
+  - place credentials in a repo-local `.env` file because the automation runner may not inherit your shell exports
+  - supported keys: `MLS_EMAIL=...` and `MLS_PASSWORD=...`
+  - `.env` is already ignored by git
 
 ## MLS saved search export automation
 
@@ -214,6 +238,21 @@ Current menu options:
   - Prints run summary: `start_date`, downloaded file, DB row count before/after, and delta
 - Default download output:
   - `output/mls_exports/`
+
+## Unattended MLS auto-update runner
+
+- Non-interactive runner:
+  - `python3 scripts/ops/run_mls_auto_update.py --headless`
+- Wrapper script used by macOS LaunchAgent:
+  - `scripts/ops/run_mls_auto_update.sh`
+- LaunchAgent template:
+  - `scripts/ops/com.brookesnader.restats.mls-auto-update.plist`
+- Important macOS note:
+  - this repo currently lives under iCloud Drive (`~/Library/Mobile Documents/...`), which `launchd` could not read in background jobs on this Mac
+  - the installed LaunchAgent therefore targets a local mirror at `~/Code/ReStatsProgram_DEC_2025_automation`
+- The quick-search importer now uses:
+  - `python3 generate_db.py --db-name mls.db --skip-archive <csv paths...>`
+  - This avoids relying on an in-process `data_cleaning` import during the Selenium/export job.
 - Full example:
   - `export MLS_EMAIL='your_email_here'`
   - `export MLS_PASSWORD='your_password_here'`
@@ -232,17 +271,29 @@ Current menu options:
 - Lookup CSV files under `lookups/` are part of normalization quality.
 - `mls.db` and raw CSV files are excluded by `.gitignore`.
 - `requirements.txt` includes API-related packages, but this repo currently operates primarily through scripts + Streamlit UI.
+- Operational scripts are organized under `scripts/` (`audits/`, `maintenance/`, `ops/`).
+- Root script names are backward-compatible wrappers.
+- CMA engine files live under `cma_module/` and are consumed by `POST /api/cma/run`.
 
 ## Duplicate tools
 
 - Duplicate audit:
-  - `python3 audit_duplicates.py --window-days 7 --sample-size 20`
-  - Optional CSV report: `python3 audit_duplicates.py --export-report`
+  - `python3 scripts/audits/audit_duplicates.py --window-days 7 --sample-size 20`
+  - Optional CSV report: `python3 scripts/audits/audit_duplicates.py --export-report`
   - Save latest JSON summary (used by React Run Status panel):
-    - `python3 audit_duplicates.py --window-days 7 --sample-size 20 --json-path output/audits/latest_audit_summary.json`
+    - `python3 scripts/audits/audit_duplicates.py --window-days 7 --sample-size 20 --json-path output/audits/latest_audit_summary.json`
+- Board-overlap cleanup (keep `RX-`, remove non-`RX` duplicates for same sale):
+  - Dry run: `python3 scripts/maintenance/clean_rx_board_duplicates.py --window-days 7`
+  - Apply: `python3 scripts/maintenance/clean_rx_board_duplicates.py --window-days 7 --apply`
 - Legacy PBC key migration (one-time):
-  - Dry run: `python3 migrate_pbc_listing_numbers.py --dry-run`
-  - Apply: `python3 migrate_pbc_listing_numbers.py --apply`
+  - Dry run: `python3 scripts/maintenance/migrate_pbc_listing_numbers.py --dry-run`
+  - Apply: `python3 scripts/maintenance/migrate_pbc_listing_numbers.py --apply`
+
+## Project housekeeping
+
+- Organize generated artifacts (root CSVs, old logs, old tmp debug files):
+  - Dry run: `python3 scripts/maintenance/cleanup_project_artifacts.py --dry-run`
+  - Apply: `python3 scripts/maintenance/cleanup_project_artifacts.py --days-old 3`
 
 ## Property Type Standardization
 
@@ -250,23 +301,35 @@ Current menu options:
   - `Single Family Home`
   - `Condo/TH/Other`
 - One-time backfill (safe to re-run):
-  - `python3 normalize_property_types.py`
+  - `python3 scripts/maintenance/normalize_property_types.py`
 
 ## PBC Geo-Zone Audit
 
 - Audit/fix imported PBC Palm Beach geo zones (South End consistency):
-  - Dry run: `python3 audit_fix_pbc_geo_zones.py`
-  - Apply fixes: `python3 audit_fix_pbc_geo_zones.py --apply`
+  - Dry run: `python3 scripts/audits/audit_fix_pbc_geo_zones.py`
+  - Apply fixes: `python3 scripts/audits/audit_fix_pbc_geo_zones.py --apply`
 - Latest report can be written with:
-  - `python3 audit_fix_pbc_geo_zones.py --apply --report-path output/audits/pbc_geo_zone_audit_latest.csv`
+  - `python3 scripts/audits/audit_fix_pbc_geo_zones.py --apply --report-path output/audits/pbc_geo_zone_audit_latest.csv`
 
 ## Dashboard Parity Check
 
 Compare legacy analytics metrics with new API summary for period/filter parity:
 
 - Quarterly:
-  - `python3 parity_check_dashboard.py --mode quarterly --year 2025 --quarter 4 --property-group ALL`
+  - `python3 scripts/ops/parity_check_dashboard.py --mode quarterly --year 2025 --quarter 4 --property-group ALL`
 - Monthly:
-  - `python3 parity_check_dashboard.py --mode monthly --year 2026 --month 1 --property-group SINGLE_FAMILY`
+  - `python3 scripts/ops/parity_check_dashboard.py --mode monthly --year 2026 --month 1 --property-group SINGLE_FAMILY`
 - Annual:
-  - `python3 parity_check_dashboard.py --mode annual --year 2025 --property-group TOWNHOME_CONDO`
+  - `python3 scripts/ops/parity_check_dashboard.py --mode annual --year 2025 --property-group TOWNHOME_CONDO`
+
+API parity endpoint:
+- `GET /api/ops/parity?mode=monthly&year=2026&month=1&city=Palm%20Beach`
+- Supports `mode=monthly|quarterly|annual` and the same filter params as report-summary.
+
+## Unified CLI
+
+Use one entrypoint for day-to-day ops:
+- Ingest pipeline: `python3 -m restats ingest`
+- Duplicate audit: `python3 -m restats audit -- --window-days 7 --sample-size 20`
+- Parity report: `python3 -m restats report -- --mode monthly --year 2026 --month 1`
+- Guardrails: `python3 -m restats guardrails`
