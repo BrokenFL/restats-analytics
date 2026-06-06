@@ -349,7 +349,6 @@ export async function fetchKpis(soldSince: string): Promise<KpisResponse> {
 type Filters = {
   city?: string;
   finalSubdivision?: string;
-  propertyType?: string;
   geoZone?: string;
   propertyGroup?: "ALL" | "SINGLE_FAMILY" | "TOWNHOME_CONDO";
 };
@@ -368,7 +367,6 @@ export async function fetchKpisWithFilters(soldSince: string, filters: Filters):
     sold_since: soldSince || undefined,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -389,7 +387,6 @@ export async function fetchTrends(
     end_date: endDate,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -400,7 +397,6 @@ export async function fetchInventory(filters: Filters = {}): Promise<InventoryRe
   const query = buildQuery({
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -411,7 +407,6 @@ export async function fetchFilterOptions(filters: Filters = {}): Promise<FilterO
   const query = buildQuery({
     city: filters.city,
     geo_zone: filters.geoZone,
-    property_type: filters.propertyType,
     property_group: filters.propertyGroup
   });
   return getJson<FilterOptionsResponse>(`/api/filters/options${query}`);
@@ -422,7 +417,6 @@ export async function fetchRecentListings(limit = 25, filters: Filters = {}, sol
     limit,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup,
     sold_since: soldSince
@@ -441,7 +435,6 @@ export async function fetchRecentListingsForRange(
     limit,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup,
     start_date: startDate,
@@ -462,7 +455,6 @@ export async function fetchReportSummary(config: ReportConfig, filters: Filters 
     end_date: config.endDate,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -480,7 +472,6 @@ export async function fetchReportListings(config: ReportConfig, filters: Filters
     end_date: config.endDate,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -504,7 +495,6 @@ export async function fetchSubdivisionRankings(
     min_sales: minSales,
     limit,
     city: filters.city,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
@@ -529,7 +519,6 @@ export async function fetchParity(
     quarter,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup,
   });
@@ -554,7 +543,6 @@ export async function fetchMarketPeriodSeries(
     end_quarter: endQuarter,
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
-    property_type: filters.propertyType,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });

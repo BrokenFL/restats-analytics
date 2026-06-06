@@ -915,7 +915,6 @@ export default function App() {
   const [geoZone, setGeoZone] = useState("");
   const [finalSubdivision, setFinalSubdivision] = useState("");
   const [propertyGroup, setPropertyGroup] = useState<PropertyGroup>("ALL");
-  const [propertyType, setPropertyType] = useState("");
 
   const [reportMode, setReportMode] = useState<ReportMode>("rolling");
   const [periodDays, setPeriodDays] = useState(30);
@@ -963,7 +962,6 @@ export default function App() {
         const options = await fetchFilterOptions({
           city,
           geoZone,
-          propertyType,
           propertyGroup,
         });
         if (!cancelled) setFilterOptions(options);
@@ -975,14 +973,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [city, geoZone, propertyType, propertyGroup]);
+  }, [city, geoZone, propertyGroup]);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setError(null);
       try {
-        const filters = { city, geoZone, finalSubdivision, propertyType, propertyGroup };
+        const filters = { city, geoZone, finalSubdivision, propertyGroup };
         const config: ReportConfig = {
           reportMode,
           periodDays,
@@ -995,12 +993,15 @@ export default function App() {
         const trendFrequency =
           reportMode === "annual" ? "annual" : reportMode === "quarterly" ? "quarterly" : "monthly";
 
-        const [kpisResp, trendsResp, invResp, recentResp, reportResp, rankingsResp, seriesResp] = await Promise.all([
+        const reportResp = await fetchReportSummary(config, filters);
+        if (cancelled) return;
+        setReportSummary(reportResp);
+
+        const [kpisResp, trendsResp, invResp, recentResp, rankingsResp, seriesResp] = await Promise.all([
           fetchKpisWithFilters(soldSince, filters),
           fetchTrends(12, filters, trendFrequency, activeWindow.start, activeWindow.end),
           fetchInventory(filters),
           fetchRecentListingsForRange(150, filters, activeWindow.start, activeWindow.end, soldSince),
-          fetchReportSummary(config, filters),
           fetchSubdivisionRankings(config, 2, 10, filters),
           fetchMarketPeriodSeries(
             seriesFrequency,
@@ -1017,7 +1018,6 @@ export default function App() {
         setTrends(trendsResp);
         setInventory(invResp);
         setRecentListings(recentResp);
-        setReportSummary(reportResp);
         setRankings(rankingsResp);
         setPeriodSeries(seriesResp);
       } catch (err) {
@@ -1034,7 +1034,6 @@ export default function App() {
     city,
     geoZone,
     finalSubdivision,
-    propertyType,
     propertyGroup,
     reportMode,
     periodDays,
@@ -1072,14 +1071,13 @@ export default function App() {
     if (city) parts.push(`City: ${city}`);
     if (geoZone) parts.push(`Geo: ${geoZone}`);
     if (finalSubdivision) parts.push(`Subdivision: ${finalSubdivision}`);
-    if (propertyType) parts.push(`Type: ${propertyType}`);
-    else if (propertyGroup && propertyGroup !== "ALL") {
+    if (propertyGroup && propertyGroup !== "ALL") {
       parts.push(
         `Type Group: ${propertyGroup === "SINGLE_FAMILY" ? "Single Family Home" : "Condo/TH/Other"}`
       );
     }
     return parts.length ? parts.join(" | ") : "All Selected Markets";
-  }, [city, geoZone, finalSubdivision, propertyType, propertyGroup]);
+  }, [city, geoZone, finalSubdivision, propertyGroup]);
 
   const metricRows = useMemo(() => {
     if (!reportSummary) return [];
@@ -1273,9 +1271,8 @@ export default function App() {
     const scopeLine = marketScopeLabel;
     const scopeHeadline = (finalSubdivision || city || "All Selected Markets").toUpperCase();
     const periodHeadline = reportSummary.period_label.toUpperCase();
-    const typeLabel = propertyType
-      ? propertyType
-      : propertyGroup === "SINGLE_FAMILY"
+    const typeLabel =
+      propertyGroup === "SINGLE_FAMILY"
       ? "Single Family"
       : propertyGroup === "TOWNHOME_CONDO"
       ? "Condominiums/Townhomes"
@@ -1605,9 +1602,8 @@ export default function App() {
         if (city && norm(r.city) !== norm(city)) return false;
         if (finalSubdivision && norm(r.final_subdivision) !== norm(finalSubdivision)) return false;
         if (geoZone && norm(r.geo_zone) !== norm(geoZone)) return false;
-        if (propertyType && norm(r.property_type) !== norm(propertyType)) return false;
-        if (!propertyType && propertyGroup === "SINGLE_FAMILY" && !isSingleFamilyType(r.property_type)) return false;
-        if (!propertyType && propertyGroup === "TOWNHOME_CONDO" && isSingleFamilyType(r.property_type)) return false;
+        if (propertyGroup === "SINGLE_FAMILY" && !isSingleFamilyType(r.property_type)) return false;
+        if (propertyGroup === "TOWNHOME_CONDO" && isSingleFamilyType(r.property_type)) return false;
         if (r.sold_date) {
           if (r.sold_date < reportSummary.current_start || r.sold_date > reportSummary.current_end) return false;
         } else {
@@ -1907,7 +1903,7 @@ export default function App() {
   }
 
   async function exportReportListings(): Promise<void> {
-    const filters = { city, geoZone, finalSubdivision, propertyType, propertyGroup };
+    const filters = { city, geoZone, finalSubdivision, propertyGroup };
     const config: ReportConfig = {
       reportMode,
       periodDays,
@@ -2192,14 +2188,6 @@ export default function App() {
           </select>
         </label>
 
-        <label className="filter-field" htmlFor="property_type">
-          <span>Raw Type</span>
-          <select id="property_type" value={propertyType} onChange={(e) => setPropertyType(e.target.value)}>
-            <option value="">All Raw Types</option>
-            {(filterOptions?.property_types ?? []).map((p) => <option key={p.property_type} value={p.property_type}>{p.property_type} ({p.count})</option>)}
-          </select>
-        </label>
-
         <label className="filter-field" htmlFor="reportMode">
           <span>Date Range</span>
           <select id="reportMode" value={reportMode} onChange={(e) => setReportMode(e.target.value as ReportMode)}>
@@ -2293,7 +2281,7 @@ export default function App() {
             className="btn reset-btn"
             type="button"
             onClick={() => {
-              setCity(""); setGeoZone(""); setFinalSubdivision(""); setPropertyGroup("ALL"); setPropertyType("");
+              setCity(""); setGeoZone(""); setFinalSubdivision(""); setPropertyGroup("ALL");
             }}
           >
             Reset

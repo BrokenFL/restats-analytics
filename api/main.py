@@ -149,7 +149,7 @@ class PeriodSeriesResponse(BaseModel):
 
 
 class ReportListingRowResponse(BaseModel):
-    listing_number: str
+    listing_number: Optional[str] = None
     parcel_id: Optional[str] = None
     short_address: Optional[str] = None
     city: Optional[str] = None
@@ -173,6 +173,7 @@ class ReportListingRowResponse(BaseModel):
     geo_lat: Optional[float] = None
     geo_lon: Optional[float] = None
     terms_of_sale: Optional[str] = None
+    buyer_financing: Optional[str] = None
     cabana_flag: bool = False
     new_listing_in_period: bool
     pending_in_period: bool
@@ -532,6 +533,10 @@ def _listing_details_has_column(column_name: str) -> bool:
     return column_name in _listing_details_columns()
 
 
+def _optional_listing_column(column_name: str) -> str:
+    return column_name if _listing_details_has_column(column_name) else f"NULL AS {column_name}"
+
+
 def _non_cabana_mask(df: pd.DataFrame) -> pd.Series:
     if "cabana_flag" in df.columns:
         return pd.to_numeric(df["cabana_flag"], errors="coerce").fillna(0).eq(0)
@@ -665,10 +670,11 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
             ppsf_series = valid["sold_price"] / valid["sqft_living"]
 
     cash_sales_percent = None
-    if "terms_of_sale" in sold.columns and sales_count > 0:
-        terms = sold["terms_of_sale"].astype(str).str.upper()
-        cash_count = terms.str.contains("CASH", na=False).sum()
-        cash_sales_percent = _safe_number((cash_count / sales_count) * 100)
+    if "buyer_financing" in sold.columns and sales_count > 0:
+        financing = sold["buyer_financing"].fillna("").astype(str).str.upper().str.strip()
+        if financing.ne("").any():
+            cash_count = financing.str.contains("CASH", na=False).sum()
+            cash_sales_percent = _safe_number((cash_count / sales_count) * 100)
 
     return {
         "sold_count": sales_count,
@@ -780,6 +786,7 @@ def _build_report_listing_rows(df: pd.DataFrame, start_iso: str, end_iso: str) -
         "geo_lat",
         "geo_lon",
         "terms_of_sale",
+        "buyer_financing",
         "cabana_flag",
         "new_listing_in_period",
         "pending_in_period",
@@ -1167,12 +1174,13 @@ def ops_parity(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
+        buyer_financing_select = _optional_listing_column("buyer_financing")
         df = _read_sql_query(
             f"""
             SELECT
                 listing_number, city, final_subdivision, geo_zone, property_type, status,
                 listing_date, effective_active_end_date, under_contract_date, sold_date,
-                list_price, original_list_price, sold_price, terms_of_sale, cabana_flag,
+                list_price, original_list_price, sold_price, terms_of_sale, {buyer_financing_select}, cabana_flag,
                 sqft_living, days_on_market, cumulative_dom
             FROM listing_details
             WHERE {where_sql}
@@ -1617,6 +1625,7 @@ def market_report_summary(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
+        buyer_financing_select = _optional_listing_column("buyer_financing")
         df = _read_sql_query(
             f"""
             SELECT
@@ -1635,6 +1644,7 @@ def market_report_summary(
                 sold_price,
                 cabana_flag,
                 terms_of_sale,
+                {buyer_financing_select},
                 sqft_living,
                 days_on_market,
                 cumulative_dom
@@ -1711,6 +1721,7 @@ def market_report_listings(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
+        buyer_financing_select = _optional_listing_column("buyer_financing")
         df = _read_sql_query(
             f"""
             SELECT
@@ -1736,7 +1747,8 @@ def market_report_listings(
                 geo_lat,
                 geo_lon,
                 cabana_flag,
-                terms_of_sale
+                terms_of_sale,
+                {buyer_financing_select}
             FROM listing_details
             WHERE {where_sql}
             """,
@@ -1875,6 +1887,7 @@ def market_period_series(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
+        buyer_financing_select = _optional_listing_column("buyer_financing")
         df = _read_sql_query(
             f"""
             SELECT
@@ -1893,6 +1906,7 @@ def market_period_series(
                 sold_price,
                 cabana_flag,
                 terms_of_sale,
+                {buyer_financing_select},
                 sqft_living,
                 days_on_market,
                 cumulative_dom

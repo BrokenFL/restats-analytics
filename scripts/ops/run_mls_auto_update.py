@@ -45,10 +45,21 @@ def parse_args():
         default="AIDataSet",
         help="Export template name.",
     )
+    parser.add_argument(
+        "--status-mode",
+        default="all",
+        choices=["all", "closed-only", "active-only"],
+        help="MLS status scope to export.",
+    )
+    parser.add_argument(
+        "--from-date",
+        default=None,
+        help="Optional MLS status-date start, e.g. 02/01/2026. Uses DB-derived dates when omitted.",
+    )
     return parser.parse_args()
 
 
-def _run_city_refresh(city: str, template: str, headless: bool) -> None:
+def _run_city_refresh(city: str, template: str, headless: bool, status_mode: str, from_date: str | None) -> None:
     city_slug = slugify_label(city)
     cmd = [
         sys.executable,
@@ -57,9 +68,8 @@ def _run_city_refresh(city: str, template: str, headless: bool) -> None:
         "city",
         "--cities",
         city,
-        "--derive-from-db",
         "--status-mode",
-        "all",
+        status_mode,
         "--export-each-search",
         "--export-template",
         template,
@@ -73,6 +83,10 @@ def _run_city_refresh(city: str, template: str, headless: bool) -> None:
         "--backup-dir",
         "tmp",
     ]
+    if from_date:
+        cmd.extend(["--from-date", from_date])
+    else:
+        cmd.append("--derive-from-db")
     if headless:
         cmd.append("--headless")
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
@@ -90,7 +104,13 @@ def main() -> int:
     try:
         for city in cities:
             print(f"\nCity update: {city}", flush=True)
-            _run_city_refresh(city=city, template=args.template, headless=args.headless)
+            _run_city_refresh(
+                city=city,
+                template=args.template,
+                headless=args.headless,
+                status_mode=args.status_mode,
+                from_date=args.from_date,
+            )
             city_runs.append({"city": city, "status": "success"})
 
         run_subdivision_master_sync()
@@ -111,6 +131,8 @@ def main() -> int:
                 "cities": city_runs,
                 "template": args.template,
                 "headless": args.headless,
+                "status_mode": args.status_mode,
+                "from_date": args.from_date,
             },
         )
         print("\nMLS auto-update pipeline complete.", flush=True)
@@ -127,6 +149,8 @@ def main() -> int:
                 "cities": city_runs,
                 "template": args.template,
                 "headless": args.headless,
+                "status_mode": args.status_mode,
+                "from_date": args.from_date,
             },
         )
         print(f"\nMLS auto-update pipeline failed: {exc}", flush=True)
@@ -142,6 +166,8 @@ def main() -> int:
                 "cities": city_runs,
                 "template": args.template,
                 "headless": args.headless,
+                "status_mode": args.status_mode,
+                "from_date": args.from_date,
             },
         )
         print(f"\nMLS auto-update pipeline failed: {exc}", flush=True)

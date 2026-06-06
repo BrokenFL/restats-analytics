@@ -37,7 +37,13 @@ FULL_CITY_REFRESH_CITIES = {"SOUTH PALM BEACH"}
 MAX_EXPORT_RECORDS = 4000
 RESIDENTIAL_QUICK_SEARCH_TEMPLATE_ID = "20231129214456095779000000"
 RESIDENTIAL_QUICK_SEARCH_VIEW_ID = "20231129213900299116000000"
-ENV_CANDIDATE_FILES = (".env", ".env.local", "~/.codex/mls.env", "~/.codex/mls.env.local")
+ENV_CANDIDATE_FILES = (
+    ".env",
+    ".env.local",
+    "~/.codex/mls.env",
+    "~/.codex/mls.env.local",
+    "~/.config/openclaw/secrets/mls.env",
+)
 KEYCHAIN_PASSWORD_SERVICES = (
     "MLS_PASSWORD",
     "MLS Refresh",
@@ -1141,17 +1147,89 @@ def _backup_and_import(csv_files, db_file: str, backup_dir: str) -> Path:
 
 
 def _select_custom_text_export(driver) -> bool:
+    """Find and click the Custom Text Export radio button, searching all frames."""
+    selectors = [
+        (By.CSS_SELECTOR, "input[name='stype'][value='custom']"),
+        (By.CSS_SELECTOR, "input[value='type5']"),
+        (By.CSS_SELECTOR, "input[name='stype'][value='type5']"),
+        (By.CSS_SELECTOR, "#type5"),
+        (By.XPATH, "//label[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'custom text export')]"),
+        (By.XPATH, "//label[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'type5')]"),
+    ]
+
+    def _try_click_in_frame():
+        for by, sel in selectors:
+            elems = driver.find_elements(by, sel)
+            for el in elems:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    ActionChains(driver).move_to_element(el).click().perform()
+                except Exception:
+                    try:
+                        el.click()
+                    except Exception:
+                        try:
+                            driver.execute_script("arguments[0].click();", el)
+                        except Exception:
+                            continue
+                return True
+        return False
+
+    # Try current context first.
+    if _try_click_in_frame():
+        return True
+
+    # Search recursively through iframes.
+    def _search_frames(depth=0, max_depth=5):
+        if depth >= max_depth:
+            return False
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe,frame")
+        for fr in frames:
+            try:
+                driver.switch_to.frame(fr)
+                if _try_click_in_frame():
+                    return True
+                if _search_frames(depth + 1, max_depth):
+                    return True
+                driver.switch_to.parent_frame()
+            except Exception:
+                try:
+                    driver.switch_to.parent_frame()
+                except Exception:
+                    pass
+        return False
+
+    original = driver.current_window_handle
+    driver.switch_to.default_content()
+    if _search_frames():
+        return True
+    driver.switch_to.window(original)
+
+    # Aggressive fallback: find ANY label containing "custom text" or "type5" and click it via JS.
     js = """
-        const input = document.querySelector("#type5") || document.querySelector("input[name='stype'][value='custom']");
-        const label = document.querySelector("label[for='type5']");
-        if (!input && !label) return false;
-        if (label) label.click();
-        if (input) {
-            input.checked = true;
-            input.click();
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+        const labels = Array.from(document.querySelectorAll('label, div, span, li'));
+        const target = labels.find(l => {
+            const text = (l.textContent || '').toLowerCase();
+            return text.includes('custom text export') || text.includes('custom text') && text.includes('type5');
+        });
+        if (target) {
+            target.click();
+            return true;
         }
-        return true;
+        const inputs = Array.from(document.querySelectorAll('input[type=\"radio\"]'));
+        const input5 = inputs.find(i => {
+            const val = (i.value || '').toLowerCase();
+            const id = (i.id || '').toLowerCase();
+            return val === 'type5' || val === 'custom' || id === 'type5';
+        });
+        if (input5) {
+            input5.checked = true;
+            input5.click();
+            input5.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }
+        return false;
     """
     return bool(driver.execute_script(js))
 
@@ -1196,20 +1274,55 @@ def _select_export_template(driver, template_name: str) -> None:
 
 
 def _force_custom_export_mode(driver) -> bool:
-    js = """
-        const custom = document.querySelector("input[name='stype'][value='custom']") || document.querySelector("#type5");
-        const exportId = document.querySelector("input[name='export_id']");
-        if (custom) {
-          custom.checked = true;
-          custom.click();
-          custom.dispatchEvent(new Event('input', { bubbles: true }));
-          custom.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        if (exportId) exportId.value = "type5";
-        const checked = Array.from(document.querySelectorAll("input[name='stype']")).find(el => el.checked);
-        return !!(custom && custom.checked) && checked && checked.id === "type5";
-    """
-    return bool(driver.execute_script(js))
+    """Verify Custom Text Export is selected, searching all frames."""
+    def _check_frame():
+        js = """
+            const custom = document.querySelector("input[name='stype'][value='custom']") 
+                || document.querySelector("input[value='type5']")
+                || document.querySelector("input[name='stype'][value='type5']")
+                || document.querySelector("#type5");
+            const exportId = document.querySelector("input[name='export_id']");
+            if (custom) {
+              custom.checked = true;
+              custom.click();
+              custom.dispatchEvent(new Event('input', { bubbles: true }));
+              custom.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (exportId) exportId.value = "type5";
+            const checked = Array.from(document.querySelectorAll("input[name='stype']")).find(el => el.checked)
+                || Array.from(document.querySelectorAll("input[type='radio']")).find(el => el.checked);
+            const isCustom = !!(custom && custom.checked) || !!(checked && (
+                checked.value === 'custom' || checked.value === 'type5' || checked.id === 'type5'
+            ));
+            return isCustom;
+        """
+        return bool(driver.execute_script(js))
+
+    if _check_frame():
+        return True
+
+    # Search through iframes.
+    def _search_frames(depth=0, max_depth=5):
+        if depth >= max_depth:
+            return False
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe,frame")
+        for fr in frames:
+            try:
+                driver.switch_to.frame(fr)
+                if _check_frame():
+                    return True
+                if _search_frames(depth + 1, max_depth):
+                    return True
+                driver.switch_to.parent_frame()
+            except Exception:
+                try:
+                    driver.switch_to.parent_frame()
+                except Exception:
+                    pass
+        return False
+
+    driver.switch_to.default_content()
+    return _search_frames()
 
 
 def _export_current_results(
@@ -1243,6 +1356,7 @@ def _export_current_results(
     ]:
         try:
             wait.until(EC.element_to_be_clickable((by, sel))).click()
+            time.sleep(1.5)
             _capture_debug(driver, debug_dir, "export_opened")
             break
         except Exception:
@@ -1251,9 +1365,8 @@ def _export_current_results(
         _capture_debug(driver, debug_dir, "export_click_failed")
         raise TimeoutException("Could not open Export Listings dialog")
 
-    _switch_to_context_with_selector(driver, "label[for='type5'], #type5", timeout_sec=30)
-
     if not _select_custom_text_export(driver):
+        _capture_debug(driver, debug_dir, "custom_text_export_failed")
         raise TimeoutException("Could not select Custom Text Export (type5)")
     _capture_debug(driver, debug_dir, "custom_text_export")
 

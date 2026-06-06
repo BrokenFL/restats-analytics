@@ -411,8 +411,12 @@ def cash_sales_percentage(df, freq, start, end):
     df = df.copy()
     df["sold_date"] = pd.to_datetime(df["sold_date"], errors="coerce")
     df = df[df["sold_date"].notna() & _non_cabana_mask(df)]
-    df["terms_of_sale"] = df["terms_of_sale"].astype(str).str.upper()
-    df["IsCash"] = df["terms_of_sale"].str.contains("CASH", na=False)
+    if "buyer_financing" not in df.columns:
+        return _empty_stat_shell(freq, start, end, "Cash Sales %")
+    financing = df["buyer_financing"].fillna("").astype(str).str.upper().str.strip()
+    if not financing.ne("").any():
+        return _empty_stat_shell(freq, start, end, "Cash Sales %")
+    df["IsCash"] = financing.str.contains("CASH", na=False)
     
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)

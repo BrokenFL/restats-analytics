@@ -142,6 +142,7 @@ class DataLoader:
             public_remarks TEXT,
             legal_desc TEXT,
             terms_of_sale TEXT,
+            buyer_financing TEXT,
             homeowners_assoc TEXT,
             listing_agent TEXT,
             listing_office TEXT,
@@ -167,6 +168,8 @@ class DataLoader:
                 self.conn.execute("ALTER TABLE listing_details ADD COLUMN membership_fee REAL")
             if "cabana_flag" not in existing_cols:
                 self.conn.execute("ALTER TABLE listing_details ADD COLUMN cabana_flag INTEGER DEFAULT 0")
+            if "buyer_financing" not in existing_cols:
+                self.conn.execute("ALTER TABLE listing_details ADD COLUMN buyer_financing TEXT")
             # Guardrail/performance indexes for duplicate checks and forensic audits.
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_listing_details_parcel_sold_date "
