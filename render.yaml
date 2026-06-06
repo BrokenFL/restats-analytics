@@ -5,11 +5,11 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT
-      envVars:
-        - key: RESTATS_DATABASE_URL
-          sync: false
-        - key: SUPABASE_DB_HOST
-          value: aws-1-us-east-1.pooler.supabase.com
+    envVars:
+      - key: RESTATS_DATABASE_URL
+        sync: false
+      - key: SUPABASE_DB_HOST
+        value: aws-1-us-east-1.pooler.supabase.com
       - key: SUPABASE_DB_PORT
         value: 5432
       - key: SUPABASE_DB_NAME
@@ -28,3 +28,5 @@ services:
     envVars:
       - key: VITE_API_BASE_URL
         value: https://restats-api.onrender.com
+      - key: VITE_GOOGLE_MAPS_API_KEY
+        sync: false
