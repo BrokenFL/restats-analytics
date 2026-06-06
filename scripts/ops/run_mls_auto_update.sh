@@ -11,4 +11,4 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="/usr/bin/python3"
 fi
 
-exec "$PYTHON_BIN" "$PROJECT_ROOT/scripts/ops/run_mls_auto_update.py" --headless
+exec "$PYTHON_BIN" "$PROJECT_ROOT/scripts/ops/run_mls_auto_update.py" --headless "$@"

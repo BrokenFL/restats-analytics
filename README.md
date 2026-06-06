@@ -252,6 +252,7 @@ Current menu options:
 - Important macOS note:
   - the current SSD repo path is `/Volumes/ExternalSSD/projects/restats-analytics`
   - the checked-in LaunchAgent template now runs the SSD wrapper script directly
+  - the checked-in LaunchAgent template is scheduled for `9:15 PM` local time and does not force an immediate run when installed
 - The auto-update runner now follows a two-step flow by default:
   - refresh local SQLite from MLS
   - sync local `listing_details` into Supabase so the live API stays aligned
