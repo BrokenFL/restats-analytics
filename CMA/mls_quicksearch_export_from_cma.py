@@ -9,7 +9,11 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from selenium import webdriver
@@ -843,9 +847,10 @@ def _set_city_values(driver, city_names, debug_dir: str) -> None:
         raise TimeoutException(f"Some city filters were not found: {missing}")
 
 
-def _set_status_from_date(driver, from_date: str, debug_dir: str) -> None:
+def _set_status_from_date(driver, from_date: str, debug_dir: str, status_codes=None) -> None:
     js = """
         const fromDate = String(arguments[0] || '').trim();
+        const requestedStatuses = (arguments[1] || []).map(x => String(x).toUpperCase().trim());
         if (!fromDate) return {ok:false, reason:'empty_from_date'};
 
         let sel =
@@ -864,7 +869,32 @@ def _set_status_from_date(driver, from_date: str, debug_dir: str) -> None:
           try { seeAll.click(); } catch (e) {}
         }
 
-        const ids = ['2','4','5','6','7','8'].map(suffix => `from_${groupId}_${suffix}`);
+        const statusDateSuffixes = {
+          P: ['2'],
+          PWC_U: ['2'],
+          C: ['4'],
+          E: ['5'],
+          W: ['6'],
+          O: ['7'],
+          L: ['8']
+        };
+        let suffixes = [];
+        for (const status of requestedStatuses) {
+          suffixes.push(...(statusDateSuffixes[status] || []));
+        }
+        suffixes = Array.from(new Set(suffixes));
+        if (!suffixes.length) {
+          return {ok:true, touched:[], skipped:true, reason:'no_date_fields_for_requested_statuses', groupId};
+        }
+
+        for (const suffix of ['2','4','5','6','7','8']) {
+          const checkbox = document.getElementById(`c_${groupId}_${suffix}_date`);
+          if (checkbox && checkbox.checked && !suffixes.includes(suffix)) {
+            try { checkbox.click(); } catch (e) {}
+          }
+        }
+
+        const ids = suffixes.map(suffix => `from_${groupId}_${suffix}`);
         const touched = [];
         for (const id of ids) {
           const el = document.getElementById(id);
@@ -884,7 +914,7 @@ def _set_status_from_date(driver, from_date: str, debug_dir: str) -> None:
         }
         return {ok:touched.length > 0, touched, groupId};
     """
-    result = driver.execute_script(js, from_date) or {}
+    result = driver.execute_script(js, from_date, status_codes or []) or {}
     _capture_debug(driver, debug_dir, "status_from_date_set")
     if not result.get("ok"):
         raise TimeoutException(f"Unable to set status date ranges from {from_date}. reason={result.get('reason')}")
@@ -1325,6 +1355,550 @@ def _force_custom_export_mode(driver) -> bool:
     return _search_frames()
 
 
+def _wait_for_export_dialog(driver, timeout_sec=90) -> bool:
+    selectors = [
+        "label[for='type5']",
+        "#type5",
+        "input[name='stype'][value='custom']",
+        "select[name='template_id']",
+        "button[type='submit']",
+        "button.g-recaptcha.btn.btn-primary",
+    ]
+    if _switch_to_context_with_selector(driver, selectors[0], timeout_sec=0):
+        return True
+
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        for selector in selectors:
+            if _switch_to_context_with_selector(driver, selector, timeout_sec=1):
+                return True
+        time.sleep(1)
+    return False
+
+
+def _wait_for_export_page(driver, timeout_sec=12) -> bool:
+    deadline = time.time() + timeout_sec
+    heading_xpath = "//*[contains(normalize-space(.), 'Export Flexmls Data to Other Software')]"
+
+    while time.time() < deadline:
+        try:
+            if driver.find_elements(By.XPATH, heading_xpath):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _run_new_export_page(driver, wait: WebDriverWait, export_template: str | None = None, debug_dir: str = "", timeout_sec: int = 30) -> bool:
+    deadline = time.time() + timeout_sec
+    heading_xpath = "//*[contains(normalize-space(.), 'Export Flexmls Data to Other Software')]"
+
+    while time.time() < deadline:
+        try:
+            if driver.find_elements(By.XPATH, heading_xpath):
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        return False
+
+    _capture_debug(driver, debug_dir, "new_export_page")
+
+    custom_selected = False
+    try:
+        for by, sel in [
+            (By.CSS_SELECTOR, "label[for='type5']"),
+            (By.ID, "type5"),
+            (By.XPATH, "//label[contains(normalize-space(.), 'Custom Text Export')]"),
+        ]:
+            try:
+                wait.until(EC.element_to_be_clickable((by, sel))).click()
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        custom_selected = bool(
+            driver.execute_script(
+                """
+                const radio = document.querySelector('#type5');
+                const label = document.querySelector("label[for='type5']");
+                if (label) { try { label.click(); } catch (e) {} }
+                if (radio) {
+                  try { radio.click(); } catch (e) {}
+                  radio.checked = true;
+                  radio.dispatchEvent(new Event('input', { bubbles: true }));
+                  radio.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                return !!(radio && radio.checked);
+                """
+            )
+        )
+    except Exception:
+        custom_selected = False
+
+    _capture_debug(driver, debug_dir, "custom_text_export_new_page")
+    if not custom_selected:
+        raise TimeoutException("Custom Text Export (type5) did not become selected on the export page.")
+
+    if export_template:
+        try:
+            select_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "select")))
+            try:
+                Select(select_el).select_by_visible_text(export_template)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    for by, sel in [
+        (By.CSS_SELECTOR, "button.g-recaptcha.btn.btn-primary[type='submit']"),
+        (By.XPATH, "//button[normalize-space()='EXPORT' or contains(normalize-space(.), 'EXPORT')]"),
+        (By.XPATH, "//input[@type='submit' and (@value='EXPORT' or @value='Export')]"),
+    ]:
+        try:
+            wait.until(EC.element_to_be_clickable((by, sel))).click()
+            _capture_debug(driver, debug_dir, "new_export_page_submit")
+            return True
+        except Exception:
+            continue
+    raise TimeoutException("Could not submit new export page.")
+
+
+def _submit_export_form_fallback(driver, export_template: str | None = None, debug_dir: str = "") -> bool:
+    js = """
+        const exportTemplate = arguments[0];
+        const resultsNode = document.querySelector('#results_totaldiv');
+        const selectedNode = document.querySelector('#cart_totaldiv');
+        const exportForm = document.forms['exportform'];
+        if (!exportForm) {
+          return {ok: false, reason: 'missing_exportform'};
+        }
+
+        const resultsText = resultsNode ? (resultsNode.textContent || '') : '';
+        const selectedText = selectedNode ? (selectedNode.textContent || '') : '';
+        const countAll = parseInt(resultsText.replace(/[^0-9]/g, ''), 10) || 0;
+        const countSelected = parseInt(selectedText.replace(/[^0-9]/g, ''), 10) || 0;
+        const whereValue =
+          (typeof results_allwherestr !== 'undefined' && results_allwherestr) ||
+          (typeof allwherestr !== 'undefined' && allwherestr) ||
+          '';
+        const additional =
+          (typeof additionalcond !== 'undefined' && additionalcond) ||
+          '';
+
+        if (!whereValue) {
+          return {
+            ok: false,
+            reason: 'missing_results_context',
+            count_all: countAll,
+            count_selected: countSelected,
+            where_present: !!whereValue
+          };
+        }
+
+        const ensure = (name, value) => {
+          let el = exportForm.querySelector(`[name="${name}"]`);
+          if (!el) {
+            el = document.createElement('input');
+            el.type = 'hidden';
+            el.name = name;
+            exportForm.appendChild(el);
+          }
+          el.value = value;
+        };
+
+        ensure('where', whereValue);
+        ensure('additionalcond', additional);
+        ensure('countall', String(Math.max(countAll, countSelected, 0)));
+        ensure('countselected', String(Math.max(countSelected, 0)));
+        ensure('showonlyselectedoption', 'false');
+
+        if (exportTemplate) {
+          const templateSelect =
+            document.querySelector("select[name='template_id']") ||
+            exportForm.querySelector("[name='template_id']");
+          if (templateSelect && templateSelect.options) {
+            const options = Array.from(templateSelect.options);
+            const match = options.find(opt => (opt.textContent || '').trim() === exportTemplate);
+            if (match) {
+              templateSelect.value = match.value;
+              ensure('template_id', match.value);
+            }
+          }
+        }
+
+        exportForm.submit();
+        return { ok: true, count_all: countAll, count_selected: countSelected, where_present: true };
+    """
+    state = driver.execute_script(js, export_template) or {}
+    _capture_debug(driver, debug_dir, "export_form_fallback")
+    return bool(state.get("ok"))
+
+
+def _prepare_export_form_fallback(driver, export_template: str | None = None) -> dict:
+    js = """
+        const exportTemplate = arguments[0];
+        const resultsNode = document.querySelector('#results_totaldiv');
+        const selectedNode = document.querySelector('#cart_totaldiv');
+        const exportForm = document.forms['exportform'];
+        if (!exportForm) {
+          return {ok: false, reason: 'missing_exportform'};
+        }
+
+        const resultsText = resultsNode ? (resultsNode.textContent || '') : '';
+        const selectedText = selectedNode ? (selectedNode.textContent || '') : '';
+        const countAll = parseInt(resultsText.replace(/[^0-9]/g, ''), 10) || 0;
+        const countSelected = parseInt(selectedText.replace(/[^0-9]/g, ''), 10) || 0;
+        const whereValue =
+          (typeof results_allwherestr !== 'undefined' && results_allwherestr) ||
+          (typeof allwherestr !== 'undefined' && allwherestr) ||
+          '';
+        const additional =
+          (typeof additionalcond !== 'undefined' && additionalcond) ||
+          '';
+
+        if (!whereValue) {
+          return {
+            ok: false,
+            reason: 'missing_results_context',
+            count_all: countAll,
+            count_selected: countSelected,
+            where_present: false
+          };
+        }
+
+        const ensure = (name, value) => {
+          let el = exportForm.querySelector(`[name="${name}"]`);
+          if (!el) {
+            el = document.createElement('input');
+            el.type = 'hidden';
+            el.name = name;
+            exportForm.appendChild(el);
+          }
+          el.value = value;
+        };
+
+        ensure('where', whereValue);
+        ensure('additionalcond', additional);
+        ensure('countall', String(Math.max(countAll, countSelected, 0)));
+        ensure('countselected', String(Math.max(countSelected, 0)));
+        ensure('showonlyselectedoption', 'false');
+
+        if (exportTemplate) {
+          const templateSelect =
+            document.querySelector("select[name='template_id']") ||
+            exportForm.querySelector("[name='template_id']");
+          if (templateSelect && templateSelect.options) {
+            const options = Array.from(templateSelect.options);
+            const match = options.find(opt => (opt.textContent || '').trim() === exportTemplate);
+            if (match) {
+              templateSelect.value = match.value;
+              ensure('template_id', match.value);
+            }
+          }
+        }
+
+        const fields = [];
+        for (const el of Array.from(exportForm.querySelectorAll('input, select, textarea'))) {
+          if (!el.name || el.disabled) continue;
+          const tag = (el.tagName || '').toLowerCase();
+          const type = (el.type || '').toLowerCase();
+          if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+          if (tag === 'select' && el.multiple) {
+            for (const opt of Array.from(el.selectedOptions || [])) {
+              fields.push([el.name, opt.value]);
+            }
+            continue;
+          }
+          fields.push([el.name, el.value || '']);
+        }
+
+        return {
+          ok: true,
+          action: exportForm.getAttribute('action') || exportForm.action || '',
+          method: (exportForm.getAttribute('method') || exportForm.method || 'POST').toUpperCase(),
+          count_all: countAll,
+          count_selected: countSelected,
+          where_present: true,
+          fields
+        };
+    """
+    return driver.execute_script(js, export_template) or {}
+
+
+def _write_debug_response(debug_dir: str, step: str, content: bytes) -> Path | None:
+    if not debug_dir:
+        return None
+    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", step)[:80]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = Path(debug_dir) / f"{ts}_{safe}.html"
+    path.write_bytes(content)
+    return path
+
+
+def _filename_from_content_disposition(value: str) -> str:
+    if not value:
+        return ""
+    match = re.search(r"filename\\*?=(?:UTF-8''|\"?)([^\";]+)", value, flags=re.I)
+    if not match:
+        return ""
+    return Path(match.group(1).strip()).name
+
+
+class _ExportOptionsParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.form_action = ""
+        self.in_export_form = False
+        self.current_select = ""
+        self.options: dict[str, list[tuple[str, str]]] = {}
+        self.fields: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = {name.lower(): (value or "") for name, value in attrs}
+        tag = tag.lower()
+        if tag == "form":
+            form_id = attrs_dict.get("id", "")
+            form_name = attrs_dict.get("name", "")
+            if form_id == "my_export_form" or form_name in {"export_form", "exp_form"}:
+                self.in_export_form = True
+                self.form_action = attrs_dict.get("action", "")
+        if not self.in_export_form:
+            return
+
+        if tag == "input":
+            name = attrs_dict.get("name", "")
+            if not name:
+                return
+            input_type = attrs_dict.get("type", "").lower()
+            if input_type in {"radio", "checkbox"} and "checked" not in attrs_dict:
+                return
+            self.fields.append((name, attrs_dict.get("value", "")))
+        elif tag == "select":
+            self.current_select = attrs_dict.get("name", "")
+            if self.current_select:
+                self.options.setdefault(self.current_select, [])
+        elif tag == "option" and self.current_select:
+            self.options.setdefault(self.current_select, []).append((attrs_dict.get("value", ""), ""))
+
+    def handle_data(self, data):
+        if self.in_export_form and self.current_select and self.options.get(self.current_select):
+            value, label = self.options[self.current_select][-1]
+            self.options[self.current_select][-1] = (value, f"{label}{data}")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "select":
+            self.current_select = ""
+        elif tag == "form" and self.in_export_form:
+            self.in_export_form = False
+
+
+def _set_form_field(fields: list[tuple[str, str]], name: str, value: str) -> list[tuple[str, str]]:
+    cleaned = [(key, existing) for key, existing in fields if key != name]
+    cleaned.append((name, value))
+    return cleaned
+
+
+def _post_form(
+    url: str,
+    fields: list[tuple[str, str]],
+    headers: dict[str, str],
+    timeout_sec: int,
+) -> tuple[int, str, str, str, bytes]:
+    request = Request(url, data=urlencode(fields).encode("utf-8"), headers=headers, method="POST")
+    with urlopen(request, timeout=timeout_sec) as response:
+        content = response.read()
+        return (
+            getattr(response, "status", 200),
+            response.headers.get("Content-Type", ""),
+            response.headers.get("Content-Disposition", ""),
+            response.geturl(),
+            content,
+        )
+
+
+def _build_export_headers(driver, url: str) -> dict[str, str]:
+    cookies = "; ".join(
+        f"{cookie.get('name')}={cookie.get('value')}"
+        for cookie in driver.get_cookies()
+        if cookie.get("name") and cookie.get("value") is not None
+    )
+    try:
+        user_agent = driver.execute_script("return navigator.userAgent") or "Mozilla/5.0"
+    except Exception:
+        user_agent = "Mozilla/5.0"
+
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": driver.current_url,
+        "Origin": urljoin(url, "/").rstrip("/"),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/csv,application/octet-stream,text/plain,*/*",
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+    return headers
+
+
+def _write_export_content(download_dir: str, disposition: str, content: bytes) -> str:
+    filename = _filename_from_content_disposition(disposition)
+    if not filename or not filename.lower().endswith(".csv"):
+        filename = f"flexmls_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    output_path = Path(download_dir) / filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path = output_path.with_name(
+            f"{output_path.stem}_{datetime.now().strftime('%H%M%S')}{output_path.suffix}"
+        )
+    output_path.write_bytes(content)
+    return str(output_path)
+
+
+def _download_export_form_fallback(
+    driver,
+    download_dir: str,
+    export_template: str | None = None,
+    debug_dir: str = "",
+    timeout_sec: int = 180,
+) -> str:
+    state = _prepare_export_form_fallback(driver, export_template=export_template)
+    _capture_debug(driver, debug_dir, "export_form_direct_post_prepared")
+    if not state.get("ok"):
+        raise TimeoutException(f"Export form direct post was not prepared: {state}")
+
+    raw_fields = state.get("fields") or []
+    fields = [
+        (str(field[0]), "" if field[1] is None else str(field[1]))
+        for field in raw_fields
+        if isinstance(field, (list, tuple)) and len(field) == 2 and field[0]
+    ]
+    if not fields:
+        raise TimeoutException(f"Export form direct post had no fields: {state}")
+
+    action = state.get("action") or "/flexmls-servlets/sservlet/TextExport"
+    url = urljoin(driver.current_url, action)
+    headers = _build_export_headers(driver, url)
+    try:
+        status, content_type, disposition, response_url, content = _post_form(url, fields, headers, timeout_sec)
+    except HTTPError as exc:
+        content = exc.read()
+        debug_path = _write_debug_response(debug_dir, "export_direct_post_http_error", content)
+        raise TimeoutException(
+            f"Export direct POST failed with HTTP {exc.code}; debug_response={debug_path}"
+        ) from exc
+    except URLError as exc:
+        raise TimeoutException(f"Export direct POST failed: {exc}") from exc
+
+    preview = content[:2048].lower()
+    looks_html = b"<html" in preview or b"<!doctype html" in preview
+    if status >= 400 or looks_html:
+        text = content.decode("utf-8", errors="replace")
+        parser = _ExportOptionsParser()
+        parser.feed(text)
+        if status < 400 and parser.form_action:
+            final_fields = parser.fields
+            final_fields = _set_form_field(final_fields, "stype", "custom")
+            final_fields = _set_form_field(final_fields, "export_id", "type5")
+            final_fields = _set_form_field(final_fields, "export_count", "all")
+
+            template_value = ""
+            if export_template:
+                requested = re.sub(r"[^a-z0-9]+", "", export_template.lower())
+                for value, label in parser.options.get("template_id", []):
+                    normalized = re.sub(r"[^a-z0-9]+", "", label.lower())
+                    if normalized == requested:
+                        template_value = value
+                        break
+            if not template_value and parser.options.get("template_id"):
+                template_value = parser.options["template_id"][0][0]
+            if template_value:
+                final_fields = _set_form_field(final_fields, "template_id", template_value)
+
+            summary_url = urljoin(response_url, parser.form_action)
+            summary_headers = dict(headers)
+            summary_headers["Referer"] = response_url
+            summary_headers["Origin"] = urljoin(summary_url, "/").rstrip("/")
+            try:
+                summary_status, summary_type, summary_disposition, summary_url_final, summary_content = _post_form(
+                    summary_url,
+                    final_fields,
+                    summary_headers,
+                    timeout_sec,
+                )
+            except HTTPError as exc:
+                error_content = exc.read()
+                debug_path = _write_debug_response(debug_dir, "export_summary_post_http_error", error_content)
+                raise TimeoutException(
+                    f"Export Summary POST failed with HTTP {exc.code}; debug_response={debug_path}"
+                ) from exc
+            except URLError as exc:
+                raise TimeoutException(f"Export Summary POST failed: {exc}") from exc
+
+            summary_preview = summary_content[:2048].lower()
+            summary_looks_html = b"<html" in summary_preview or b"<!doctype html" in summary_preview
+            if summary_status < 400 and not summary_looks_html:
+                return _write_export_content(download_dir, summary_disposition, summary_content)
+
+            download_parser = _ExportOptionsParser()
+            download_parser.feed(summary_content.decode("utf-8", errors="replace"))
+            if summary_status < 400 and download_parser.form_action and download_parser.fields:
+                custom_url = urljoin(summary_url_final, download_parser.form_action)
+                custom_headers = dict(headers)
+                custom_headers["Referer"] = summary_url_final
+                custom_headers["Origin"] = urljoin(custom_url, "/").rstrip("/")
+                try:
+                    custom_status, custom_type, custom_disposition, _custom_url, custom_content = _post_form(
+                        custom_url,
+                        download_parser.fields,
+                        custom_headers,
+                        timeout_sec,
+                    )
+                except HTTPError as exc:
+                    error_content = exc.read()
+                    debug_path = _write_debug_response(debug_dir, "export_custom_post_http_error", error_content)
+                    raise TimeoutException(
+                        f"Export CustomExport POST failed with HTTP {exc.code}; debug_response={debug_path}"
+                    ) from exc
+                except URLError as exc:
+                    raise TimeoutException(f"Export CustomExport POST failed: {exc}") from exc
+
+                custom_preview = custom_content[:2048].lower()
+                custom_looks_html = b"<html" in custom_preview or b"<!doctype html" in custom_preview
+                if custom_status < 400 and not custom_looks_html:
+                    return _write_export_content(download_dir, custom_disposition, custom_content)
+
+                debug_path = _write_debug_response(debug_dir, "export_custom_post_html_response", custom_content)
+                custom_text = custom_content[:500].decode("utf-8", errors="replace").replace("\n", " ")
+                raise TimeoutException(
+                    f"Export CustomExport POST returned non-CSV response status={custom_status} "
+                    f"content_type={custom_type!r}; debug_response={debug_path}; preview={custom_text!r}"
+                )
+
+            debug_path = _write_debug_response(debug_dir, "export_summary_post_html_response", summary_content)
+            summary_text = summary_content[:500].decode("utf-8", errors="replace").replace("\n", " ")
+            raise TimeoutException(
+                f"Export Summary POST returned non-CSV response status={summary_status} "
+                f"content_type={summary_type!r}; debug_response={debug_path}; preview={summary_text!r}"
+            )
+
+        debug_path = _write_debug_response(debug_dir, "export_direct_post_html_response", content)
+        text = content[:500].decode("utf-8", errors="replace").replace("\n", " ")
+        raise TimeoutException(
+            f"Export direct POST returned non-CSV response status={status} "
+            f"content_type={content_type!r}; debug_response={debug_path}; preview={text!r}"
+        )
+
+    return _write_export_content(download_dir, disposition, content)
+
+
 def _export_current_results(
     driver,
     wait: WebDriverWait,
@@ -1333,7 +1907,7 @@ def _export_current_results(
     export_template: str,
     download_timeout: int,
 ) -> str:
-    # Full export flow: open export menu, choose Custom Text Export (type5), choose template, click Export, wait for CSV.
+    # Full export flow: open export menu, prefer export page/direct form submit, then fall back to legacy modal.
     if not _switch_to_context_with_selector(driver, "#more-ellipses", timeout_sec=15):
         _capture_debug(driver, debug_dir, "export_menu_not_found")
         raise TimeoutException("More menu not found for export")
@@ -1364,6 +1938,33 @@ def _export_current_results(
     else:
         _capture_debug(driver, debug_dir, "export_click_failed")
         raise TimeoutException("Could not open Export Listings dialog")
+
+    if _wait_for_export_page(driver, timeout_sec=8):
+        if _run_new_export_page(
+            driver,
+            wait,
+            export_template=export_template,
+            debug_dir=debug_dir,
+            timeout_sec=10,
+        ):
+            return _wait_for_csv(download_dir=download_dir, timeout_sec=download_timeout)
+
+    try:
+        return _download_export_form_fallback(
+            driver,
+            download_dir=download_dir,
+            export_template=export_template,
+            debug_dir=debug_dir,
+            timeout_sec=download_timeout,
+        )
+    except TimeoutException as exc:
+        print(f"  export_direct_post_fallback_failed={exc}", flush=True)
+
+    if _submit_export_form_fallback(driver, export_template=export_template, debug_dir=debug_dir):
+        return _wait_for_csv(download_dir=download_dir, timeout_sec=download_timeout)
+
+    if not _wait_for_export_dialog(driver, timeout_sec=30):
+        raise TimeoutException("Export dialog did not finish loading known controls.")
 
     if not _select_custom_text_export(driver):
         _capture_debug(driver, debug_dir, "custom_text_export_failed")
@@ -1590,6 +2191,13 @@ def main():
     service_port = _pick_chromedriver_port(args.chromedriver_port)
     print(f"chromedriver_port={service_port}")
     driver = webdriver.Chrome(service=Service(port=service_port), options=options)
+    try:
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": str(Path(args.download_dir).resolve())},
+        )
+    except Exception:
+        pass
     wait = WebDriverWait(driver, 30)
     exported_csvs = []
     try:
@@ -1602,7 +2210,7 @@ def main():
             _set_status_values(driver, status_codes, args.debug_dir)
             from_date = row.get("from_date", args.from_date)
             if from_date:
-                _set_status_from_date(driver, from_date, args.debug_dir)
+                _set_status_from_date(driver, from_date, args.debug_dir, status_codes=status_codes)
             if args.search_mode == "city":
                 _set_city_values(driver, row["cities"], args.debug_dir)
             else:
