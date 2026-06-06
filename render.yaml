@@ -20,7 +20,6 @@ services:
   - type: web
     name: restats-web
     env: static
-    plan: free
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
