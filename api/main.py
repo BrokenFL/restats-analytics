@@ -2,12 +2,16 @@ import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from typing import Optional, Literal
 import calendar
 import json
+import socket
 from dataclasses import asdict
 
 import pandas as pd
+import psycopg
+from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, Query
@@ -50,6 +54,14 @@ def _ops_project_root() -> str:
 
 
 DB_PATH = os.getenv("RESTATS_DB_PATH", _default_db_path())
+DATABASE_URL = os.getenv("RESTATS_DATABASE_URL") or os.getenv("DATABASE_URL")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF")
+SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
+SUPABASE_DB_HOST = os.getenv("SUPABASE_DB_HOST")
+SUPABASE_DB_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+SUPABASE_DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
+SUPABASE_DB_USER = os.getenv("SUPABASE_DB_USER")
+USE_POSTGRES = bool(DATABASE_URL or (SUPABASE_DB_PASSWORD and (SUPABASE_DB_HOST or SUPABASE_PROJECT_REF)))
 
 app = FastAPI(
     title="ReStats API",
@@ -245,12 +257,99 @@ class CmaRunResponse(BaseModel):
     comps: list[CmaCompRow]
 
 
-def get_connection() -> sqlite3.Connection:
+def _postgres_sql(sql: str) -> str:
+    """Translate the small SQLite SQL subset used by the read API."""
+    translated = sql.replace("DATE('now', ?)", "(CURRENT_DATE + (?::interval))")
+    translated = translated.replace("DATE(?)", "(?::date)")
+    translated = translated.replace("%", "%%")
+    return translated.replace("?", "%s")
+
+
+class _PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def execute(self, sql: str, params=None):
+        self._cursor.execute(_postgres_sql(sql), params or [])
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def close(self):
+        self._cursor.close()
+
+
+class _PostgresConnection:
+    def __init__(self):
+        if DATABASE_URL:
+            self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        else:
+            host = SUPABASE_DB_HOST or f"db.{SUPABASE_PROJECT_REF}.supabase.co"
+            hostaddr = _resolve_ipv4(host)
+            kwargs = dict(
+                host=host,
+                port=SUPABASE_DB_PORT,
+                dbname=SUPABASE_DB_NAME,
+                user=SUPABASE_DB_USER or "postgres",
+                password=SUPABASE_DB_PASSWORD,
+                sslmode="require",
+                row_factory=dict_row,
+            )
+            if hostaddr:
+                kwargs["hostaddr"] = hostaddr
+            self._conn = psycopg.connect(**kwargs)
+
+    def cursor(self):
+        return _PostgresCursor(self._conn.cursor())
+
+    def execute(self, sql: str, params=None):
+        cursor = self.cursor()
+        return cursor.execute(sql, params)
+
+    def close(self):
+        self._conn.close()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+
+def _resolve_ipv4(host: str) -> Optional[str]:
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(host, 5432, type=socket.SOCK_STREAM):
+            if family == socket.AF_INET:
+                return sockaddr[0]
+    except OSError:
+        return None
+    return None
+
+
+def get_connection():
+    if USE_POSTGRES:
+        return _PostgresConnection()
     if not os.path.exists(DB_PATH):
         raise HTTPException(status_code=500, detail=f"Database not found: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _read_sql_query(sql: str, conn, params=None) -> pd.DataFrame:
+    if USE_POSTGRES:
+        cursor = conn.cursor()
+        cursor.execute(sql, params or [])
+        return pd.DataFrame(cursor.fetchall())
+    return pd.read_sql_query(sql, conn, params=params)
 
 
 def _read_latest_audit_summary() -> dict:
@@ -298,6 +397,10 @@ def _read_last_run_metadata() -> dict:
 def _parse_iso_date(value: Optional[str]) -> Optional[date]:
     if not value:
         return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
@@ -403,6 +506,30 @@ def _safe_number(value) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+@lru_cache(maxsize=1)
+def _listing_details_columns() -> set[str]:
+    if USE_POSTGRES:
+        with closing(get_connection()) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'listing_details'
+                """
+            )
+            return {row["column_name"] for row in cur.fetchall()}
+    if not os.path.exists(DB_PATH):
+        return set()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute("PRAGMA table_info(listing_details)").fetchall()
+    return {row[1] for row in rows}
+
+
+def _listing_details_has_column(column_name: str) -> bool:
+    return column_name in _listing_details_columns()
 
 
 def _non_cabana_mask(df: pd.DataFrame) -> pd.Series:
@@ -813,7 +940,8 @@ def health() -> dict:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) AS cnt FROM listing_details")
         count = cursor.fetchone()["cnt"]
-    return {"ok": True, "database": DB_PATH, "listing_count": count}
+    database = "supabase-postgres" if USE_POSTGRES else DB_PATH
+    return {"ok": True, "database": database, "listing_count": count}
 
 
 @app.post("/api/cma/run", response_model=CmaRunResponse)
@@ -986,7 +1114,7 @@ def ops_status() -> dict:
 
     return {
         "database": {
-            "path": DB_PATH,
+            "path": "supabase-postgres" if USE_POSTGRES else DB_PATH,
             "listing_count": listing_count,
             "last_mls_status_date": last_mls_status,
             "last_off_market_sold_date": last_off_market_sold,
@@ -1039,7 +1167,7 @@ def ops_parity(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT
                 listing_number, city, final_subdivision, geo_zone, property_type, status,
@@ -1103,6 +1231,7 @@ def summary_kpis(
     sold_since: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     snapshot_date: Optional[str] = Query(default=None, description="YYYY-MM-DD for as-of inventory snapshot"),
 ) -> dict:
+    cabana_select = "cabana_flag" if _listing_details_has_column("cabana_flag") else "0 AS cabana_flag"
     where_clauses = ["1=1"]
     params: list[str] = []
     _append_common_filters(
@@ -1119,10 +1248,10 @@ def summary_kpis(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        active_df = pd.read_sql_query(
+        active_df = _read_sql_query(
             f"""
             SELECT listing_number, listing_date, effective_active_end_date, status, sold_price, list_price
-                 , cabana_flag
+                 , {cabana_select}
             FROM listing_details
             WHERE {where_sql}
             """,
@@ -1212,7 +1341,13 @@ def market_trends(
 
     where_sql = " AND ".join(where_clauses)
     freq = frequency.lower()
-    if freq == "quarterly":
+    if USE_POSTGRES and freq == "quarterly":
+        group_expr = "'Q' || EXTRACT(QUARTER FROM sold_date)::int::text || ' ' || EXTRACT(YEAR FROM sold_date)::int::text"
+    elif USE_POSTGRES and freq == "annual":
+        group_expr = "TO_CHAR(sold_date, 'YYYY')"
+    elif USE_POSTGRES:
+        group_expr = "TO_CHAR(sold_date, 'YYYY-MM')"
+    elif freq == "quarterly":
         group_expr = "'Q' || CAST(((CAST(STRFTIME('%m', DATE(sold_date)) AS INTEGER)-1)/3)+1 AS INTEGER) || ' ' || STRFTIME('%Y', DATE(sold_date))"
     elif freq == "annual":
         group_expr = "STRFTIME('%Y', DATE(sold_date))"
@@ -1226,9 +1361,9 @@ def market_trends(
             SELECT
                 {group_expr} AS period,
                 COUNT(*) AS sold_count,
-                ROUND(AVG(CASE WHEN sold_price > 0 THEN sold_price END), 2) AS avg_sold_price,
-                ROUND(MIN(CASE WHEN sold_price > 0 THEN sold_price END), 2) AS min_sold_price,
-                ROUND(MAX(CASE WHEN sold_price > 0 THEN sold_price END), 2) AS max_sold_price
+                CAST(ROUND(CAST(AVG(CASE WHEN sold_price > 0 THEN sold_price END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_sold_price,
+                CAST(ROUND(CAST(MIN(CASE WHEN sold_price > 0 THEN sold_price END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS min_sold_price,
+                CAST(ROUND(CAST(MAX(CASE WHEN sold_price > 0 THEN sold_price END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS max_sold_price
             FROM listing_details
             WHERE {where_sql}
             GROUP BY {group_expr}
@@ -1264,7 +1399,7 @@ def inventory_by_status(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT status
             FROM listing_details
@@ -1381,6 +1516,7 @@ def recent_listings(
     start_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     end_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
 ) -> dict:
+    cabana_select = "cabana_flag" if _listing_details_has_column("cabana_flag") else "0 AS cabana_flag"
     where_clauses = ["sold_date IS NOT NULL"]
     params: list[str] = []
     _append_common_filters(
@@ -1421,13 +1557,13 @@ def recent_listings(
                 geo_lon,
                 list_price,
                 sold_price,
-                cabana_flag,
+                {cabana_select},
                 CASE
-                    WHEN sqft_living > 0 AND sold_price > 0 THEN ROUND((sold_price / sqft_living), 2)
+                    WHEN sqft_living > 0 AND sold_price > 0 THEN CAST(ROUND(CAST((sold_price / sqft_living) AS NUMERIC), 2) AS DOUBLE PRECISION)
                     ELSE NULL
                 END AS sold_ppsf,
                 CASE
-                    WHEN list_price > 0 AND sold_price > 0 THEN ROUND((sold_price / list_price) * 100, 2)
+                    WHEN list_price > 0 AND sold_price > 0 THEN CAST(ROUND(CAST((sold_price / list_price) * 100 AS NUMERIC), 2) AS DOUBLE PRECISION)
                     ELSE NULL
                 END AS sp_lp_ratio
             FROM listing_details
@@ -1481,7 +1617,7 @@ def market_report_summary(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT
                 listing_number,
@@ -1575,7 +1711,7 @@ def market_report_listings(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT
                 listing_number,
@@ -1684,12 +1820,12 @@ def subdivision_rankings(
                 final_subdivision,
                 city,
                 COUNT(*) AS sold_count,
-                ROUND(AVG(CASE WHEN sold_price > 0 THEN sold_price END), 2) AS avg_sold_price,
-                ROUND(AVG(CASE WHEN list_price > 0 THEN list_price END), 2) AS avg_list_price,
-                ROUND(AVG(CASE
+                CAST(ROUND(CAST(AVG(CASE WHEN sold_price > 0 THEN sold_price END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_sold_price,
+                CAST(ROUND(CAST(AVG(CASE WHEN list_price > 0 THEN list_price END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_list_price,
+                CAST(ROUND(CAST(AVG(CASE
                     WHEN sold_price > 0 AND list_price > 0 THEN (sold_price / list_price) * 100
-                END), 2) AS avg_sp_lp,
-                ROUND(AVG(CASE WHEN COALESCE(days_on_market, cumulative_dom) > 0 THEN COALESCE(days_on_market, cumulative_dom) END), 1) AS avg_dom
+                END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_sp_lp,
+                CAST(ROUND(CAST(AVG(CASE WHEN COALESCE(days_on_market, cumulative_dom) > 0 THEN COALESCE(days_on_market, cumulative_dom) END) AS NUMERIC), 1) AS DOUBLE PRECISION) AS avg_dom
             FROM listing_details
             WHERE {where_sql}
             GROUP BY final_subdivision, city
@@ -1739,7 +1875,7 @@ def market_period_series(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = pd.read_sql_query(
+        df = _read_sql_query(
             f"""
             SELECT
                 listing_number,

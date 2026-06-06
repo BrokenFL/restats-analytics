@@ -2,13 +2,28 @@ services:
   - type: web
     name: restats-api
     env: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/ops/bootstrap_sqlite_from_supabase.py && uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    startCommand: python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: DATABASE_URL
+      - key: SUPABASE_DB_HOST
+        value: aws-1-us-east-1.pooler.supabase.com
+      - key: SUPABASE_DB_PORT
+        value: 5432
+      - key: SUPABASE_DB_NAME
+        value: postgres
+      - key: SUPABASE_DB_USER
+        value: postgres.cgkfrezxkvvxgrhogtew
+      - key: SUPABASE_DB_PASSWORD
         sync: false
-      - key: RESTATS_DB_PATH
-        value: /opt/render/project/src/mls.db
-      - key: RESTATS_REFRESH_FROM_SUPABASE
-        value: "1"
+
+  - type: web
+    name: restats-web
+    env: static
+    plan: free
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        value: https://restats-api.onrender.com
