@@ -19,6 +19,7 @@ from main import (  # noqa: E402
     run_duplicate_audit_summary,
     run_cabana_flag_sync,
     run_mls_gap_batch_audit,
+    run_pbc_geo_zone_audit_and_fix,
     run_property_type_normalization,
     run_property_type_override_sync,
     run_rx_board_duplicate_cleanup,
@@ -137,6 +138,7 @@ def main() -> int:
         run_subdivision_master_sync()
         run_cross_source_duplicate_cleanup()
         run_rx_board_duplicate_cleanup()
+        run_pbc_geo_zone_audit_and_fix()
         run_property_type_normalization()
         run_property_type_override_sync()
         run_cabana_flag_sync()

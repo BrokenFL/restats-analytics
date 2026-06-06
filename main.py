@@ -1264,6 +1264,7 @@ def run_mls_update_automation():
         run_cross_source_duplicate_cleanup()
         run_rx_board_duplicate_cleanup()
         run_off_market_sync_audit()
+        run_pbc_geo_zone_audit_and_fix()
         run_property_type_normalization()
         run_property_type_override_sync()
         run_cabana_flag_sync()
