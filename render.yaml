@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: restats-api
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/ops/bootstrap_sqlite_from_supabase.py && uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RESTATS_DB_PATH
+        value: /opt/render/project/src/mls.db
+      - key: RESTATS_REFRESH_FROM_SUPABASE
+        value: "1"
