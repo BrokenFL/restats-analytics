@@ -149,6 +149,26 @@ def write_last_run(pipeline_name, status, started_at=None, finished_at=None, det
     except Exception as e:
         print(f"⚠️  Could not write last run metadata: {e}")
 
+
+def run_cloud_database_sync(keep_cloud_only=False):
+    """Push the current local SQLite listing_details table to Supabase."""
+    print("\n☁️  Syncing local SQLite -> Supabase API database...")
+    cmd = [
+        sys.executable,
+        os.path.join("scripts", "ops", "sync_sqlite_to_supabase.py"),
+        "--delete-invalid-local",
+    ]
+    if keep_cloud_only:
+        cmd.append("--keep-cloud-only")
+    subprocess.run(cmd, check=True)
+    print("✅ Cloud database sync complete.")
+    return {
+        "enabled": True,
+        "script": os.path.join("scripts", "ops", "sync_sqlite_to_supabase.py"),
+        "keep_cloud_only": keep_cloud_only,
+    }
+
+
 def reset_database():
     print("\n--- RESETTING DATABASE & RESTORING FILES ---")
     confirm = input("Are you sure you want to delete the database and restore all CSVs? (y/n): ").lower()
@@ -210,6 +230,7 @@ def run_data_processing():
     try:
         # Run generate_db.py using the current python interpreter
         subprocess.run([sys.executable, "generate_db.py"], check=True)
+        run_cloud_database_sync()
         input("\nPress Enter to continue...")
     except subprocess.CalledProcessError as e:
         print(f"\nError running data processing: {e}")
@@ -369,6 +390,7 @@ def update_subdivisions():
             print(f"\n✅ Fuzzy matched {fuzzy_matches} additional records.")
         
         conn.close()
+        run_cloud_database_sync()
         
     except Exception as e:
         print(f"\n❌ Database error: {e}")
@@ -727,8 +749,15 @@ def run_cma_off_market_refresh(parcel: str, as_of_date: str = None, months_back:
         run_cabana_flag_sync()
         run_data_quality_guardrails()
         run_duplicate_audit_summary()
+        cloud_sync = run_cloud_database_sync()
         print(f"\n✅ CMA off-market refresh complete. Imported files: {len(imported_files)}")
-        return {"status": "ok", "reason": None, "attempted": len(names), "imported": len(imported_files)}
+        return {
+            "status": "ok",
+            "reason": None,
+            "attempted": len(names),
+            "imported": len(imported_files),
+            "cloud_sync": cloud_sync,
+        }
     else:
         print("\nℹ️  No new subdivision files imported for CMA refresh.")
         return {"status": "ok", "reason": "no_new_files", "attempted": len(names), "imported": 0}
@@ -1027,6 +1056,7 @@ def run_off_market_scraper_automation():
         run_cabana_flag_sync()
         run_data_quality_guardrails()
         run_duplicate_audit_summary()
+        cloud_sync = run_cloud_database_sync()
         write_last_run(
             pipeline_name="off_market_auto",
             status="success",
@@ -1035,6 +1065,7 @@ def run_off_market_scraper_automation():
                 "cities": target_cities,
                 "mode": "incremental",
                 "city_runs": city_runs,
+                "cloud_sync": cloud_sync,
             },
         )
         print("\n✅ Off-market automation pipeline complete.")
@@ -1141,6 +1172,7 @@ def run_off_market_scraper_custom():
         run_cabana_flag_sync()
         run_data_quality_guardrails()
         run_duplicate_audit_summary()
+        cloud_sync = run_cloud_database_sync()
         write_last_run(
             pipeline_name="off_market_custom",
             status="success",
@@ -1154,6 +1186,7 @@ def run_off_market_scraper_custom():
                 "city_last_imported_sold_date": date_meta["city_latest"],
                 "global_last_imported_sold_date": date_meta["global_latest"],
                 "baseline_source": date_meta["source"],
+                "cloud_sync": cloud_sync,
             },
         )
         print("\n✅ Off-market custom pipeline complete.")
@@ -1237,11 +1270,17 @@ def run_mls_update_automation():
         run_data_quality_guardrails()
         run_duplicate_audit_summary()
         run_mls_gap_batch_audit(pause=False)
+        cloud_sync = run_cloud_database_sync()
         write_last_run(
             pipeline_name="mls_auto_update",
             status="success",
             started_at=started_ts,
-            details={"mode": "fresh_city_quicksearch", "cities": city_runs, "template": template},
+            details={
+                "mode": "fresh_city_quicksearch",
+                "cities": city_runs,
+                "template": template,
+                "cloud_sync": cloud_sync,
+            },
         )
         print("\n✅ MLS update pipeline complete.")
     except subprocess.CalledProcessError as e:
