@@ -1,10 +1,22 @@
 import os
 import sqlite3
-from typing import Optional
+import socket
+from typing import Any, Iterable, Optional
 
 import pandas as pd
+import psycopg
+from psycopg.rows import dict_row
 
 from .models import SubjectProfile
+
+DATABASE_URL = os.getenv("RESTATS_DATABASE_URL") or os.getenv("DATABASE_URL")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF")
+SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
+SUPABASE_DB_HOST = os.getenv("SUPABASE_DB_HOST")
+SUPABASE_DB_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+SUPABASE_DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
+SUPABASE_DB_USER = os.getenv("SUPABASE_DB_USER")
+USE_POSTGRES = bool(DATABASE_URL or (SUPABASE_DB_PASSWORD and (SUPABASE_DB_HOST or SUPABASE_PROJECT_REF)))
 
 
 def db_path() -> str:
@@ -13,14 +25,122 @@ def db_path() -> str:
     return os.path.join(root, "mls.db")
 
 
-def connect() -> sqlite3.Connection:
+def _resolve_ipv4(host: str) -> Optional[str]:
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(host, 5432, type=socket.SOCK_STREAM):
+            if family == socket.AF_INET:
+                return sockaddr[0]
+    except OSError:
+        return None
+    return None
+
+
+def _postgres_sql(sql: str) -> str:
+    translated = sql.replace("%", "%%")
+    translated = translated.replace("DATE(?, '-60 days')", "(%s::date - INTERVAL '60 days')")
+    translated = translated.replace("DATE(?, '-365 days')", "(%s::date - INTERVAL '365 days')")
+    translated = translated.replace("DATE(?, ?)", "(%s::date + %s::interval)")
+    translated = translated.replace("DATE(?)", "(%s::date)")
+    translated = translated.replace("DATE(COALESCE(sold_date, listing_date))", "COALESCE(sold_date, listing_date)::date")
+    translated = translated.replace("DATE(sold_date)", "sold_date::date")
+    translated = translated.replace("DATE(listing_date)", "listing_date::date")
+    translated = translated.replace("DATE(under_contract_date)", "under_contract_date::date")
+    translated = translated.replace("?", "%s")
+    return translated
+
+
+def _params(params: Optional[Iterable[Any]] = None):
+    if params is None:
+        return None
+    return tuple(params)
+
+
+def _row_to_dict(row: Any) -> dict:
+    return dict(row or {})
+
+
+class _PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def execute(self, sql: str, params=None):
+        self._cursor.execute(_postgres_sql(sql), _params(params) or [])
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def close(self):
+        self._cursor.close()
+
+
+class _PostgresConnection:
+    def __init__(self):
+        if DATABASE_URL:
+            self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        else:
+            host = SUPABASE_DB_HOST or f"db.{SUPABASE_PROJECT_REF}.supabase.co"
+            hostaddr = _resolve_ipv4(host)
+            kwargs = dict(
+                host=host,
+                port=SUPABASE_DB_PORT,
+                dbname=SUPABASE_DB_NAME,
+                user=SUPABASE_DB_USER or "postgres",
+                password=SUPABASE_DB_PASSWORD,
+                sslmode="require",
+                row_factory=dict_row,
+            )
+            if hostaddr:
+                kwargs["hostaddr"] = hostaddr
+            self._conn = psycopg.connect(**kwargs)
+
+    def cursor(self):
+        return _PostgresCursor(self._conn.cursor())
+
+    def close(self):
+        self._conn.close()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+def read_sql(sql: str, conn: Any, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
+    if USE_POSTGRES:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params or [])
+            return pd.DataFrame(cur.fetchall())
+        finally:
+            cur.close()
+    return pd.read_sql_query(sql, conn, params=params)
+
+
+def connect():
+    if USE_POSTGRES:
+        return _PostgresConnection()
     conn = sqlite3.connect(db_path())
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _to_subject(row: sqlite3.Row) -> SubjectProfile:
-    d = dict(row)
+def _to_subject(row: Any) -> SubjectProfile:
+    d = _row_to_dict(row)
     baths_total = d.get("baths_total")
     if baths_total is None:
         try:
@@ -103,7 +223,7 @@ def get_subject_by_parcel(parcel: str, as_of_date: Optional[str] = None) -> Subj
 
 def pull_candidate_sales(as_of_date: str, months_back: int = 24) -> pd.DataFrame:
     with connect() as conn:
-        df = pd.read_sql_query(
+        df = read_sql(
             """
             SELECT
                 listing_number, parcel_id, pcn_10_digit, city, geo_zone, property_type,
@@ -169,7 +289,10 @@ def pull_market_activity(subject: SubjectProfile, as_of_date: str) -> dict:
         pg_sql = property_group_sql()
         cur.execute(
             f"""
-            SELECT COUNT(*), AVG(sold_price), AVG(sold_price / NULLIF(sqft_living,0))
+            SELECT
+                COUNT(*) AS sold_60_count,
+                AVG(sold_price) AS sold_60_avg_price,
+                AVG(sold_price / NULLIF(sqft_living,0)) AS sold_60_avg_ppsf
             FROM listing_details
             WHERE city = ?
               AND DATE(sold_date) >= DATE(?, '-60 days')
@@ -179,11 +302,14 @@ def pull_market_activity(subject: SubjectProfile, as_of_date: str) -> dict:
             """,
             [params[0], params[1], as_of_date, *params[2:]],
         )
-        sold_60_count, sold_60_avg_price, sold_60_avg_ppsf = cur.fetchone()
+        sold_60_row = _row_to_dict(cur.fetchone())
+        sold_60_count = sold_60_row.get("sold_60_count")
+        sold_60_avg_price = sold_60_row.get("sold_60_avg_price")
+        sold_60_avg_ppsf = sold_60_row.get("sold_60_avg_ppsf")
 
         cur.execute(
             f"""
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS pending_60_count
             FROM listing_details
             WHERE city = ?
               AND DATE(under_contract_date) >= DATE(?, '-60 days')
@@ -193,7 +319,7 @@ def pull_market_activity(subject: SubjectProfile, as_of_date: str) -> dict:
             """,
             [params[0], params[1], as_of_date, *params[2:]],
         )
-        pending_60 = cur.fetchone()[0]
+        pending_60 = _row_to_dict(cur.fetchone()).get("pending_60_count")
 
     return {
         "sold_60_count": int(sold_60_count or 0),
@@ -241,7 +367,7 @@ def pull_surrounding_discount_metrics(subject: SubjectProfile, as_of_date: str) 
             params = [city, zone, lat - lat_d, lat + lat_d, lon - lon_d, lon + lon_d]
 
         pg_sql = property_group_sql()
-        sold_df = pd.read_sql_query(
+        sold_df = read_sql(
             f"""
             SELECT sold_date, list_price, sold_price
             FROM listing_details
@@ -377,7 +503,7 @@ def pull_pending_projection(subject: SubjectProfile, scope: dict, as_of_date: st
     city = subject.city or ""
     pg_sql = property_group_sql()
     with connect() as conn:
-        sold_df = pd.read_sql_query(
+        sold_df = read_sql(
             f"""
             SELECT sold_price, list_price, sold_date, final_subdivision, development_name
             FROM listing_details
@@ -392,7 +518,7 @@ def pull_pending_projection(subject: SubjectProfile, scope: dict, as_of_date: st
             conn,
             params=(city, as_of_date, as_of_date),
         )
-        pending_df = pd.read_sql_query(
+        pending_df = read_sql(
             f"""
             SELECT
                 listing_number, short_address, list_price, status, calculated_status,
