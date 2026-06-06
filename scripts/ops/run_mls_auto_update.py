@@ -56,6 +56,16 @@ def parse_args():
         default=None,
         help="Optional MLS status-date start, e.g. 02/01/2026. Uses DB-derived dates when omitted.",
     )
+    parser.add_argument(
+        "--skip-cloud-sync",
+        action="store_true",
+        help="Skip the follow-up SQLite to Supabase sync.",
+    )
+    parser.add_argument(
+        "--keep-cloud-only",
+        action="store_true",
+        help="Do not prune cloud-only rows during the follow-up sync.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +102,17 @@ def _run_city_refresh(city: str, template: str, headless: bool, status_mode: str
     subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
 
 
+def _run_cloud_sync(keep_cloud_only: bool) -> None:
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts/ops/sync_sqlite_to_supabase.py"),
+        "--delete-invalid-local",
+    ]
+    if keep_cloud_only:
+        cmd.append("--keep-cloud-only")
+    subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
+
+
 def main() -> int:
     args = parse_args()
     started_ts = datetime.now().isoformat(timespec="seconds")
@@ -122,6 +143,9 @@ def main() -> int:
         run_data_quality_guardrails()
         run_duplicate_audit_summary()
         run_mls_gap_batch_audit(pause=False)
+        if not args.skip_cloud_sync:
+            print("\nCloud sync: local SQLite -> Supabase", flush=True)
+            _run_cloud_sync(keep_cloud_only=args.keep_cloud_only)
         write_last_run(
             pipeline_name="mls_auto_update",
             status="success",
@@ -133,6 +157,10 @@ def main() -> int:
                 "headless": args.headless,
                 "status_mode": args.status_mode,
                 "from_date": args.from_date,
+                "cloud_sync": {
+                    "enabled": not args.skip_cloud_sync,
+                    "keep_cloud_only": args.keep_cloud_only,
+                },
             },
         )
         print("\nMLS auto-update pipeline complete.", flush=True)
@@ -151,6 +179,10 @@ def main() -> int:
                 "headless": args.headless,
                 "status_mode": args.status_mode,
                 "from_date": args.from_date,
+                "cloud_sync": {
+                    "enabled": not args.skip_cloud_sync,
+                    "keep_cloud_only": args.keep_cloud_only,
+                },
             },
         )
         print(f"\nMLS auto-update pipeline failed: {exc}", flush=True)
@@ -168,6 +200,10 @@ def main() -> int:
                 "headless": args.headless,
                 "status_mode": args.status_mode,
                 "from_date": args.from_date,
+                "cloud_sync": {
+                    "enabled": not args.skip_cloud_sync,
+                    "keep_cloud_only": args.keep_cloud_only,
+                },
             },
         )
         print(f"\nMLS auto-update pipeline failed: {exc}", flush=True)

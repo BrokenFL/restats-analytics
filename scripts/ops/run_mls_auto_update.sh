@@ -6,4 +6,9 @@ cd "$PROJECT_ROOT"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-exec /usr/bin/python3 "$PROJECT_ROOT/scripts/ops/run_mls_auto_update.py" --headless
+PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="/usr/bin/python3"
+fi
+
+exec "$PYTHON_BIN" "$PROJECT_ROOT/scripts/ops/run_mls_auto_update.py" --headless

@@ -247,9 +247,15 @@ Current menu options:
   - `scripts/ops/run_mls_auto_update.sh`
 - LaunchAgent template:
   - `scripts/ops/com.brookesnader.restats.mls-auto-update.plist`
+- Cloud sync runner:
+  - `python3 scripts/ops/sync_sqlite_to_supabase.py`
 - Important macOS note:
-  - this repo currently lives under iCloud Drive (`~/Library/Mobile Documents/...`), which `launchd` could not read in background jobs on this Mac
-  - the installed LaunchAgent therefore targets a local mirror at `~/Code/ReStatsProgram_DEC_2025_automation`
+  - the current SSD repo path is `/Volumes/ExternalSSD/projects/restats-analytics`
+  - the checked-in LaunchAgent template now runs the SSD wrapper script directly
+- The auto-update runner now follows a two-step flow by default:
+  - refresh local SQLite from MLS
+  - sync local `listing_details` into Supabase so the live API stays aligned
+- The cloud sync now prunes cloud-only rows by default so valid local/cloud row counts stay matched.
 - The quick-search importer now uses:
   - `python3 generate_db.py --db-name mls.db --skip-archive <csv paths...>`
   - This avoids relying on an in-process `data_cleaning` import during the Selenium/export job.

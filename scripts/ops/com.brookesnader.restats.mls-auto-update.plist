@@ -7,9 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/scripts/ops/run_mls_auto_update.py</string>
-        <string>--headless</string>
+        <string>/Volumes/ExternalSSD/projects/restats-analytics/scripts/ops/run_mls_auto_update.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -24,9 +22,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/logs/launchagent_mls_auto_update.out.log</string>
+    <string>/Volumes/ExternalSSD/projects/restats-analytics/logs/launchagent_mls_auto_update.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/brookesnader/Code/ReStatsProgram_DEC_2025_automation/logs/launchagent_mls_auto_update.err.log</string>
+    <string>/Volumes/ExternalSSD/projects/restats-analytics/logs/launchagent_mls_auto_update.err.log</string>
 </dict>
 </plist>
