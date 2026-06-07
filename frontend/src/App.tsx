@@ -977,55 +977,76 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    async function load() {
-      setError(null);
-      try {
-        const filters = { city, geoZone, finalSubdivision, propertyGroup };
-        const config: ReportConfig = {
-          reportMode,
-          periodDays,
-          refYear,
-          refMonth,
-          refQuarter,
-          startDate: reportMode === "custom" ? customStart : undefined,
-          endDate: reportMode === "custom" ? customEnd : undefined
-        };
-        const trendFrequency =
-          reportMode === "annual" ? "annual" : reportMode === "quarterly" ? "quarterly" : "monthly";
+    setError(null);
 
-        const reportResp = await fetchReportSummary(config, filters);
-        if (cancelled) return;
-        setReportSummary(reportResp);
+    const filters = { city, geoZone, finalSubdivision, propertyGroup };
+    const config: ReportConfig = {
+      reportMode,
+      periodDays,
+      refYear,
+      refMonth,
+      refQuarter,
+      startDate: reportMode === "custom" ? customStart : undefined,
+      endDate: reportMode === "custom" ? customEnd : undefined
+    };
+    const trendFrequency =
+      reportMode === "annual" ? "annual" : reportMode === "quarterly" ? "quarterly" : "monthly";
 
-        const [kpisResp, trendsResp, invResp, recentResp, rankingsResp, seriesResp] = await Promise.all([
-          fetchKpisWithFilters(soldSince, filters),
-          fetchTrends(12, filters, trendFrequency, activeWindow.start, activeWindow.end),
-          fetchInventory(filters),
-          fetchRecentListingsForRange(150, filters, activeWindow.start, activeWindow.end, soldSince),
-          fetchSubdivisionRankings(config, 2, 10, filters),
-          fetchMarketPeriodSeries(
-            seriesFrequency,
-            seriesPeriods,
-            filters,
-            reportMode === "custom" ? customEnd : undefined,
-            refYear,
-            refMonth,
-            refQuarter
-          ),
-        ]);
-        if (cancelled) return;
-        setKpis(kpisResp);
-        setTrends(trendsResp);
-        setInventory(invResp);
-        setRecentListings(recentResp);
-        setRankings(rankingsResp);
-        setPeriodSeries(seriesResp);
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Failed to load dashboard data");
-      }
-    }
-    void load();
+    const handleLoadError = (err: unknown, fallback: string) => {
+      if (cancelled) return;
+      setError(err instanceof Error ? err.message : fallback);
+    };
+
+    void fetchReportSummary(config, filters)
+      .then((reportResp) => {
+        if (!cancelled) setReportSummary(reportResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load market summary"));
+
+    void fetchKpisWithFilters(soldSince, filters)
+      .then((kpisResp) => {
+        if (!cancelled) setKpis(kpisResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load KPI summary"));
+
+    void fetchTrends(12, filters, trendFrequency, activeWindow.start, activeWindow.end)
+      .then((trendsResp) => {
+        if (!cancelled) setTrends(trendsResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load trends"));
+
+    void fetchInventory(filters)
+      .then((invResp) => {
+        if (!cancelled) setInventory(invResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load inventory"));
+
+    void fetchRecentListingsForRange(150, filters, activeWindow.start, activeWindow.end, soldSince)
+      .then((recentResp) => {
+        if (!cancelled) setRecentListings(recentResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load recent closings"));
+
+    void fetchSubdivisionRankings(config, 2, 10, filters)
+      .then((rankingsResp) => {
+        if (!cancelled) setRankings(rankingsResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load subdivision rankings"));
+
+    void fetchMarketPeriodSeries(
+      seriesFrequency,
+      seriesPeriods,
+      filters,
+      reportMode === "custom" ? customEnd : undefined,
+      refYear,
+      refMonth,
+      refQuarter
+    )
+      .then((seriesResp) => {
+        if (!cancelled) setPeriodSeries(seriesResp);
+      })
+      .catch((err) => handleLoadError(err, "Failed to load historical market stats"));
+
     return () => {
       cancelled = true;
     };
