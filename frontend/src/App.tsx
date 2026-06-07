@@ -528,7 +528,7 @@ function loadGoogleMaps(apiKey: string): Promise<any> {
     script.id = "google-maps-js";
     script.async = true;
     script.defer = true;
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly&loading=async`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly`;
     script.onload = () => resolve(window.google);
     script.onerror = () => reject(new Error("Google Maps failed to load"));
     document.head.appendChild(script);
