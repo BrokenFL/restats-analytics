@@ -9,7 +9,7 @@ import chardet
 import glob
 from datetime import datetime, timedelta
 from property_type_utils import canonical_property_type_series
-from geo_zone_utils import classify_palm_beach_zone
+from geo_zone_utils import classify_palm_beach_zone_from_coords
 from cabana_utils import likely_cabana_mask
 
 # --- 1. SETUP & CONFIGURATION ---
@@ -1420,8 +1420,9 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
         try:
             if 'geo_lat' in final_merged.columns and 'city' in final_merged.columns:
                 final_merged['geo_zone'] = final_merged.apply(
-                    lambda r: classify_palm_beach_zone(
+                    lambda r: classify_palm_beach_zone_from_coords(
                         r.get('geo_lat'),
+                        r.get('geo_lon'),
                         r.get('city'),
                         short_address=r.get('short_address'),
                     ),

@@ -16,7 +16,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from geo_zone_utils import classify_palm_beach_zone
+from geo_zone_utils import classify_palm_beach_zone_from_coords
 
 DB_FILE = str(PROJECT_ROOT / "mls.db")
 
@@ -41,10 +41,14 @@ def run_audit(conn):
             lat = float(geo_lat) if geo_lat is not None else None
         except Exception:
             lat = None
-        expected = classify_palm_beach_zone(lat, city, short_address=short_address)
+        try:
+            lon = float(geo_lon) if geo_lon is not None else None
+        except Exception:
+            lon = None
+        expected = classify_palm_beach_zone_from_coords(lat, lon, city, short_address=short_address)
         actual = geo_zone.strip() if isinstance(geo_zone, str) else geo_zone
 
-        if lat is None:
+        if lat is None and expected is None:
             unknown += 1
             continue
 

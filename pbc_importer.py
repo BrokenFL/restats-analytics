@@ -9,7 +9,7 @@ import pandas as pd
 import os
 from datetime import datetime, timedelta
 from property_type_utils import canonical_property_type
-from geo_zone_utils import classify_palm_beach_zone
+from geo_zone_utils import classify_palm_beach_zone_from_coords
 
 # Configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
@@ -89,13 +89,15 @@ def build_pbc_listing_number(parcel_number, sale_date_yyyy_mm_dd):
 
 def determine_geo_zone(lat, lon, city, short_address=None):
     """Determine Palm Beach geo zone for PBC imports using shared landmark bands."""
-    if lat is None:
-        return None
     try:
-        lat = float(lat)
+        lat = float(lat) if lat is not None else None
     except Exception:
-        return None
-    return classify_palm_beach_zone(lat, city, short_address=short_address)
+        lat = None
+    try:
+        lon = float(lon) if lon is not None else None
+    except Exception:
+        lon = None
+    return classify_palm_beach_zone_from_coords(lat, lon, city, short_address=short_address)
 
 
 def clean_price(price_str):
