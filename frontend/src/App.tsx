@@ -528,7 +528,7 @@ function loadGoogleMaps(apiKey: string): Promise<any> {
     script.id = "google-maps-js";
     script.async = true;
     script.defer = true;
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&libraries=visualization&v=weekly`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly&loading=async`;
     script.onload = () => resolve(window.google);
     script.onerror = () => reject(new Error("Google Maps failed to load"));
     document.head.appendChild(script);
@@ -591,7 +591,7 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
   useEffect(() => {
     if (!apiKey || !mapRef.current || !hasPoints) return;
     let cancelled = false;
-    let heatLayer: any = null;
+    let heatCircles: any[] = [];
     let markers: any[] = [];
 
     void loadGoogleMaps(apiKey)
@@ -618,14 +618,19 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
         if (filteredPoints.length > 1) map.fitBounds(bounds, 44);
 
         if (mapMode === "heat" || mapMode === "both") {
-          heatLayer = new google.maps.visualization.HeatmapLayer({
-            data: filteredPoints.map((point) => ({
-              location: new google.maps.LatLng(point.lat, point.lon),
-              weight: Math.max(1, Math.min(8, (point.soldPrice ?? 500000) / 500000)),
-            })),
-            radius: 34,
-            opacity: 0.58,
-            map,
+          const maxSoldPrice = Math.max(...filteredPoints.map((point) => point.soldPrice ?? 0), 500000);
+          heatCircles = filteredPoints.map((point) => {
+            const weight = Math.max(0.25, Math.min(1, (point.soldPrice ?? 500000) / maxSoldPrice));
+            return new google.maps.Circle({
+              center: { lat: point.lat, lng: point.lon },
+              map,
+              radius: 250 + weight * 1250,
+              strokeColor: "#d86f1d",
+              strokeOpacity: 0.32,
+              strokeWeight: 1,
+              fillColor: "#d86f1d",
+              fillOpacity: mapMode === "heat" ? 0.2 : 0.14,
+            });
           });
         }
 
@@ -668,7 +673,7 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
 
     return () => {
       cancelled = true;
-      if (heatLayer) heatLayer.setMap(null);
+      heatCircles.forEach((circle) => circle.setMap(null));
       markers.forEach((marker) => marker.setMap(null));
     };
   }, [apiKey, filteredPoints, hasPoints, mapMode]);
