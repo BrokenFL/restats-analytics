@@ -1,6 +1,8 @@
 import os
 import sqlite3
+import logging
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Optional, Literal
@@ -30,6 +32,9 @@ from cma_module.expansion import resolve_market_scope
 from cma_module.insights import build_closing_trends, build_community_insights
 from cma_module.scoring import build_candidate_pool, confidence_grade, score_candidates
 from cma_module.valuation import value_from_comps
+
+
+logger = logging.getLogger(__name__)
 
 
 def _single_family_property_type_clause(column_name: str = "property_type") -> str:
@@ -146,6 +151,16 @@ class PeriodSeriesResponse(BaseModel):
     frequency: Literal["monthly", "quarterly", "annual"]
     periods: int
     rows: list[PeriodSeriesRowResponse]
+
+
+class DashboardBootstrapResponse(BaseModel):
+    report_summary: ReportSummaryResponse
+    kpis: KpiSummaryResponse
+    trends: dict
+    inventory: dict
+    recent_listings: dict
+    rankings: dict
+    filter_options: dict
 
 
 class ReportListingRowResponse(BaseModel):
@@ -825,6 +840,172 @@ def _series_last_value(df: pd.DataFrame, col: str) -> Optional[float]:
     return _safe_number(df.iloc[-1][col])
 
 
+def _shift_months(iso_date: str, months: int) -> str:
+    return (pd.Timestamp(iso_date).normalize() + pd.DateOffset(months=months)).date().isoformat()
+
+
+def _market_history_start(start_iso: str, months_back: int) -> str:
+    return _shift_months(start_iso, -months_back)
+
+
+def _load_market_analysis_frame(
+    conn,
+    where_sql: str,
+    params: list[str],
+    history_start: Optional[str] = None,
+) -> pd.DataFrame:
+    cabana_select = "cabana_flag" if _listing_details_has_column("cabana_flag") else "0 AS cabana_flag"
+    buyer_financing_select = _optional_listing_column("buyer_financing")
+    query_params = list(params)
+    extra_where = ""
+    if history_start:
+        extra_where = (
+            " AND (sold_date >= ? OR listing_date >= ? OR under_contract_date >= ? "
+            "OR effective_active_end_date IS NULL OR effective_active_end_date >= ?)"
+        )
+        query_params.extend([history_start, history_start, history_start, history_start])
+
+    df = _read_sql_query(
+        f"""
+        SELECT
+            listing_number,
+            parcel_id,
+            city,
+            final_subdivision,
+            geo_zone,
+            property_type,
+            status,
+            unit_number,
+            listing_date,
+            effective_active_end_date,
+            under_contract_date,
+            sold_date,
+            list_price,
+            original_list_price,
+            sold_price,
+            {cabana_select},
+            terms_of_sale,
+            {buyer_financing_select},
+            total_bedrooms,
+            baths_total,
+            sqft_living,
+            geo_lat,
+            geo_lon,
+            days_on_market,
+            cumulative_dom
+        FROM listing_details
+        WHERE {where_sql}{extra_where}
+        """,
+        conn,
+        params=query_params,
+    )
+
+    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "days_on_market" in df.columns and "cumulative_dom" in df.columns:
+        df["days_on_market"] = df["days_on_market"].fillna(df["cumulative_dom"])
+    return df
+
+
+def _ensure_postgres_read_indexes() -> None:
+    if not USE_POSTGRES:
+        return
+
+    statements = [
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_sold_date ON public.listing_details (sold_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_listing_date ON public.listing_details (listing_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_under_contract_date ON public.listing_details (under_contract_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_effective_active_end_date ON public.listing_details (effective_active_end_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_city ON public.listing_details (city)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_geo_zone ON public.listing_details (geo_zone)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_final_subdivision ON public.listing_details (final_subdivision)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_status ON public.listing_details (status)",
+    ]
+
+    try:
+        with closing(get_connection()) as conn:
+            for stmt in statements:
+                cur = conn.cursor()
+                cur.execute(stmt)
+                conn.commit()
+        logger.info("Ensured Postgres read indexes on listing_details")
+    except Exception as exc:
+        logger.warning("Unable to ensure Postgres read indexes: %s", exc)
+
+
+def _build_dashboard_bootstrap(
+    *,
+    sold_since: Optional[str],
+    report_mode: str,
+    period_days: int,
+    ref_year: Optional[int],
+    ref_month: Optional[int],
+    ref_quarter: Optional[int],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    city: Optional[str],
+    final_subdivision: Optional[str],
+    property_type: Optional[str],
+    geo_zone: Optional[str],
+    property_group: Optional[str],
+) -> dict:
+    trend_frequency = "monthly" if report_mode in {"rolling", "custom"} else report_mode
+    filters = {
+        "city": city,
+        "finalSubdivision": final_subdivision,
+        "geoZone": geo_zone,
+        "propertyGroup": property_group,
+    }
+    config = {
+        "reportMode": report_mode,
+        "periodDays": period_days,
+        "refYear": ref_year,
+        "refMonth": ref_month,
+        "refQuarter": ref_quarter,
+        "startDate": start_date,
+        "endDate": end_date,
+    }
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_report = executor.submit(
+            market_report_summary,
+            report_mode,
+            period_days,
+            ref_year,
+            ref_month,
+            ref_quarter,
+            start_date,
+            end_date,
+            city,
+            final_subdivision,
+            property_type,
+            geo_zone,
+            property_group,
+        )
+        future_kpis = executor.submit(summary_kpis, city, final_subdivision, property_type, geo_zone, property_group, sold_since, None)
+        future_trends = executor.submit(market_trends, 12, trend_frequency, start_date, end_date, city, final_subdivision, property_type, geo_zone, property_group)
+        future_inventory = executor.submit(inventory_by_status, city, final_subdivision, property_type, geo_zone, property_group)
+        future_recent = executor.submit(recent_listings, 25, city, final_subdivision, property_type, geo_zone, property_group, sold_since, start_date, end_date)
+        future_rankings = executor.submit(subdivision_rankings, report_mode, period_days, ref_year, ref_month, ref_quarter, start_date, end_date, 2, 10, city, property_type, geo_zone, property_group)
+        future_filters = executor.submit(filter_options, city, geo_zone, property_type, property_group)
+
+        return {
+            "config": config,
+            "filters": filters,
+            "report_summary": future_report.result(),
+            "kpis": future_kpis.result(),
+            "trends": future_trends.result(),
+            "inventory": future_inventory.result(),
+            "recent_listings": future_recent.result(),
+            "rankings": future_rankings.result(),
+            "filter_options": future_filters.result(),
+        }
+
+
 def _compute_legacy_period_metrics(df: pd.DataFrame, mode: str, start_iso: str, end_iso: str) -> dict:
     freq = "annually" if mode == "annual" else mode
     sales_df = daf.sales_count(df, freq, start_iso, end_iso)
@@ -904,7 +1085,7 @@ def _append_common_filters(
             # Unknown group values are ignored to keep endpoint robust.
             pass
     if sold_since:
-        where_clauses.append("DATE(sold_date) >= DATE(?)")
+        where_clauses.append("sold_date >= ?")
         params.append(sold_since)
 
 
@@ -949,6 +1130,49 @@ def health() -> dict:
         count = cursor.fetchone()["cnt"]
     database = "supabase-postgres" if USE_POSTGRES else DB_PATH
     return {"ok": True, "database": database, "listing_count": count}
+
+
+@app.head("/api/health")
+def health_head() -> None:
+    return None
+
+
+@app.on_event("startup")
+def startup_tasks() -> None:
+    _ensure_postgres_read_indexes()
+
+
+@app.get("/api/dashboard/bootstrap")
+def dashboard_bootstrap(
+    sold_since: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    report_mode: str = Query(default="rolling", pattern="^(rolling|monthly|quarterly|annual|custom)$"),
+    period_days: int = Query(default=30, ge=7, le=366),
+    ref_year: Optional[int] = Query(default=None),
+    ref_month: Optional[int] = Query(default=None, ge=1, le=12),
+    ref_quarter: Optional[int] = Query(default=None, ge=1, le=4),
+    start_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    city: Optional[str] = Query(default=None),
+    final_subdivision: Optional[str] = Query(default=None),
+    property_type: Optional[str] = Query(default=None),
+    geo_zone: Optional[str] = Query(default=None),
+    property_group: Optional[str] = Query(default="ALL"),
+) -> dict:
+    return _build_dashboard_bootstrap(
+        sold_since=sold_since,
+        report_mode=report_mode,
+        period_days=period_days,
+        ref_year=ref_year,
+        ref_month=ref_month,
+        ref_quarter=ref_quarter,
+        start_date=start_date,
+        end_date=end_date,
+        city=city,
+        final_subdivision=final_subdivision,
+        property_type=property_type,
+        geo_zone=geo_zone,
+        property_group=property_group,
+    )
 
 
 @app.post("/api/cma/run", response_model=CmaRunResponse)
@@ -1331,11 +1555,11 @@ def market_trends(
     ]
     params: list[str] = []
     if start_date and end_date:
-        where_clauses.append("DATE(sold_date) >= DATE(?)")
-        where_clauses.append("DATE(sold_date) <= DATE(?)")
+        where_clauses.append("sold_date >= ?")
+        where_clauses.append("sold_date <= ?")
         params.extend([start_date, end_date])
     else:
-        where_clauses.append("DATE(sold_date) >= DATE('now', ?)")
+        where_clauses.append("sold_date >= DATE('now', ?)")
         params.append(f"-{months} months")
     _append_common_filters(
         where_clauses,
@@ -1537,11 +1761,11 @@ def recent_listings(
         property_group=property_group,
     )
     if start_date and end_date:
-        where_clauses.append("DATE(sold_date) >= DATE(?)")
-        where_clauses.append("DATE(sold_date) <= DATE(?)")
+        where_clauses.append("sold_date >= ?")
+        where_clauses.append("sold_date <= ?")
         params.extend([start_date, end_date])
     elif sold_since:
-        where_clauses.append("DATE(sold_date) >= DATE(?)")
+        where_clauses.append("sold_date >= ?")
         params.append(sold_since)
     where_sql = " AND ".join(where_clauses)
 
@@ -1623,44 +1847,10 @@ def market_report_summary(
         property_group=property_group,
     )
     where_sql = " AND ".join(where_clauses)
+    history_start = _market_history_start(previous_start, 12)
 
     with closing(get_connection()) as conn:
-        buyer_financing_select = _optional_listing_column("buyer_financing")
-        df = _read_sql_query(
-            f"""
-            SELECT
-                listing_number,
-                city,
-                final_subdivision,
-                geo_zone,
-                property_type,
-                status,
-                listing_date,
-                effective_active_end_date,
-                under_contract_date,
-                sold_date,
-                list_price,
-                original_list_price,
-                sold_price,
-                cabana_flag,
-                terms_of_sale,
-                {buyer_financing_select},
-                sqft_living,
-                days_on_market,
-                cumulative_dom
-            FROM listing_details
-            WHERE {where_sql}
-            """,
-            conn,
-            params=params,
-        )
-
-    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Use cumulative_dom fallback if days_on_market missing
-    df["days_on_market"] = df["days_on_market"].fillna(df["cumulative_dom"])
+        df = _load_market_analysis_frame(conn, where_sql, params, history_start=history_start)
 
     current = _compute_period_metrics(df, current_start, current_end)
     previous = _compute_period_metrics(df, previous_start, previous_end)
@@ -1719,47 +1909,10 @@ def market_report_listings(
         property_group=property_group,
     )
     where_sql = " AND ".join(where_clauses)
+    history_start = _market_history_start(current_start, 12)
 
     with closing(get_connection()) as conn:
-        buyer_financing_select = _optional_listing_column("buyer_financing")
-        df = _read_sql_query(
-            f"""
-            SELECT
-                listing_number,
-                parcel_id,
-                short_address,
-                city,
-                geo_zone,
-                final_subdivision,
-                property_type,
-                status,
-                unit_number,
-                listing_date,
-                effective_active_end_date,
-                under_contract_date,
-                sold_date,
-                list_price,
-                original_list_price,
-                sold_price,
-                total_bedrooms,
-                baths_total,
-                sqft_living,
-                geo_lat,
-                geo_lon,
-                cabana_flag,
-                terms_of_sale,
-                {buyer_financing_select}
-            FROM listing_details
-            WHERE {where_sql}
-            """,
-            conn,
-            params=params,
-        )
-
-    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ["list_price", "original_list_price", "sold_price", "total_bedrooms", "baths_total", "sqft_living", "geo_lat", "geo_lon"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = _load_market_analysis_frame(conn, where_sql, params, history_start=history_start)
 
     rows = _build_report_listing_rows(df, current_start, current_end)
     return {
@@ -1801,8 +1954,8 @@ def subdivision_rankings(
     where_clauses = [
         "sold_date IS NOT NULL",
         "COALESCE(cabana_flag, 0) = 0",
-        "DATE(sold_date) >= DATE(?)",
-        "DATE(sold_date) <= DATE(?)",
+        "sold_date >= ?",
+        "sold_date <= ?",
         "final_subdivision IS NOT NULL",
         "TRIM(final_subdivision) <> ''",
     ]
@@ -1885,45 +2038,13 @@ def market_period_series(
         property_group=property_group,
     )
     where_sql = " AND ".join(where_clauses)
+    anchor = _resolve_anchor_period(frequency, end_date, end_year, end_month, end_quarter)
+    earliest_period = anchor - (periods - 1)
+    history_start = _market_history_start(earliest_period.start_time.date().isoformat(), 12)
 
     with closing(get_connection()) as conn:
-        buyer_financing_select = _optional_listing_column("buyer_financing")
-        df = _read_sql_query(
-            f"""
-            SELECT
-                listing_number,
-                city,
-                final_subdivision,
-                geo_zone,
-                property_type,
-                status,
-                listing_date,
-                effective_active_end_date,
-                under_contract_date,
-                sold_date,
-                list_price,
-                original_list_price,
-                sold_price,
-                cabana_flag,
-                terms_of_sale,
-                {buyer_financing_select},
-                sqft_living,
-                days_on_market,
-                cumulative_dom
-            FROM listing_details
-            WHERE {where_sql}
-            """,
-            conn,
-            params=params,
-        )
+        df = _load_market_analysis_frame(conn, where_sql, params, history_start=history_start)
 
-    for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["days_on_market"] = df["days_on_market"].fillna(df["cumulative_dom"])
-
-    anchor = _resolve_anchor_period(frequency, end_date, end_year, end_month, end_quarter)
     rows = []
     for i in range(periods - 1, -1, -1):
         p = anchor - i

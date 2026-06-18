@@ -47,6 +47,18 @@ export type FilterOptionsResponse = {
   property_groups: PropertyGroupOption[];
 };
 
+export type DashboardBootstrapResponse = {
+  config: ReportConfig;
+  filters: Filters;
+  report_summary: ReportSummaryResponse;
+  kpis: KpisResponse;
+  trends: TrendsResponse;
+  inventory: InventoryResponse;
+  recent_listings: RecentListingsResponse;
+  rankings: SubdivisionRankingsResponse;
+  filter_options: FilterOptionsResponse;
+};
+
 export type RecentListing = {
   listing_number: string;
   sold_date: string | null;
@@ -410,6 +422,28 @@ export async function fetchFilterOptions(filters: Filters = {}): Promise<FilterO
     property_group: filters.propertyGroup
   });
   return getJson<FilterOptionsResponse>(`/api/filters/options${query}`);
+}
+
+export async function fetchDashboardBootstrap(
+  config: ReportConfig,
+  filters: Filters = {},
+  soldSince?: string
+): Promise<DashboardBootstrapResponse> {
+  const query = buildQuery({
+    report_mode: config.reportMode,
+    period_days: config.periodDays,
+    ref_year: config.refYear,
+    ref_month: config.refMonth,
+    ref_quarter: config.refQuarter,
+    start_date: config.startDate,
+    end_date: config.endDate,
+    city: filters.city,
+    final_subdivision: filters.finalSubdivision,
+    geo_zone: filters.geoZone,
+    property_group: filters.propertyGroup,
+    sold_since: soldSince
+  });
+  return getJson<DashboardBootstrapResponse>(`/api/dashboard/bootstrap${query}`);
 }
 
 export async function fetchRecentListings(limit = 25, filters: Filters = {}, soldSince?: string): Promise<RecentListingsResponse> {

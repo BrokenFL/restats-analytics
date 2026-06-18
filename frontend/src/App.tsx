@@ -1,26 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  fetchFilterOptions,
-  fetchInventory,
-  fetchKpisWithFilters,
+  fetchDashboardBootstrap,
   fetchMarketPeriodSeries,
-  fetchRecentListingsForRange,
   fetchReportListings,
-  fetchReportSummary,
-  fetchSubdivisionRankings,
-  fetchTrends,
   runCma,
   type CmaComp,
   type CmaRunResponse,
-  type FilterOptionsResponse,
-  type InventoryResponse,
-  type KpisResponse,
+  type DashboardBootstrapResponse,
   type PeriodSeriesResponse,
   type RecentListingsResponse,
   type ReportConfig,
   type ReportSummaryResponse,
   type SubdivisionRankingsResponse,
-  type TrendsResponse
+  type TrendsResponse,
+  type FilterOptionsResponse,
+  type InventoryResponse,
+  type KpisResponse
 } from "./api";
 
 type PropertyGroup = "ALL" | "SINGLE_FAMILY" | "TOWNHOME_CONDO";
@@ -954,31 +949,12 @@ export default function App() {
   const [activeView, setActiveView] = useState<DashboardView>("market");
   const [cmaSelectedListing, setCmaSelectedListing] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<SidebarSection>("overview");
+  const [historicalSeriesRequested, setHistoricalSeriesRequested] = useState(false);
 
   const activeWindow = useMemo(
     () => resolveWindowClient(reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd),
     [reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd]
   );
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadFilters() {
-      try {
-        const options = await fetchFilterOptions({
-          city,
-          geoZone,
-          propertyGroup,
-        });
-        if (!cancelled) setFilterOptions(options);
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load filter options");
-      }
-    }
-    void loadFilters();
-    return () => {
-      cancelled = true;
-    };
-  }, [city, geoZone, propertyGroup]);
 
   useEffect(() => {
     let cancelled = false;
@@ -994,63 +970,24 @@ export default function App() {
       startDate: reportMode === "custom" ? customStart : undefined,
       endDate: reportMode === "custom" ? customEnd : undefined
     };
-    const trendFrequency =
-      reportMode === "annual" ? "annual" : reportMode === "quarterly" ? "quarterly" : "monthly";
 
     const handleLoadError = (err: unknown, fallback: string) => {
       if (cancelled) return;
       setError(err instanceof Error ? err.message : fallback);
     };
 
-    void fetchReportSummary(config, filters)
-      .then((reportResp) => {
-        if (!cancelled) setReportSummary(reportResp);
+    void fetchDashboardBootstrap(config, filters, soldSince)
+      .then((payload: DashboardBootstrapResponse) => {
+        if (cancelled) return;
+        setReportSummary(payload.report_summary);
+        setKpis(payload.kpis);
+        setTrends(payload.trends);
+        setInventory(payload.inventory);
+        setRecentListings(payload.recent_listings);
+        setRankings(payload.rankings);
+        setFilterOptions(payload.filter_options);
       })
-      .catch((err) => handleLoadError(err, "Failed to load market summary"));
-
-    void fetchKpisWithFilters(soldSince, filters)
-      .then((kpisResp) => {
-        if (!cancelled) setKpis(kpisResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load KPI summary"));
-
-    void fetchTrends(12, filters, trendFrequency, activeWindow.start, activeWindow.end)
-      .then((trendsResp) => {
-        if (!cancelled) setTrends(trendsResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load trends"));
-
-    void fetchInventory(filters)
-      .then((invResp) => {
-        if (!cancelled) setInventory(invResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load inventory"));
-
-    void fetchRecentListingsForRange(150, filters, activeWindow.start, activeWindow.end, soldSince)
-      .then((recentResp) => {
-        if (!cancelled) setRecentListings(recentResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load recent closings"));
-
-    void fetchSubdivisionRankings(config, 2, 10, filters)
-      .then((rankingsResp) => {
-        if (!cancelled) setRankings(rankingsResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load subdivision rankings"));
-
-    void fetchMarketPeriodSeries(
-      seriesFrequency,
-      seriesPeriods,
-      filters,
-      reportMode === "custom" ? customEnd : undefined,
-      refYear,
-      refMonth,
-      refQuarter
-    )
-      .then((seriesResp) => {
-        if (!cancelled) setPeriodSeries(seriesResp);
-      })
-      .catch((err) => handleLoadError(err, "Failed to load historical market stats"));
+      .catch((err) => handleLoadError(err, "Failed to load dashboard bootstrap"));
 
     return () => {
       cancelled = true;
@@ -1068,10 +1005,67 @@ export default function App() {
     refQuarter,
     customStart,
     customEnd,
+  ]);
+
+  useEffect(() => {
+    if (activeSection === "trends") {
+      setHistoricalSeriesRequested(true);
+      return;
+    }
+
+    const target = document.getElementById("section-trends");
+    if (!target || typeof IntersectionObserver === "undefined") {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setHistoricalSeriesRequested(true);
+        }
+      },
+      { rootMargin: "240px 0px" }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (!historicalSeriesRequested) return;
+    let cancelled = false;
+    const filters = { city, geoZone, finalSubdivision, propertyGroup };
+    void fetchMarketPeriodSeries(
+      seriesFrequency,
+      seriesPeriods,
+      filters,
+      reportMode === "custom" ? customEnd : undefined,
+      refYear,
+      refMonth,
+      refQuarter
+    )
+      .then((seriesResp) => {
+        if (!cancelled) setPeriodSeries(seriesResp);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load historical market stats");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    historicalSeriesRequested,
+    city,
+    geoZone,
+    finalSubdivision,
+    propertyGroup,
+    reportMode,
+    customEnd,
+    refYear,
+    refMonth,
+    refQuarter,
     seriesFrequency,
     seriesPeriods,
-    activeWindow.start,
-    activeWindow.end
   ]);
 
   const inventoryTotal = useMemo(() => (inventory?.rows ?? []).reduce((sum, row) => sum + row.count, 0), [inventory]);

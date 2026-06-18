@@ -137,6 +137,25 @@ def _ensure_unique_index(pg_conn) -> None:
     pg_conn.commit()
 
 
+def _ensure_read_indexes(pg_conn) -> None:
+    statements = [
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_sold_date ON public.listing_details (sold_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_listing_date ON public.listing_details (listing_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_under_contract_date ON public.listing_details (under_contract_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_effective_active_end_date ON public.listing_details (effective_active_end_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_city ON public.listing_details (city)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_geo_zone ON public.listing_details (geo_zone)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_final_subdivision ON public.listing_details (final_subdivision)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_status ON public.listing_details (status)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_parcel_sold_date ON public.listing_details (parcel_id, sold_date)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_details_pcn10_sold_date ON public.listing_details (pcn_10_digit, sold_date)",
+    ]
+    with pg_conn.cursor() as cur:
+        for stmt in statements:
+            cur.execute(stmt)
+    pg_conn.commit()
+
+
 def _pg_type_map(pg_conn) -> dict[str, str]:
     with pg_conn.cursor() as cur:
         cur.execute(
@@ -285,6 +304,7 @@ def main() -> int:
         with psycopg.connect(pg_url) as pg_conn:
             _ensure_column(pg_conn, "buyer_financing", "TEXT")
             _ensure_unique_index(pg_conn)
+            _ensure_read_indexes(pg_conn)
             pg_types = _pg_type_map(pg_conn)
 
             quoted_cols = [f'"{c}"' for c in cols]
