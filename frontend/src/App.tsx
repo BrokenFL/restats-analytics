@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchDashboardBootstrap,
+  fetchFilterOptions,
   fetchMarketPeriodSeries,
   fetchReportListings,
   runCma,
@@ -955,9 +956,42 @@ export default function App() {
     () => resolveWindowClient(reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd),
     [reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd]
   );
+  const hasMarketSelection = Boolean(city || geoZone || finalSubdivision || propertyGroup !== "ALL");
 
   useEffect(() => {
     let cancelled = false;
+    async function loadFilters() {
+      try {
+        const options = await fetchFilterOptions({
+          city,
+          geoZone,
+          propertyGroup,
+        });
+        if (!cancelled) setFilterOptions(options);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load filter options");
+      }
+    }
+    void loadFilters();
+    return () => {
+      cancelled = true;
+    };
+  }, [city, geoZone, propertyGroup]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!hasMarketSelection) {
+      setReportSummary(null);
+      setKpis(null);
+      setTrends(null);
+      setInventory(null);
+      setRecentListings(null);
+      setRankings(null);
+      setPeriodSeries(null);
+      return () => {
+        cancelled = true;
+      };
+    }
     setError(null);
 
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
@@ -1005,6 +1039,7 @@ export default function App() {
     refQuarter,
     customStart,
     customEnd,
+    hasMarketSelection,
   ]);
 
   useEffect(() => {
@@ -2160,7 +2195,9 @@ export default function App() {
           <p className="eyebrow">Palm Beach County Market Overview</p>
           <h1>Market Intelligence Report</h1>
           <p className="hero-copy">
-            {`Data as of ${formatDateDisplay(reportSummary?.current_end ?? activeWindow.end)}`}
+            {hasMarketSelection
+              ? `Data as of ${formatDateDisplay(reportSummary?.current_end ?? activeWindow.end)}`
+              : "Select a market to load the report."}
           </p>
         </div>
         <div className="actions top-actions">
@@ -2311,6 +2348,15 @@ export default function App() {
       ) : null}
 
       {activeView === "market" && error ? <section className="error">{error}</section> : null}
+
+      {activeView === "market" && !hasMarketSelection ? (
+        <section className="panel">
+          <h2>Select a market to load the dashboard</h2>
+          <p className="panel-subtitle">
+            Pick a city, geo zone, subdivision, or building type. The report stays idle until you choose a market.
+          </p>
+        </section>
+      ) : null}
 
       {activeView === "cma" ? (
       <section className="panel listings-panel">
