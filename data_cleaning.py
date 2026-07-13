@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from property_type_utils import canonical_property_type_series
 from geo_zone_utils import classify_palm_beach_zone_from_coords
 from cabana_utils import likely_cabana_mask
+from city_utils import canonical_city_name
 
 # --- 1. SETUP & CONFIGURATION ---
 
@@ -1415,6 +1416,9 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
             logger.info("Applied global PCN grouping.")
         except Exception as e:
             logger.error(f"Grouping error: {e}")
+
+        if "city" in final_merged.columns:
+            final_merged["city"] = final_merged["city"].map(canonical_city_name)
 
         # Apply geo zones (Palm Beach landmark bands)
         try:

@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import data_analysis_functions as daf
 from cabana_utils import likely_cabana_mask
+from city_utils import canonical_city_name
 from cma_module.db import (
     build_pending_pressure_guardrail,
     get_subject_by_parcel,
@@ -1897,7 +1898,15 @@ def filter_options(
             LIMIT 200
             """
         )
-        cities = [dict(r) for r in cursor.fetchall()]
+        city_counts: dict[str, int] = {}
+        for row in cursor.fetchall():
+            city_name = canonical_city_name(row.get("city"))
+            if city_name:
+                city_counts[city_name] = city_counts.get(city_name, 0) + int(row.get("count") or 0)
+        cities = [
+            {"city": city_name, "count": count}
+            for city_name, count in sorted(city_counts.items(), key=lambda item: (-item[1], item[0]))
+        ][:200]
 
         cursor.execute(
             f"""

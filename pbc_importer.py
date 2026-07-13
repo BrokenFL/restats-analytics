@@ -10,6 +10,7 @@ import os
 from datetime import datetime, timedelta
 from property_type_utils import canonical_property_type
 from geo_zone_utils import classify_palm_beach_zone_from_coords
+from city_utils import canonical_city_name, normalize_city_values_in_db
 
 # Configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
@@ -234,7 +235,7 @@ def import_pbc_data(csv_path, dry_run=False):
                 'listing_date': f"{sale_date}T00:00:00" if sale_date else None,  # Off-market: use sold_date
                 'sold_price': sale_price,  # Already cleaned above
                 'short_address': address,
-                'city': row.get('Municipality', 'Palm Beach').title(),  # Normalize to title case
+                'city': canonical_city_name(row.get('Municipality')) or 'Palm Beach',
                 'state_province': 'FL',
                 'subdivision': row.get('Subdivision') if row.get('Subdivision') != 'N/A' else None,
                 'final_subdivision': row.get('Subdivision') if row.get('Subdivision') != 'N/A' else None,
@@ -310,6 +311,10 @@ def import_pbc_data(csv_path, dry_run=False):
         """)
         print(f"  Updated {cursor.rowcount} records with subdivision from PCN lookup")
         conn.commit()
+
+        normalized_cities = normalize_city_values_in_db(conn)
+        if normalized_cities:
+            print(f"  Normalized {normalized_cities} existing city labels")
     
     conn.close()
     
