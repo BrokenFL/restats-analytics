@@ -17,6 +17,7 @@ import argparse
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -405,5 +406,22 @@ def main() -> int:
     return 0
 
 
+def run_with_retries() -> int:
+    attempts = max(1, int(os.getenv("RESTATS_CLOUD_SYNC_ATTEMPTS", "3")))
+    for attempt in range(1, attempts + 1):
+        try:
+            return main()
+        except psycopg.OperationalError:
+            if attempt >= attempts:
+                raise
+            delay = 5 * attempt
+            print(
+                f"Cloud sync attempt {attempt}/{attempts} failed; retrying in {delay}s.",
+                flush=True,
+            )
+            time.sleep(delay)
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_retries())
