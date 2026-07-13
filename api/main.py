@@ -307,7 +307,12 @@ class _PostgresConnection:
     def __init__(self):
         pooler_host = (SUPABASE_DB_HOST or "").strip()
         use_pooler = bool(pooler_host and "pooler" in pooler_host.lower() and SUPABASE_DB_PASSWORD)
-        if use_pooler:
+        # Keep an explicitly configured Render DATABASE_URL authoritative. The
+        # service may have a valid URL without a matching standalone pooler
+        # password; the refresh script can still use the local pooler config.
+        if DATABASE_URL:
+            self._conn = psycopg.connect(DATABASE_URL, connect_timeout=20, row_factory=dict_row)
+        elif use_pooler:
             hostaddr = _resolve_ipv4(pooler_host)
             kwargs = dict(
                 host=pooler_host,
@@ -322,8 +327,6 @@ class _PostgresConnection:
             if hostaddr:
                 kwargs["hostaddr"] = hostaddr
             self._conn = psycopg.connect(**kwargs)
-        elif DATABASE_URL:
-            self._conn = psycopg.connect(DATABASE_URL, connect_timeout=20, row_factory=dict_row)
         else:
             host = SUPABASE_DB_HOST or f"db.{SUPABASE_PROJECT_REF}.supabase.co"
             hostaddr = _resolve_ipv4(host)
