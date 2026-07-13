@@ -579,13 +579,34 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
   const mapRef = useRef<HTMLDivElement | null>(null);
   const [mapMode, setMapMode] = useState<"heat" | "pins" | "both">("both");
   const [mapStatus, setMapStatus] = useState<string | null>(null);
+  const [mapVisible, setMapVisible] = useState(false);
   const apiKey = String(import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? "").trim();
   const filteredPoints = useMemo(() => filterMarketMapOutliers(points), [points]);
   const hiddenOutlierCount = Math.max(0, points.length - filteredPoints.length);
   const hasPoints = filteredPoints.length > 0;
 
   useEffect(() => {
-    if (!apiKey || !mapRef.current || !hasPoints) return;
+    const target = mapRef.current;
+    if (!target) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setMapVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setMapVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "240px 0px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!mapVisible || !apiKey || !mapRef.current || !hasPoints) return;
     let cancelled = false;
     let heatCircles: any[] = [];
     let markers: any[] = [];
@@ -672,7 +693,7 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
       heatCircles.forEach((circle) => circle.setMap(null));
       markers.forEach((marker) => marker.setMap(null));
     };
-  }, [apiKey, filteredPoints, hasPoints, mapMode]);
+  }, [apiKey, filteredPoints, hasPoints, mapMode, mapVisible]);
 
   const fallbackPoints = useMemo(() => {
     if (!filteredPoints.length) return [];
@@ -1019,7 +1040,7 @@ export default function App() {
         setInventory(payload.inventory);
         setRecentListings(payload.recent_listings);
         setRankings(payload.rankings);
-        setFilterOptions(payload.filter_options);
+        if (payload.filter_options) setFilterOptions(payload.filter_options);
       })
       .catch((err) => handleLoadError(err, "Failed to load dashboard bootstrap"));
 

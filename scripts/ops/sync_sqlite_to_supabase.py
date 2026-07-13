@@ -74,16 +74,33 @@ def _load_local_env_defaults() -> None:
 
 
 def _database_url() -> str:
+    # Prefer the configured Supabase pooler over a direct database URL. The
+    # direct endpoint can resolve to an unreachable IPv6 address from the
+    # unattended refresh host, while the pooler is the connection path used
+    # by the deployed API.
+    pooler_host = (os.getenv("SUPABASE_DB_HOST") or "").strip()
+    pooler_password = os.getenv("SUPABASE_DB_PASSWORD")
+    if pooler_host and "pooler" in pooler_host.lower() and pooler_password:
+        pooler_port = os.getenv("SUPABASE_DB_PORT", "5432")
+        pooler_name = os.getenv("SUPABASE_DB_NAME", "postgres")
+        pooler_user = os.getenv("SUPABASE_DB_USER", "postgres")
+        return (
+            f"postgresql://{quote(pooler_user, safe='')}:{quote(pooler_password, safe='')}"
+            f"@{pooler_host}:{pooler_port}/{pooler_name}"
+            "?sslmode=require&connect_timeout=20"
+        )
+
     url = os.getenv("RESTATS_DATABASE_URL") or os.getenv("DATABASE_URL")
     if url:
-        return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}connect_timeout=20"
 
     ref = os.getenv("SUPABASE_PROJECT_REF")
     password = os.getenv("SUPABASE_DB_PASSWORD")
     if ref and password:
         return (
             f"postgresql://postgres:{quote(password, safe='')}"
-            f"@db.{ref}.supabase.co:5432/postgres?sslmode=require"
+            f"@db.{ref}.supabase.co:5432/postgres?sslmode=require&connect_timeout=20"
         )
 
     host = os.getenv("SUPABASE_DB_HOST")
@@ -94,7 +111,7 @@ def _database_url() -> str:
     if host and password:
         return (
             f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
-            f"@{host}:{port}/{dbname}?sslmode=require"
+            f"@{host}:{port}/{dbname}?sslmode=require&connect_timeout=20"
         )
 
     raise RuntimeError(

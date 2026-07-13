@@ -56,7 +56,7 @@ export type DashboardBootstrapResponse = {
   inventory: InventoryResponse;
   recent_listings: RecentListingsResponse;
   rankings: SubdivisionRankingsResponse;
-  filter_options: FilterOptionsResponse;
+  filter_options?: FilterOptionsResponse;
 };
 
 export type RecentListing = {

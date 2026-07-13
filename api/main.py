@@ -305,8 +305,25 @@ class _PostgresCursor:
 
 class _PostgresConnection:
     def __init__(self):
-        if DATABASE_URL:
-            self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        pooler_host = (SUPABASE_DB_HOST or "").strip()
+        use_pooler = bool(pooler_host and "pooler" in pooler_host.lower() and SUPABASE_DB_PASSWORD)
+        if use_pooler:
+            hostaddr = _resolve_ipv4(pooler_host)
+            kwargs = dict(
+                host=pooler_host,
+                port=SUPABASE_DB_PORT,
+                dbname=SUPABASE_DB_NAME,
+                user=SUPABASE_DB_USER or "postgres",
+                password=SUPABASE_DB_PASSWORD,
+                sslmode="require",
+                connect_timeout=20,
+                row_factory=dict_row,
+            )
+            if hostaddr:
+                kwargs["hostaddr"] = hostaddr
+            self._conn = psycopg.connect(**kwargs)
+        elif DATABASE_URL:
+            self._conn = psycopg.connect(DATABASE_URL, connect_timeout=20, row_factory=dict_row)
         else:
             host = SUPABASE_DB_HOST or f"db.{SUPABASE_PROJECT_REF}.supabase.co"
             hostaddr = _resolve_ipv4(host)
@@ -317,6 +334,7 @@ class _PostgresConnection:
                 user=SUPABASE_DB_USER or "postgres",
                 password=SUPABASE_DB_PASSWORD,
                 sslmode="require",
+                connect_timeout=20,
                 row_factory=dict_row,
             )
             if hostaddr:
@@ -853,6 +871,7 @@ def _load_market_analysis_frame(
     where_sql: str,
     params: list[str],
     history_start: Optional[str] = None,
+    select_columns: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     cabana_select = "cabana_flag" if _listing_details_has_column("cabana_flag") else "0 AS cabana_flag"
     buyer_financing_select = _optional_listing_column("buyer_financing")
@@ -865,34 +884,46 @@ def _load_market_analysis_frame(
         )
         query_params.extend([history_start, history_start, history_start, history_start])
 
+    default_columns = [
+        "listing_number",
+        "parcel_id",
+        "city",
+        "final_subdivision",
+        "geo_zone",
+        "property_type",
+        "status",
+        "unit_number",
+        "listing_date",
+        "effective_active_end_date",
+        "under_contract_date",
+        "sold_date",
+        "list_price",
+        "original_list_price",
+        "sold_price",
+        "cabana_flag",
+        "terms_of_sale",
+        "buyer_financing",
+        "total_bedrooms",
+        "baths_total",
+        "sqft_living",
+        "geo_lat",
+        "geo_lon",
+        "days_on_market",
+        "cumulative_dom",
+    ]
+    selected_columns = select_columns or default_columns
+    select_items = []
+    for column in selected_columns:
+        if column == "cabana_flag":
+            select_items.append(cabana_select)
+        elif column == "buyer_financing":
+            select_items.append(buyer_financing_select)
+        else:
+            select_items.append(column)
+
     df = _read_sql_query(
         f"""
-        SELECT
-            listing_number,
-            parcel_id,
-            city,
-            final_subdivision,
-            geo_zone,
-            property_type,
-            status,
-            unit_number,
-            listing_date,
-            effective_active_end_date,
-            under_contract_date,
-            sold_date,
-            list_price,
-            original_list_price,
-            sold_price,
-            {cabana_select},
-            terms_of_sale,
-            {buyer_financing_select},
-            total_bedrooms,
-            baths_total,
-            sqft_living,
-            geo_lat,
-            geo_lon,
-            days_on_market,
-            cumulative_dom
+        SELECT {', '.join(select_items)}
         FROM listing_details
         WHERE {where_sql}{extra_where}
         """,
@@ -970,7 +1001,7 @@ def _build_dashboard_bootstrap(
         "endDate": end_date,
     }
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_report = executor.submit(
             market_report_summary,
             report_mode,
@@ -991,8 +1022,6 @@ def _build_dashboard_bootstrap(
         future_inventory = executor.submit(inventory_by_status, city, final_subdivision, property_type, geo_zone, property_group)
         future_recent = executor.submit(recent_listings, 25, city, final_subdivision, property_type, geo_zone, property_group, sold_since, start_date, end_date)
         future_rankings = executor.submit(subdivision_rankings, report_mode, period_days, ref_year, ref_month, ref_quarter, start_date, end_date, 2, 10, city, property_type, geo_zone, property_group)
-        future_filters = executor.submit(filter_options, city, geo_zone, property_type, property_group)
-
         return {
             "config": config,
             "filters": filters,
@@ -1002,8 +1031,192 @@ def _build_dashboard_bootstrap(
             "inventory": future_inventory.result(),
             "recent_listings": future_recent.result(),
             "rankings": future_rankings.result(),
-            "filter_options": future_filters.result(),
         }
+
+
+def _postgres_report_period_metrics(
+    conn,
+    where_sql: str,
+    params: list[str],
+    *,
+    current_start: str,
+    current_end: str,
+    previous_start: str,
+    previous_end: str,
+    history_start: str,
+) -> tuple[dict, dict]:
+    """Compute report metrics in Postgres without shipping a wide dataframe to pandas."""
+    cabana_predicate = "COALESCE(d.cabana_flag, 0) = 0" if _listing_details_has_column("cabana_flag") else "TRUE"
+    buyer_financing_expr = "d.buyer_financing" if _listing_details_has_column("buyer_financing") else "NULL"
+    primary_predicate = (
+        "UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'B%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'RX-%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%'"
+    )
+    active_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('A', 'ACTIVE', 'ACT', 'COMING SOON', 'CS')"
+    pending_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('P', 'PENDING', 'U', 'UNDER CONTRACT', 'D', 'BACKUP', 'L')"
+
+    def sold_window(start_ref: str, end_ref: str) -> str:
+        return f"DATE(d.sold_date) >= b.{start_ref} AND DATE(d.sold_date) <= b.{end_ref}"
+
+    def listed_window(start_ref: str, end_ref: str) -> str:
+        return f"DATE(d.listing_date) >= b.{start_ref} AND DATE(d.listing_date) <= b.{end_ref}"
+
+    def pending_sales_window(start_ref: str, end_ref: str) -> str:
+        return f"DATE(d.under_contract_date) >= b.{start_ref} AND DATE(d.under_contract_date) <= b.{end_ref}"
+
+    def active_inventory(end_ref: str) -> str:
+        return (
+            f"{cabana_predicate} AND {primary_predicate} "
+            f"AND d.listing_date IS NOT NULL AND DATE(d.listing_date) <= b.{end_ref} "
+            f"AND (DATE(d.effective_active_end_date) > b.{end_ref} "
+            f"OR (d.effective_active_end_date IS NULL AND {active_status}))"
+        )
+
+    def pending_inventory(end_ref: str) -> str:
+        return (
+            f"{cabana_predicate} AND {primary_predicate} "
+            f"AND d.under_contract_date IS NOT NULL AND DATE(d.under_contract_date) <= b.{end_ref} "
+            f"AND (d.sold_date IS NULL OR DATE(d.sold_date) > b.{end_ref}) "
+            f"AND (d.effective_active_end_date IS NULL OR DATE(d.effective_active_end_date) > b.{end_ref} "
+            f"OR {pending_status})"
+        )
+
+    def twelve_month_sales(end_ref: str) -> str:
+        effective_end = f"COALESCE(LEAST(b.{end_ref}, m.max_sold_date), b.{end_ref})"
+        return (
+            f"{cabana_predicate} AND d.sold_date IS NOT NULL "
+            f"AND DATE(d.sold_date) > ({effective_end} - INTERVAL '12 months') "
+            f"AND DATE(d.sold_date) <= {effective_end}"
+        )
+
+    current_active = active_inventory("current_end")
+    previous_active = active_inventory("previous_end")
+    current_pending_inventory = pending_inventory("current_end")
+    previous_pending_inventory = pending_inventory("previous_end")
+    current_sales_12 = twelve_month_sales("current_end")
+    previous_sales_12 = twelve_month_sales("previous_end")
+    current_sold = sold_window("current_start", "current_end")
+    previous_sold = sold_window("previous_start", "previous_end")
+    current_listed = listed_window("current_start", "current_end")
+    previous_listed = listed_window("previous_start", "previous_end")
+    current_pending_sales = pending_sales_window("current_start", "current_end")
+    previous_pending_sales = pending_sales_window("previous_start", "previous_end")
+
+    sql = f"""
+        WITH bounds AS (
+            SELECT
+                CAST(? AS date) AS current_start,
+                CAST(? AS date) AS current_end,
+                CAST(? AS date) AS previous_start,
+                CAST(? AS date) AS previous_end,
+                CAST(? AS date) AS history_start
+        ),
+        base AS (
+            SELECT d.*
+            FROM listing_details d
+            CROSS JOIN bounds b
+            WHERE {where_sql}
+              AND (
+                    DATE(d.sold_date) >= b.history_start
+                 OR DATE(d.listing_date) >= b.history_start
+                 OR DATE(d.under_contract_date) >= b.history_start
+                 OR d.effective_active_end_date IS NULL
+                 OR DATE(d.effective_active_end_date) >= b.history_start
+              )
+        ),
+        max_dates AS (
+            SELECT MAX(DATE(sold_date)) AS max_sold_date
+            FROM base
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold}) AS current_sold_count,
+            COALESCE(SUM(CASE WHEN {cabana_predicate} AND {current_sold} THEN d.sold_price END), 0) AS current_total_sales_volume,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price) FILTER (WHERE {cabana_predicate} AND {current_sold}) AS current_median_sold_price,
+            AVG(CASE WHEN {cabana_predicate} AND {current_sold} THEN d.sold_price END) AS current_avg_sold_price,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price / NULLIF(d.sqft_living, 0)) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.sold_price > 0 AND d.sqft_living > 0) AS current_median_price_per_sqft,
+            AVG(CASE WHEN {cabana_predicate} AND {current_sold} THEN d.list_price END) AS current_avg_list_price,
+            AVG(CASE WHEN {cabana_predicate} AND {current_sold} AND d.sold_price > 0 AND d.list_price > 0 THEN (d.sold_price / d.list_price) * 100 END) AS current_avg_sp_lp,
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_listed}) AS current_new_listings,
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_pending_sales}) AS current_pending_sales,
+            COUNT(*) FILTER (WHERE {current_pending_inventory}) AS current_pending_inventory,
+            COUNT(*) FILTER (WHERE {current_active}) AS current_active_inventory,
+            COUNT(*) FILTER (WHERE {current_sales_12}) AS current_sales_12mo,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.current_start AND DATE(d.effective_active_end_date) <= b.current_end) AS current_median_dom,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS current_median_listing_discount,
+            (COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold}), 0) AS current_cash_sales_percent,
+
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold}) AS previous_sold_count,
+            COALESCE(SUM(CASE WHEN {cabana_predicate} AND {previous_sold} THEN d.sold_price END), 0) AS previous_total_sales_volume,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price) FILTER (WHERE {cabana_predicate} AND {previous_sold}) AS previous_median_sold_price,
+            AVG(CASE WHEN {cabana_predicate} AND {previous_sold} THEN d.sold_price END) AS previous_avg_sold_price,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price / NULLIF(d.sqft_living, 0)) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.sold_price > 0 AND d.sqft_living > 0) AS previous_median_price_per_sqft,
+            AVG(CASE WHEN {cabana_predicate} AND {previous_sold} THEN d.list_price END) AS previous_avg_list_price,
+            AVG(CASE WHEN {cabana_predicate} AND {previous_sold} AND d.sold_price > 0 AND d.list_price > 0 THEN (d.sold_price / d.list_price) * 100 END) AS previous_avg_sp_lp,
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_listed}) AS previous_new_listings,
+            COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_pending_sales}) AS previous_pending_sales,
+            COUNT(*) FILTER (WHERE {previous_pending_inventory}) AS previous_pending_inventory,
+            COUNT(*) FILTER (WHERE {previous_active}) AS previous_active_inventory,
+            COUNT(*) FILTER (WHERE {previous_sales_12}) AS previous_sales_12mo,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.previous_start AND DATE(d.effective_active_end_date) <= b.previous_end) AS previous_median_dom,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS previous_median_listing_discount,
+            (COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold}), 0) AS previous_cash_sales_percent
+        FROM base d
+        CROSS JOIN bounds b
+        CROSS JOIN max_dates m
+    """
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, [current_start, current_end, previous_start, previous_end, history_start, *params])
+        row = cursor.fetchone() or {}
+    finally:
+        cursor.close()
+
+    current = {
+        "sold_count": int(row.get("current_sold_count") or 0),
+        "total_sales_volume": _safe_number(row.get("current_total_sales_volume")),
+        "median_sold_price": _safe_number(row.get("current_median_sold_price")),
+        "avg_sold_price": _safe_number(row.get("current_avg_sold_price")),
+        "median_price_per_sqft": _safe_number(row.get("current_median_price_per_sqft")),
+        "avg_list_price": _safe_number(row.get("current_avg_list_price")),
+        "avg_sp_lp": _safe_number(row.get("current_avg_sp_lp")),
+        "new_listings": int(row.get("current_new_listings") or 0),
+        "pending_sales": int(row.get("current_pending_sales") or 0),
+        "pending_inventory": int(row.get("current_pending_inventory") or 0),
+        "active_inventory": int(row.get("current_active_inventory") or 0),
+        "months_supply": _safe_number(
+            (row.get("current_active_inventory") or 0) / ((row.get("current_sales_12mo") or 0) / 12.0)
+            if (row.get("current_sales_12mo") or 0) > 0
+            else (0 if (row.get("current_active_inventory") or 0) == 0 else 999)
+        ),
+        "median_dom": _safe_number(row.get("current_median_dom")),
+        "median_listing_discount": _safe_number(row.get("current_median_listing_discount")),
+        "cash_sales_percent": _safe_number(row.get("current_cash_sales_percent")),
+    }
+    previous = {
+        "sold_count": int(row.get("previous_sold_count") or 0),
+        "total_sales_volume": _safe_number(row.get("previous_total_sales_volume")),
+        "median_sold_price": _safe_number(row.get("previous_median_sold_price")),
+        "avg_sold_price": _safe_number(row.get("previous_avg_sold_price")),
+        "median_price_per_sqft": _safe_number(row.get("previous_median_price_per_sqft")),
+        "avg_list_price": _safe_number(row.get("previous_avg_list_price")),
+        "avg_sp_lp": _safe_number(row.get("previous_avg_sp_lp")),
+        "new_listings": int(row.get("previous_new_listings") or 0),
+        "pending_sales": int(row.get("previous_pending_sales") or 0),
+        "pending_inventory": int(row.get("previous_pending_inventory") or 0),
+        "active_inventory": int(row.get("previous_active_inventory") or 0),
+        "months_supply": _safe_number(
+            (row.get("previous_active_inventory") or 0) / ((row.get("previous_sales_12mo") or 0) / 12.0)
+            if (row.get("previous_sales_12mo") or 0) > 0
+            else (0 if (row.get("previous_active_inventory") or 0) == 0 else 999)
+        ),
+        "median_dom": _safe_number(row.get("previous_median_dom")),
+        "median_listing_discount": _safe_number(row.get("previous_median_listing_discount")),
+        "cash_sales_percent": _safe_number(row.get("previous_cash_sales_percent")),
+    }
+    return current, previous
 
 
 def _compute_legacy_period_metrics(df: pd.DataFrame, mode: str, start_iso: str, end_iso: str) -> dict:
@@ -1849,11 +2062,49 @@ def market_report_summary(
     where_sql = " AND ".join(where_clauses)
     history_start = _market_history_start(previous_start, 12)
 
+    metric_pair: Optional[tuple[dict, dict]] = None
     with closing(get_connection()) as conn:
-        df = _load_market_analysis_frame(conn, where_sql, params, history_start=history_start)
+        if USE_POSTGRES:
+            try:
+                metric_pair = _postgres_report_period_metrics(
+                    conn,
+                    where_sql,
+                    params,
+                    current_start=current_start,
+                    current_end=current_end,
+                    previous_start=previous_start,
+                    previous_end=previous_end,
+                    history_start=history_start,
+                )
+            except Exception:
+                logger.exception("Postgres report-summary aggregate failed; falling back to dataframe metrics")
+        if metric_pair is None:
+            df = _load_market_analysis_frame(
+                conn,
+                where_sql,
+                params,
+                history_start=history_start,
+                select_columns=[
+                    "listing_number",
+                    "listing_date",
+                    "effective_active_end_date",
+                    "under_contract_date",
+                    "sold_date",
+                    "list_price",
+                    "original_list_price",
+                    "sold_price",
+                    "cabana_flag",
+                    "status",
+                    "sqft_living",
+                    "buyer_financing",
+                ],
+            )
+            metric_pair = (
+                _compute_period_metrics(df, current_start, current_end),
+                _compute_period_metrics(df, previous_start, previous_end),
+            )
 
-    current = _compute_period_metrics(df, current_start, current_end)
-    previous = _compute_period_metrics(df, previous_start, previous_end)
+    current, previous = metric_pair
 
     keys = sorted(set(current.keys()) | set(previous.keys()))
     delta_pct = {k: _pct_change(current.get(k), previous.get(k)) for k in keys}
@@ -2043,7 +2294,26 @@ def market_period_series(
     history_start = _market_history_start(earliest_period.start_time.date().isoformat(), 12)
 
     with closing(get_connection()) as conn:
-        df = _load_market_analysis_frame(conn, where_sql, params, history_start=history_start)
+        df = _load_market_analysis_frame(
+            conn,
+            where_sql,
+            params,
+            history_start=history_start,
+            select_columns=[
+                "listing_number",
+                "listing_date",
+                "effective_active_end_date",
+                "under_contract_date",
+                "sold_date",
+                "list_price",
+                "original_list_price",
+                "sold_price",
+                "cabana_flag",
+                "status",
+                "sqft_living",
+                "buyer_financing",
+            ],
+        )
 
     rows = []
     for i in range(periods - 1, -1, -1):
