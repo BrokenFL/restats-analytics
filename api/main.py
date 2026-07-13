@@ -574,6 +574,60 @@ def _optional_listing_column(column_name: str) -> str:
     return column_name if _listing_details_has_column(column_name) else f"NULL AS {column_name}"
 
 
+def _snapshot_table_name() -> str:
+    return "public.market_report_snapshots" if USE_POSTGRES else "market_report_snapshots"
+
+
+def _load_monthly_snapshot(
+    *,
+    period_start: str,
+    period_end: str,
+    city: Optional[str],
+    property_group: Optional[str],
+) -> Optional[dict]:
+    """Read a precomputed monthly report, if the snapshot table is available."""
+    if os.getenv("RESTATS_DISABLE_SNAPSHOT_READ") == "1":
+        return None
+    if city is not None and not str(city).strip():
+        city = None
+    scope_key = city or "__ALL_MARKETS__"
+    group_key = (property_group or "ALL").upper()
+    with closing(get_connection()) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT payload
+                FROM {_snapshot_table_name()}
+                WHERE report_mode = ?
+                  AND period_start = ?
+                  AND period_end = ?
+                  AND scope_key = ?
+                  AND property_group = ?
+                LIMIT 1
+                """,
+                ["monthly", period_start, period_end, scope_key, group_key],
+            )
+            row = cursor.fetchone()
+        except Exception as exc:
+            # The API must continue serving live calculations while the
+            # snapshot table is being introduced or temporarily unavailable.
+            logger.debug("Monthly report snapshot unavailable: %s", exc)
+            return None
+        finally:
+            cursor.close()
+
+    if not row:
+        return None
+    payload = row["payload"] if isinstance(row, dict) else row[0]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _non_cabana_mask(df: pd.DataFrame) -> pd.Series:
     if "cabana_flag" in df.columns:
         return pd.to_numeric(df["cabana_flag"], errors="coerce").fillna(0).eq(0)
@@ -891,6 +945,7 @@ def _load_market_analysis_frame(
     default_columns = [
         "listing_number",
         "parcel_id",
+        "short_address",
         "city",
         "final_subdivision",
         "geo_zone",
@@ -1221,6 +1276,211 @@ def _postgres_report_period_metrics(
         "cash_sales_percent": _safe_number(row.get("previous_cash_sales_percent")),
     }
     return current, previous
+
+
+def _postgres_period_series(
+    conn,
+    where_sql: str,
+    params: list[str],
+    period_specs: list[tuple[int, str, str, str]],
+    history_start: str,
+) -> list[dict]:
+    """Aggregate all requested periods in one Postgres query."""
+    cabana_predicate = "COALESCE(d.cabana_flag, 0) = 0" if _listing_details_has_column("cabana_flag") else "TRUE"
+    buyer_financing_expr = "d.buyer_financing" if _listing_details_has_column("buyer_financing") else "NULL"
+    active_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('A', 'ACTIVE', 'ACT', 'COMING SOON', 'CS')"
+    pending_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('P', 'PENDING', 'U', 'UNDER CONTRACT', 'D', 'BACKUP', 'L')"
+    primary_predicate = (
+        "UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'B%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'RX-%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%'"
+    )
+
+    period_values = []
+    for index, label, start_iso, end_iso in period_specs:
+        period_values.extend([index, label, start_iso, end_iso])
+    period_rows_sql = ",\n                ".join(
+        ["(?, ?, CAST(? AS date), CAST(? AS date))" for _ in period_specs]
+    )
+
+    active_inventory = (
+        f"{cabana_predicate} AND {primary_predicate} "
+        "AND d.listing_date IS NOT NULL "
+        "AND d.listing_date < (p.end_date + INTERVAL '1 day') "
+        "AND ((d.effective_active_end_date IS NULL "
+        f"AND {active_status}) "
+        "OR d.effective_active_end_date >= (p.end_date + INTERVAL '1 day'))"
+    )
+    pending_inventory = (
+        f"{cabana_predicate} AND {primary_predicate} "
+        "AND d.under_contract_date IS NOT NULL "
+        "AND d.under_contract_date < (p.end_date + INTERVAL '1 day') "
+        "AND (d.sold_date IS NULL OR d.sold_date >= (p.end_date + INTERVAL '1 day')) "
+        "AND (d.effective_active_end_date IS NULL "
+        "OR d.effective_active_end_date >= (p.end_date + INTERVAL '1 day') "
+        f"OR {pending_status})"
+    )
+    effective_sales_end = "COALESCE(LEAST(p.end_date, m.max_sold_date), p.end_date)"
+    sales_12_months = (
+        f"{cabana_predicate} AND d.sold_date IS NOT NULL "
+        f"AND d.sold_date > ({effective_sales_end} - INTERVAL '12 months') "
+        f"AND d.sold_date <= {effective_sales_end}"
+    )
+
+    sql = f"""
+        WITH periods (idx, period, start_date, end_date) AS (
+            VALUES
+                {period_rows_sql}
+        ),
+        base AS (
+            SELECT d.*
+            FROM listing_details d
+            WHERE {where_sql}
+              AND (
+                    d.sold_date >= CAST(? AS date)
+                 OR d.listing_date >= CAST(? AS date)
+                 OR d.under_contract_date >= CAST(? AS date)
+                 OR d.effective_active_end_date IS NULL
+                 OR d.effective_active_end_date >= CAST(? AS date)
+              )
+        ),
+        max_dates AS (
+            SELECT MAX(DATE(sold_date)) AS max_sold_date
+            FROM base
+        )
+        SELECT
+            p.idx,
+            p.period,
+            p.start_date,
+            p.end_date,
+            COUNT(*) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+            ) AS sold_count,
+            SUM(CASE WHEN {cabana_predicate}
+                       AND d.sold_date >= p.start_date
+                       AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                     THEN d.sold_price END) AS total_sales_volume,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+            ) AS median_sold_price,
+            AVG(CASE WHEN {cabana_predicate}
+                       AND d.sold_date >= p.start_date
+                       AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                     THEN d.sold_price END) AS avg_sold_price,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.sold_price / NULLIF(d.sqft_living, 0)) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                  AND d.sold_price > 0
+                  AND d.sqft_living > 0
+            ) AS median_price_per_sqft,
+            AVG(CASE WHEN {cabana_predicate}
+                       AND d.sold_date >= p.start_date
+                       AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                     THEN d.list_price END) AS avg_list_price,
+            AVG(CASE WHEN {cabana_predicate}
+                       AND d.sold_date >= p.start_date
+                       AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                       AND d.sold_price > 0
+                       AND d.list_price > 0
+                     THEN (d.sold_price / d.list_price) * 100 END) AS avg_sp_lp,
+            COUNT(*) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.listing_date >= p.start_date
+                  AND d.listing_date < (p.end_date + INTERVAL '1 day')
+            ) AS new_listings,
+            COUNT(*) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.under_contract_date >= p.start_date
+                  AND d.under_contract_date < (p.end_date + INTERVAL '1 day')
+            ) AS pending_sales,
+            COUNT(*) FILTER (WHERE {pending_inventory}) AS pending_inventory,
+            COUNT(*) FILTER (WHERE {active_inventory}) AS active_inventory,
+            COUNT(*) FILTER (WHERE {sales_12_months}) AS sales_12mo,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)
+            ) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.listing_date IS NOT NULL
+                  AND d.effective_active_end_date IS NOT NULL
+                  AND DATE(d.effective_active_end_date) >= p.start_date
+                  AND DATE(d.effective_active_end_date) <= p.end_date
+            ) AS median_dom,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100
+            ) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                  AND d.original_list_price > 0
+                  AND d.sold_price IS NOT NULL
+            ) AS median_listing_discount,
+            COUNT(*) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+                  AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%'
+            ) * 100.0 / NULLIF(COUNT(*) FILTER (
+                WHERE {cabana_predicate}
+                  AND d.sold_date >= p.start_date
+                  AND d.sold_date < (p.end_date + INTERVAL '1 day')
+            ), 0) AS cash_sales_percent
+        FROM periods p
+        CROSS JOIN base d
+        CROSS JOIN max_dates m
+        GROUP BY p.idx, p.period, p.start_date, p.end_date
+        ORDER BY p.idx
+    """
+
+    cursor = conn.cursor()
+    try:
+        history_params = [history_start, history_start, history_start, history_start]
+        cursor.execute(sql, period_values + params + history_params)
+        raw_rows = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    count_keys = {"sold_count", "new_listings", "pending_sales", "pending_inventory", "active_inventory"}
+    numeric_keys = {
+        "sold_count",
+        "total_sales_volume",
+        "median_sold_price",
+        "avg_sold_price",
+        "median_price_per_sqft",
+        "avg_list_price",
+        "avg_sp_lp",
+        "new_listings",
+        "pending_sales",
+        "pending_inventory",
+        "active_inventory",
+        "sales_12mo",
+        "median_dom",
+        "median_listing_discount",
+        "cash_sales_percent",
+    }
+    rows = []
+    for raw in raw_rows:
+        row = dict(raw)
+        for date_key in ("start_date", "end_date"):
+            value = row.get(date_key)
+            if hasattr(value, "isoformat"):
+                row[date_key] = value.isoformat()
+        sales_12mo = int(_safe_number(row.pop("sales_12mo", 0)) or 0)
+        active_count = int(_safe_number(row.get("active_inventory")) or 0)
+        row["months_supply"] = _safe_number(active_count / (sales_12mo / 12.0)) if sales_12mo else (0 if active_count == 0 else 999)
+        for key in numeric_keys:
+            if key not in row:
+                continue
+            value = _safe_number(row[key])
+            row[key] = int(value or 0) if key in count_keys else value
+        row.pop("idx", None)
+        rows.append(row)
+    return rows
 
 
 def _compute_legacy_period_metrics(df: pd.DataFrame, mode: str, start_iso: str, end_iso: str) -> dict:
@@ -2074,6 +2334,16 @@ def market_report_summary(
     where_sql = " AND ".join(where_clauses)
     history_start = _market_history_start(previous_start, 12)
 
+    if report_mode == "monthly" and not final_subdivision and not property_type and not geo_zone:
+        snapshot = _load_monthly_snapshot(
+            period_start=current_start,
+            period_end=current_end,
+            city=city,
+            property_group=property_group,
+        )
+        if snapshot and isinstance(snapshot.get("report_summary"), dict):
+            return snapshot["report_summary"]
+
     metric_pair: Optional[tuple[dict, dict]] = None
     with closing(get_connection()) as conn:
         if USE_POSTGRES:
@@ -2240,6 +2510,16 @@ def subdivision_rankings(
             where_clauses.append(f"NOT {_single_family_property_type_clause()}")
     where_sql = " AND ".join(where_clauses)
 
+    if report_mode == "monthly" and not property_type and not geo_zone:
+        snapshot = _load_monthly_snapshot(
+            period_start=current_start,
+            period_end=current_end,
+            city=city,
+            property_group=property_group,
+        )
+        if snapshot and isinstance(snapshot.get("rankings"), dict):
+            return snapshot["rankings"]
+
     with closing(get_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -2304,6 +2584,40 @@ def market_period_series(
     anchor = _resolve_anchor_period(frequency, end_date, end_year, end_month, end_quarter)
     earliest_period = anchor - (periods - 1)
     history_start = _market_history_start(earliest_period.start_time.date().isoformat(), 12)
+
+    if frequency == "monthly" and periods == 12 and not final_subdivision and not property_type and not geo_zone:
+        snapshot = _load_monthly_snapshot(
+            period_start=anchor.start_time.date().isoformat(),
+            period_end=anchor.end_time.date().isoformat(),
+            city=city,
+            property_group=property_group,
+        )
+        if snapshot and isinstance(snapshot.get("period_series"), dict):
+            return snapshot["period_series"]
+
+    period_specs = []
+    for i in range(periods - 1, -1, -1):
+        period = anchor - i
+        start_iso = period.start_time.date().isoformat()
+        end_iso = period.end_time.date().isoformat()
+        if frequency == "monthly":
+            label = period.strftime("%b %Y")
+        elif frequency == "quarterly":
+            label = f"Q{period.quarter} {period.year}"
+        else:
+            label = str(period.year)
+        period_specs.append((periods - 1 - i, label, start_iso, end_iso))
+
+    if USE_POSTGRES:
+        with closing(get_connection()) as conn:
+            try:
+                return {
+                    "frequency": frequency,
+                    "periods": periods,
+                    "rows": _postgres_period_series(conn, where_sql, params, period_specs, history_start),
+                }
+            except Exception:
+                logger.exception("Postgres period-series aggregate failed; falling back to dataframe metrics")
 
     with closing(get_connection()) as conn:
         df = _load_market_analysis_frame(
