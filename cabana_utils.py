@@ -31,10 +31,8 @@ def is_cabana_address(addr: str) -> bool:
     addr = str(addr or "").upper()
     has_c = bool(re.search(r"\bC(?:\s|-)?\d{1,3}[A-Z]?\b", addr))
     has_cs = bool(re.search(r"\bCS\d{1,3}\b", addr))
-    has_zero_unit = bool(re.search(r" 0\d{2,3}[A-Z]?$", addr))
-    has_stg = any(token in addr for token in (" STG", "STORAGE", " PARKING", " PK "))
     has_cabana_word = "CABANA" in addr
-    return has_c or has_cs or has_zero_unit or has_stg or has_cabana_word
+    return has_c or has_cs or has_cabana_word
 
 
 def likely_cabana_mask(df: pd.DataFrame) -> pd.Series:
@@ -55,9 +53,14 @@ def likely_cabana_mask(df: pd.DataFrame) -> pd.Series:
     excluded = building.apply(is_excluded_building)
 
     address_signal = addr_upper.apply(is_cabana_address)
-    legal_signal = legal_upper.str.contains(r"\bCABANA\b|\bSTORAGE\b|\bPARKING\b|\bPK\b", regex=True, na=False)
-    remarks_signal = remarks_upper.str.contains(r"\bCABANA\b|\bSTORAGE\b|\bPARKING\b|\bPK\b", regex=True, na=False)
-    unit_signal = unit_upper.str.contains(r"^(?:C\d{1,3}[A-Z]?|CS\d{1,3}|0\d{2,3}[A-Z]?)$", regex=True, na=False)
+    explicit_cabana_signal = addr_upper.str.contains(r"\bCABANA\b", regex=True, na=False)
+    legal_signal = legal_upper.str.contains(
+        r"\b(?:CABANA|STORAGE UNIT|PARKING (?:SPACE|UNIT))\b", regex=True, na=False
+    )
+    unit_signal = unit_upper.str.contains(r"^(?:C\d{1,3}[A-Z]?|CS\d{1,3})$", regex=True, na=False)
+    secondary_unit_signal = unit_upper.str.contains(
+        r"^(?:0\d{2,3}[A-Z]?|STG\s*\w*|PK\s*\w*)$", regex=True, na=False
+    )
 
     beds = pd.to_numeric(df.get("total_bedrooms", pd.Series(index=df.index)), errors="coerce")
     sqft = pd.to_numeric(df.get("sqft_living", pd.Series(index=df.index)), errors="coerce")
@@ -65,6 +68,18 @@ def likely_cabana_mask(df: pd.DataFrame) -> pd.Series:
     list_price = pd.to_numeric(df.get("list_price", pd.Series(index=df.index)), errors="coerce")
     low_price = sold_price.fillna(list_price).fillna(0)
 
-    small_accessory_signal = (beds.fillna(0) <= 0) & (sqft.fillna(0) < 400) & (low_price > 0) & (low_price < 500000)
+    small_accessory_signal = (
+        (beds.fillna(0) <= 0)
+        & (sqft.fillna(0) < 400)
+        & (low_price > 0)
+        & (low_price < 500000)
+    )
 
-    return (~excluded) & (address_signal | legal_signal | remarks_signal | unit_signal | small_accessory_signal)
+    # Marketing remarks commonly mention parking, storage, or shared cabanas on
+    # ordinary residences. Only physical accessory identifiers are decisive;
+    # weaker legal/unit labels must also have accessory-sized property facts.
+    return (~excluded) & (
+        explicit_cabana_signal
+        | (small_accessory_signal & (address_signal | unit_signal))
+        | (small_accessory_signal & (legal_signal | secondary_unit_signal))
+    )

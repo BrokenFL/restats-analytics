@@ -1167,7 +1167,9 @@ def backfill_missing_city_in_db(conn) -> int:
         """
         SELECT listing_number, city, pcn_10_digit, geo_lat, geo_lon
         FROM listing_details
-        WHERE city IS NULL OR TRIM(city) = ''
+        WHERE city IS NULL
+           OR TRIM(city) = ''
+           OR LOWER(TRIM(city)) IN ('<na>', '<nan>', 'n/a', 'na', 'nan', 'none', 'null')
         """,
         conn,
     )
@@ -1195,7 +1197,9 @@ def infer_missing_city(conn, incoming_df: pd.DataFrame) -> tuple[pd.DataFrame, d
         return incoming_df, {"filled_by_pcn": 0, "filled_by_geo": 0}
 
     df = incoming_df.copy()
-    city_blank = df["city"].isna() | df["city"].astype(str).str.strip().eq("")
+    normalized_city = df["city"].map(canonical_city_name)
+    city_blank = normalized_city.isna()
+    df.loc[city_blank, "city"] = None
 
     filled_by_lookup = 0
     filled_by_pcn = 0
@@ -1210,7 +1214,7 @@ def infer_missing_city(conn, incoming_df: pd.DataFrame) -> tuple[pd.DataFrame, d
                 filled_by_lookup = int(lk_mask.sum())
 
     # Stage 1: PCN -> city mode from existing DB records for remaining blanks.
-    city_blank = df["city"].isna() | df["city"].astype(str).str.strip().eq("")
+    city_blank = df["city"].map(canonical_city_name).isna()
     if "pcn_10_digit" in df.columns and city_blank.any():
         db_city = pd.read_sql_query(
             """
@@ -1235,7 +1239,7 @@ def infer_missing_city(conn, incoming_df: pd.DataFrame) -> tuple[pd.DataFrame, d
                 filled_by_pcn = int(pcn_fill_mask.sum())
 
     # Stage 2: Geo fallback by nearest centroid of known cities.
-    city_blank = df["city"].isna() | df["city"].astype(str).str.strip().eq("")
+    city_blank = df["city"].map(canonical_city_name).isna()
     filled_by_geo = 0
     if city_blank.any() and {"geo_lat", "geo_lon"}.issubset(df.columns):
         known_geo = pd.read_sql_query(

@@ -12,14 +12,3 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 "$PYTHON_BIN" "$PROJECT_ROOT/scripts/ops/run_mls_auto_update.py" --headless "$@"
-
-# Build the most recently completed monthly report after a successful data
-# refresh.  The job is idempotent and exits quickly once the target month is
-# present; a snapshot failure must not mark the MLS data refresh as failed.
-set +e
-"$PYTHON_BIN" "$PROJECT_ROOT/scripts/ops/generate_market_report_snapshots.py" --if-missing
-snapshot_status=$?
-set -e
-if [[ $snapshot_status -ne 0 ]]; then
-  print "Monthly report snapshot generation failed; the next refresh will retry." >&2
-fi

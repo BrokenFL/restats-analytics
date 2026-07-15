@@ -14,6 +14,7 @@ _CANONICAL_CITY_NAMES = {
     "west palm beach": "West Palm Beach",
     "wellington": "Wellington",
 }
+_MISSING_CITY_VALUES = {"<na>", "<nan>", "n/a", "na", "nan", "none", "null"}
 
 
 def canonical_city_name(value: object) -> str | None:
@@ -21,7 +22,7 @@ def canonical_city_name(value: object) -> str | None:
     if value is None:
         return None
     text = " ".join(str(value).strip().split())
-    if not text or text.casefold() in {"nan", "none", "null"}:
+    if not text or text.casefold() in _MISSING_CITY_VALUES:
         return None
     text = _ZIP_SUFFIX_RE.sub("", text).strip()
     if not text:
@@ -37,7 +38,7 @@ def normalize_city_values_in_db(conn) -> int:
     updates = []
     for listing_number, city in rows:
         canonical = canonical_city_name(city)
-        if canonical and canonical != str(city).strip():
+        if canonical != str(city).strip():
             updates.append((canonical, listing_number))
     if updates:
         conn.executemany(

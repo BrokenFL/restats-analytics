@@ -125,7 +125,9 @@ def _city_stats(conn, city: str):
         ).fetchone()[0]
 
     max_dates = {col: _date_or_none(val) for col, val in zip(DATE_COLUMNS, maxima)}
-    coverage_end = max([d for d in max_dates.values() if d], default=None)
+    # Future source dates can be valid expirations or malformed status dates;
+    # neither should advance incremental coverage beyond the current day.
+    coverage_end = max([d for d in max_dates.values() if d and d <= date.today()], default=None)
 
     return {
         "city": city,

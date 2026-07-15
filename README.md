@@ -243,6 +243,11 @@ Current menu options:
 
 - Non-interactive runner:
   - `python3 scripts/ops/run_mls_auto_update.py --headless`
+- Default flow now includes both:
+  - MLS quick-search refresh/import for the configured markets
+  - county off-market municipality refresh/import for the same markets
+- Optional skip flag for MLS-only unattended runs:
+  - `python3 scripts/ops/run_mls_auto_update.py --headless --skip-pbc`
 - Wrapper script used by macOS LaunchAgent:
   - `scripts/ops/run_mls_auto_update.sh`
 - LaunchAgent template:
@@ -253,9 +258,11 @@ Current menu options:
   - the current SSD repo path is `/Volumes/ExternalSSD/projects/restats-analytics`
   - the checked-in LaunchAgent template now runs the SSD wrapper script directly
   - the checked-in LaunchAgent template is scheduled for `9:15 PM` local time and does not force an immediate run when installed
-- The auto-update runner now follows a two-step flow by default:
+- The auto-update runner now follows one ordered refresh flow by default:
   - refresh local SQLite from MLS
+  - refresh/import county off-market sales for the same markets
   - sync local `listing_details` into Supabase so the live API stays aligned
+  - force-rebuild every cached monthly report snapshot after a successful sync
 - The cloud sync now prunes cloud-only rows by default so valid local/cloud row counts stay matched.
 - The quick-search importer now uses:
   - `python3 generate_db.py --db-name mls.db --skip-archive <csv paths...>`

@@ -7,5 +7,6 @@ python-multipart>=0.0.6
 numpy>=1.26.2
 scipy>=1.11.4
 chardet
+requests>=2.31.0
 selenium>=4.18.0
 # psycopg v3 binary package is already pinned above.

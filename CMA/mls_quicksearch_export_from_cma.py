@@ -1123,14 +1123,14 @@ def _derive_from_date_from_db(db_file: str, cities) -> str:
     placeholders = ",".join("?" for _ in city_vals)
     q = f"""
         SELECT
-          MAX(listing_date),
-          MAX(status_change_date),
-          MAX(under_contract_date),
-          MAX(sold_date),
-          MAX(withdrawn_date),
-          MAX(temp_off_market_date),
-          MAX(cancel_date),
-          MAX(expiration_date)
+          MAX(CASE WHEN DATE(listing_date) <= DATE('now', 'localtime') THEN listing_date END),
+          MAX(CASE WHEN DATE(status_change_date) <= DATE('now', 'localtime') THEN status_change_date END),
+          MAX(CASE WHEN DATE(under_contract_date) <= DATE('now', 'localtime') THEN under_contract_date END),
+          MAX(CASE WHEN DATE(sold_date) <= DATE('now', 'localtime') THEN sold_date END),
+          MAX(CASE WHEN DATE(withdrawn_date) <= DATE('now', 'localtime') THEN withdrawn_date END),
+          MAX(CASE WHEN DATE(temp_off_market_date) <= DATE('now', 'localtime') THEN temp_off_market_date END),
+          MAX(CASE WHEN DATE(cancel_date) <= DATE('now', 'localtime') THEN cancel_date END),
+          MAX(CASE WHEN DATE(expiration_date) <= DATE('now', 'localtime') THEN expiration_date END)
         FROM listing_details
         WHERE UPPER(COALESCE(city, '')) IN ({placeholders})
     """
@@ -1174,6 +1174,17 @@ def _backup_and_import(csv_files, db_file: str, backup_dir: str) -> Path:
     if proc.returncode != 0:
         raise SystemExit(f"CSV import failed with exit code {proc.returncode}")
     return backup_path
+
+
+def _stamp_authoritative_city(csv_path: str, city: str) -> None:
+    """Stamp the city selected in FlexMLS when the export omits that field."""
+    path = Path(csv_path)
+    try:
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="latin1")
+    frame["City"] = str(city).strip()
+    frame.to_csv(path, index=False, encoding="utf-8")
 
 
 def _select_custom_text_export(driver) -> bool:
@@ -2242,6 +2253,8 @@ def main():
                     shutil.move(str(downloaded), str(unique_csv))
                     csv_path = str(unique_csv)
                 print(f"  export_csv={csv_path}")
+                if args.search_mode == "city":
+                    _stamp_authoritative_city(csv_path, row["cities"][0])
                 exported_csvs.append(csv_path)
 
         print("Quick Search run completed.")

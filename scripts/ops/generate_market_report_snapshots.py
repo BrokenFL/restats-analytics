@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--month", type=int, choices=range(1, 13), default=default_month)
     parser.add_argument("--force", action="store_true", help="Rebuild snapshots even when they already exist.")
     parser.add_argument("--if-missing", action="store_true", help="Exit without work when the target month is already complete.")
+    parser.add_argument(
+        "--all-existing",
+        action="store_true",
+        help="Rebuild every month already present in the snapshot table, plus the target month.",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +130,25 @@ def _source_record_count(pg_conn) -> int:
         return int(value or 0)
 
 
+def _existing_months(pg_conn) -> set[tuple[int, int]]:
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT period_start
+            FROM public.market_report_snapshots
+            WHERE report_mode = 'monthly'
+            ORDER BY period_start
+            """
+        )
+        months = set()
+        for row in cur.fetchall():
+            value = row["period_start"] if isinstance(row, dict) else row[0]
+            if isinstance(value, str):
+                value = date.fromisoformat(value)
+            months.add((value.year, value.month))
+        return months
+
+
 def _cities(api_module) -> list[str]:
     with api_module.closing(api_module.get_connection()) as conn:
         cursor = conn.cursor()
@@ -197,7 +221,6 @@ class _ReusableApiConnection:
 
 def main() -> int:
     args = parse_args()
-    period_start, period_end = _month_bounds(args.year, args.month)
     database_url = _load_database_url()
     os.environ["RESTATS_DATABASE_URL"] = database_url
 
@@ -211,77 +234,83 @@ def main() -> int:
     try:
         pg_conn = api_connection.raw_connection
         _ensure_snapshot_table(pg_conn)
-        existing = _existing_keys(pg_conn, period_start, period_end)
         source_count = _source_record_count(pg_conn)
         cities = _cities(api_module)
         scopes = [(None, "__ALL_MARKETS__")] + [(city, city) for city in cities]
         groups = ["ALL", "SINGLE_FAMILY", "TOWNHOME_CONDO"]
         required = {(scope_key, group) for _, scope_key in scopes for group in groups}
-        if args.if_missing and not args.force and required.issubset(existing):
-            print(f"Monthly snapshots already complete for {period_start} to {period_end}; nothing to do.")
-            return 0
+        months = {(args.year, args.month)}
+        if args.all_existing:
+            months.update(_existing_months(pg_conn))
 
-        pending_writes = []
-        for city, scope_key in scopes:
-            for property_group in groups:
-                identity = (scope_key, property_group)
-                if identity in existing and not args.force:
-                    continue
-                print(
-                    f"Generating snapshot: {scope_key} | {property_group} | {period_start} to {period_end}",
-                    flush=True,
-                )
-                payload = _build_payload(
-                    api_module,
-                    city,
-                    property_group,
-                    args.year,
-                    args.month,
-                    period_start,
-                    period_end,
-                )
-                pending_writes.append(
-                    (
-                        _snapshot_key(period_start, period_end, scope_key, property_group),
-                        scope_key,
+        generated = 0
+        for year, month in sorted(months):
+            period_start, period_end = _month_bounds(year, month)
+            existing = _existing_keys(pg_conn, period_start, period_end)
+            if args.if_missing and not args.force and required.issubset(existing):
+                print(f"Monthly snapshots already complete for {period_start} to {period_end}; nothing to do.")
+                continue
+
+            pending_writes = []
+            for city, scope_key in scopes:
+                for property_group in groups:
+                    identity = (scope_key, property_group)
+                    if identity in existing and not args.force:
+                        continue
+                    print(
+                        f"Generating snapshot: {scope_key} | {property_group} | {period_start} to {period_end}",
+                        flush=True,
+                    )
+                    payload = _build_payload(
+                        api_module,
                         city,
                         property_group,
-                        Jsonb(json.loads(json.dumps(payload, default=str, allow_nan=False))),
-                    )
-                )
-        generated = 0
-        for key, scope_key, city, property_group, payload in pending_writes:
-            with pg_conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO public.market_report_snapshots (
-                        snapshot_key, report_mode, period_start, period_end,
-                        scope_key, city, property_group, payload, source_record_count, generated_at
-                    )
-                    VALUES (%s, 'monthly', %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (snapshot_key) DO UPDATE SET
-                        payload = EXCLUDED.payload,
-                        source_record_count = EXCLUDED.source_record_count,
-                        generated_at = EXCLUDED.generated_at,
-                        period_start = EXCLUDED.period_start,
-                        period_end = EXCLUDED.period_end,
-                        scope_key = EXCLUDED.scope_key,
-                        city = EXCLUDED.city,
-                        property_group = EXCLUDED.property_group
-                    """,
-                    (
-                        key,
+                        year,
+                        month,
                         period_start,
                         period_end,
-                        scope_key,
-                        city,
-                        property_group,
-                        payload,
-                        source_count,
-                    ),
-                )
-            generated += 1
-        pg_conn.commit()
+                    )
+                    pending_writes.append(
+                        (
+                            _snapshot_key(period_start, period_end, scope_key, property_group),
+                            scope_key,
+                            city,
+                            property_group,
+                            Jsonb(json.loads(json.dumps(payload, default=str, allow_nan=False))),
+                        )
+                    )
+            for key, scope_key, city, property_group, payload in pending_writes:
+                with pg_conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.market_report_snapshots (
+                            snapshot_key, report_mode, period_start, period_end,
+                            scope_key, city, property_group, payload, source_record_count, generated_at
+                        )
+                        VALUES (%s, 'monthly', %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (snapshot_key) DO UPDATE SET
+                            payload = EXCLUDED.payload,
+                            source_record_count = EXCLUDED.source_record_count,
+                            generated_at = EXCLUDED.generated_at,
+                            period_start = EXCLUDED.period_start,
+                            period_end = EXCLUDED.period_end,
+                            scope_key = EXCLUDED.scope_key,
+                            city = EXCLUDED.city,
+                            property_group = EXCLUDED.property_group
+                        """,
+                        (
+                            key,
+                            period_start,
+                            period_end,
+                            scope_key,
+                            city,
+                            property_group,
+                            payload,
+                            source_count,
+                        ),
+                    )
+                generated += 1
+            pg_conn.commit()
     finally:
         api_connection.shutdown()
 

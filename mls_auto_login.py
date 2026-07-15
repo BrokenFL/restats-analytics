@@ -40,6 +40,176 @@ def _first_clickable(wait, selectors):
     raise TimeoutException(f"No clickable element found for selectors: {selectors}")
 
 
+def _set_value_via_js(driver, selectors, value) -> bool:
+    js = """
+        const selectors = arguments[0];
+        const value = arguments[1];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            el.focus();
+            el.value = value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        }
+        return false;
+    """
+    return bool(driver.execute_script(js, selectors, value))
+
+
+def _wait_for_auth_form(driver, timeout_sec: int = 45) -> None:
+    deadline = time.time() + timeout_sec
+    js = """
+        const hasRadio = !!document.querySelector("input[type='radio'][value='email'], input[type='radio'][value='member_login_id']");
+        const hasMls = !!document.querySelector("input[name='member_login_id'], input[aria-label='MLS Username']");
+        const hasPassword = !!document.querySelector("input[type='password'][aria-label='Password'], input[type='password']");
+        return {hasRadio, hasMls, hasPassword, title: document.title || ''};
+    """
+    while time.time() < deadline:
+        state = driver.execute_script(js) or {}
+        if state.get("hasRadio") or state.get("hasMls") or state.get("hasPassword"):
+            return
+        time.sleep(0.5)
+    raise TimeoutException("Auth form did not hydrate on the login page.")
+
+
+def _select_email_mode(driver, timeout_sec: int = 45) -> None:
+    for by, sel in [
+        (By.XPATH, "//label[normalize-space()='Email']"),
+        (By.XPATH, "//*[self::label or self::div or self::span][normalize-space()='Email']"),
+        (By.CSS_SELECTOR, "input[type='radio'][value='email']"),
+    ]:
+        try:
+            for el in driver.find_elements(by, sel):
+                if el.is_displayed() and el.is_enabled():
+                    try:
+                        el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.6)
+                    if driver.find_elements(By.CSS_SELECTOR, "input[name='email'][type='email'], input[type='email'], input[aria-label='Email']"):
+                        return
+        except Exception:
+            continue
+
+    js = """
+        const visible = (el) => !!(el && el.offsetParent !== null);
+        const clickish = (el) => { try { el.click(); return true; } catch (e) { return false; } };
+        const emailInput = document.querySelector("input[name='email'][type='email'], input[type='email'], input[aria-label='Email']");
+        const mlsInput = document.querySelector("input[name='member_login_id'], input[aria-label='MLS Username']");
+        if (visible(emailInput) && !visible(mlsInput)) {
+          return {ready:true, emailVisible:true, mlsVisible:false};
+        }
+
+        const emailRadio = document.querySelector("input[type='radio'][value='email']");
+        if (emailRadio) {
+          try {
+            emailRadio.checked = true;
+            emailRadio.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            emailRadio.dispatchEvent(new Event('input', { bubbles: true }));
+            emailRadio.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch (e) {}
+          const radioWrap = emailRadio.closest('.v-radio, .v-input--selection-controls__input');
+          if (radioWrap) clickish(radioWrap);
+          const label = radioWrap ? radioWrap.parentElement && radioWrap.parentElement.querySelector('label') : null;
+          if (label) clickish(label);
+        }
+
+        return {
+          ready:false,
+          emailVisible: visible(document.querySelector("input[name='email'][type='email'], input[type='email'], input[aria-label='Email']")),
+          mlsVisible: visible(document.querySelector("input[name='member_login_id'], input[aria-label='MLS Username']")),
+        };
+    """
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        state = driver.execute_script(js) or {}
+        if state.get("ready") or (state.get("emailVisible") and not state.get("mlsVisible")):
+            return
+        time.sleep(0.5)
+    raise TimeoutException("Could not switch login page into Email mode.")
+
+
+def _wait_for_email_login_fields(driver, timeout_sec: int = 20) -> None:
+    deadline = time.time() + timeout_sec
+    email_selectors = ["input[name='email'][type='email']", "input[type='email']", "input[aria-label='Email']"]
+    password_selectors = ["input[name='password'][type='password']", "input[type='password'][aria-label='Password']", "input[type='password']"]
+
+    while time.time() < deadline:
+        email_ready = False
+        password_ready = False
+        for sel in email_selectors:
+            for field in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if field.is_displayed() and field.is_enabled():
+                        email_ready = True
+                        break
+                except Exception:
+                    continue
+            if email_ready:
+                break
+        for sel in password_selectors:
+            for field in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if field.is_displayed() and field.is_enabled():
+                        password_ready = True
+                        break
+                except Exception:
+                    continue
+            if password_ready:
+                break
+        if email_ready and password_ready:
+            return
+        time.sleep(0.4)
+    raise TimeoutException("Email/password fields did not become ready after selecting Email mode.")
+
+
+def _fill_identity_fields(driver, value: str) -> None:
+    selectors = [
+        "input[name='email'][type='email']",
+        "input[type='email']",
+        "input[aria-label='Email']",
+    ]
+    for sel in selectors:
+        for field in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                if field.is_displayed() and field.is_enabled():
+                    try:
+                        field.clear()
+                    except Exception:
+                        pass
+                    field.send_keys(value)
+                    return
+            except Exception:
+                continue
+    if not _set_value_via_js(driver, selectors, value):
+        raise TimeoutException("Could not fill email field.")
+
+
+def _fill_password(driver, password: str, timeout_sec: int = 40) -> None:
+    selectors = [
+        "input[name='password'][type='password']",
+        "input[type='password'][aria-label='Password']",
+        "input[type='password']",
+    ]
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for sel in selectors:
+            fields = driver.find_elements(By.CSS_SELECTOR, sel)
+            for field in fields:
+                try:
+                    if field.is_displayed() and field.is_enabled():
+                        field.send_keys(password)
+                        return
+                except Exception:
+                    continue
+        if _set_value_via_js(driver, selectors, password):
+            return
+        time.sleep(0.5)
+    raise TimeoutException("Could not fill password field.")
+
+
 def login(username, email, password, headless=False, timeout=30, stay_open_seconds=10):
     options = webdriver.ChromeOptions()
     if headless:
@@ -52,32 +222,11 @@ def login(username, email, password, headless=False, timeout=30, stay_open_secon
     try:
         driver.get(LOGIN_URL)
 
-        identity_input = _first_visible(
-            wait,
-            [
-                (By.NAME, "member_login_id"),
-                (By.NAME, "email"),
-                (By.CSS_SELECTOR, "input[name='member_login_id']"),
-                (By.CSS_SELECTOR, "input[name='email']"),
-            ],
-        )
-        identity_input.clear()
-        identity_input.send_keys(username or email)
-
-        password_input = _first_visible(
-            wait,
-            [
-                (By.NAME, "password"),
-                (By.CSS_SELECTOR, "input[type='password']"),
-                (
-                    By.XPATH,
-                    "/html/body/div[2]/div/main/div/div/div[1]/div/div[2]/form/"
-                    "div[1]/div[3]/div/div[1]/div[1]/input",
-                ),
-            ],
-        )
-        password_input.clear()
-        password_input.send_keys(password)
+        _wait_for_auth_form(driver, timeout_sec=timeout)
+        _select_email_mode(driver, timeout_sec=timeout)
+        _wait_for_email_login_fields(driver, timeout_sec=min(timeout, 20))
+        _fill_identity_fields(driver, email)
+        _fill_password(driver, password, timeout_sec=timeout)
 
         login_button = _first_clickable(
             wait,
