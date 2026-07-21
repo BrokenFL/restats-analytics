@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchDashboardBootstrap,
   fetchFilterOptions,
+  fetchMarketMapPoints,
   fetchMarketPeriodSeries,
   fetchReportListings,
+  fetchReportSummary,
   runCma,
   type CmaComp,
   type CmaRunResponse,
@@ -16,8 +18,11 @@ import {
   type TrendsResponse,
   type FilterOptionsResponse,
   type InventoryResponse,
-  type KpisResponse
+  type KpisResponse,
+  type MarketMapPointsResponse
 } from "./api";
+import { SocialReportModal } from "./components/SocialReportModal";
+import { SubdivisionCombobox } from "./components/SubdivisionCombobox";
 
 type PropertyGroup = "ALL" | "SINGLE_FAMILY" | "TOWNHOME_CONDO";
 type ReportMode = "rolling" | "monthly" | "quarterly" | "annual" | "custom";
@@ -162,6 +167,33 @@ function resolveWindowClient(
   const start = new Date(today);
   start.setDate(start.getDate() - (periodDays - 1));
   return { start: toIsoDate(start), end: toIsoDate(end) };
+}
+
+function shiftIsoDateByYears(value: string, years: number): string {
+  const [year, month, day] = value.split("-").map(Number);
+  const shifted = new Date(year + years, month - 1, day);
+  if (shifted.getMonth() !== month - 1) shifted.setDate(0);
+  return toIsoDate(shifted);
+}
+
+function buildYearAgoConfig(
+  mode: ReportMode,
+  periodDays: number,
+  refYear: number,
+  refMonth: number,
+  refQuarter: number,
+  currentStart: string,
+  currentEnd: string
+): ReportConfig {
+  if (mode === "monthly") return { reportMode: "monthly", periodDays, refYear: refYear - 1, refMonth };
+  if (mode === "quarterly") return { reportMode: "quarterly", periodDays, refYear: refYear - 1, refQuarter };
+  if (mode === "annual") return { reportMode: "annual", periodDays, refYear: refYear - 1 };
+  return {
+    reportMode: "custom",
+    periodDays,
+    startDate: shiftIsoDateByYears(currentStart, -1),
+    endDate: shiftIsoDateByYears(currentEnd, -1),
+  };
 }
 
 type ChartPadding = { left: number; right: number; top: number; bottom: number };
@@ -575,7 +607,7 @@ function filterMarketMapOutliers(points: SaleMapPoint[]): SaleMapPoint[] {
   return trimmed.length >= Math.max(3, Math.round(basePoints.length * 0.7)) ? trimmed : basePoints;
 }
 
-function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLabel: string }) {
+function MarketGeoMap({ points, scopeLabel, loading = false }: { points: SaleMapPoint[]; scopeLabel: string; loading?: boolean }) {
   const mapRef = useRef<HTMLDivElement | null>(null);
   const [mapMode, setMapMode] = useState<"heat" | "pins" | "both">("both");
   const [mapStatus, setMapStatus] = useState<string | null>(null);
@@ -603,7 +635,7 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, []);
+  }, [hasPoints]);
 
   useEffect(() => {
     if (!mapVisible || !apiKey || !mapRef.current || !hasPoints) return;
@@ -723,10 +755,10 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
             {hiddenOutlierCount > 0 ? ` · ${hiddenOutlierCount} outlier${hiddenOutlierCount === 1 ? "" : "s"} hidden` : ""}
           </p>
         </div>
-        <div className="map-mode-tabs" aria-label="Map display mode">
-          <button className={mapMode === "heat" ? "active" : ""} type="button" onClick={() => setMapMode("heat")}>Heat</button>
-          <button className={mapMode === "pins" ? "active" : ""} type="button" onClick={() => setMapMode("pins")}>Pins</button>
-          <button className={mapMode === "both" ? "active" : ""} type="button" onClick={() => setMapMode("both")}>Both</button>
+        <div className="map-mode-tabs" role="group" aria-label="Map display mode">
+          <button aria-pressed={mapMode === "heat"} className={mapMode === "heat" ? "active" : ""} type="button" onClick={() => setMapMode("heat")}>Heat</button>
+          <button aria-pressed={mapMode === "pins"} className={mapMode === "pins" ? "active" : ""} type="button" onClick={() => setMapMode("pins")}>Pins</button>
+          <button aria-pressed={mapMode === "both"} className={mapMode === "both" ? "active" : ""} type="button" onClick={() => setMapMode("both")}>Both</button>
         </div>
       </div>
 
@@ -743,7 +775,9 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
             ))}
           </svg>
           <div className="map-empty">
-            {hasPoints
+            {loading
+              ? "Loading all geocoded sales for this period…"
+              : hasPoints
               ? "Add VITE_GOOGLE_MAPS_API_KEY to enable Google Maps heat layer and clickable pins."
               : "No geocoded sales found for the selected period and filters."}
           </div>
@@ -751,6 +785,26 @@ function MarketGeoMap({ points, scopeLabel }: { points: SaleMapPoint[]; scopeLab
       )}
 
       {mapStatus ? <p className="map-status">{mapStatus}</p> : null}
+      {filteredPoints.length ? (
+        <details className="map-data-alternative">
+          <summary>View mapped sales as a table</summary>
+          <div className="table-wrap">
+            <table className="data-table compact">
+              <thead><tr><th>Address</th><th>Subdivision</th><th>Sold Price</th><th>Sold Date</th></tr></thead>
+              <tbody>
+                {filteredPoints.map((point) => (
+                  <tr key={point.listingNumber}>
+                    <td>{point.address}</td>
+                    <td>{point.subdivision ?? "-"}</td>
+                    <td>{formatMoney(point.soldPrice)}</td>
+                    <td>{formatDateDisplay(point.soldDate)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
@@ -959,8 +1013,10 @@ export default function App() {
   const [reportSummary, setReportSummary] = useState<ReportSummaryResponse | null>(null);
   const [rankings, setRankings] = useState<SubdivisionRankingsResponse | null>(null);
   const [periodSeries, setPeriodSeries] = useState<PeriodSeriesResponse | null>(null);
+  const [marketMapPoints, setMarketMapPoints] = useState<MarketMapPointsResponse | null>(null);
   const [filterOptions, setFilterOptions] = useState<FilterOptionsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
   const [reportExporting, setReportExporting] = useState(false);
   const [cmaParcel, setCmaParcel] = useState("");
   const [cmaAsOfDate, setCmaAsOfDate] = useState(toIsoDate(new Date()));
@@ -972,13 +1028,17 @@ export default function App() {
   const [cmaSelectedListing, setCmaSelectedListing] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<SidebarSection>("overview");
   const [historicalSeriesRequested, setHistoricalSeriesRequested] = useState(false);
+  const [mapPointsRequested, setMapPointsRequested] = useState(false);
+  const [mapPointsLoading, setMapPointsLoading] = useState(false);
+  const [socialReportOpen, setSocialReportOpen] = useState(false);
+  const [socialYearAgoSummary, setSocialYearAgoSummary] = useState<ReportSummaryResponse | null>(null);
+  const [socialReportLoading, setSocialReportLoading] = useState(false);
+  const [socialReportError, setSocialReportError] = useState<string | null>(null);
 
   const activeWindow = useMemo(
     () => resolveWindowClient(reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd),
     [reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd]
   );
-  const hasMarketSelection = Boolean(city || geoZone || finalSubdivision || propertyGroup !== "ALL");
-
   useEffect(() => {
     let cancelled = false;
     async function loadFilters() {
@@ -1001,19 +1061,8 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    if (!hasMarketSelection) {
-      setReportSummary(null);
-      setKpis(null);
-      setTrends(null);
-      setInventory(null);
-      setRecentListings(null);
-      setRankings(null);
-      setPeriodSeries(null);
-      return () => {
-        cancelled = true;
-      };
-    }
     setError(null);
+    setDashboardLoading(true);
 
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     const config: ReportConfig = {
@@ -1041,8 +1090,12 @@ export default function App() {
         setRecentListings(payload.recent_listings);
         setRankings(payload.rankings);
         if (payload.filter_options) setFilterOptions(payload.filter_options);
+        setDashboardLoading(false);
       })
-      .catch((err) => handleLoadError(err, "Failed to load dashboard bootstrap"));
+      .catch((err) => {
+        handleLoadError(err, "Failed to load dashboard bootstrap");
+        if (!cancelled) setDashboardLoading(false);
+      });
 
     return () => {
       cancelled = true;
@@ -1060,7 +1113,6 @@ export default function App() {
     refQuarter,
     customStart,
     customEnd,
-    hasMarketSelection,
   ]);
 
   useEffect(() => {
@@ -1124,6 +1176,107 @@ export default function App() {
     seriesPeriods,
   ]);
 
+  useEffect(() => {
+    if (activeSection === "neighborhoods") {
+      setMapPointsRequested(true);
+      return;
+    }
+    const target = document.getElementById("section-neighborhoods");
+    if (!target || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setMapPointsRequested(true);
+      },
+      { rootMargin: "320px 0px" }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (!mapPointsRequested) return;
+    let cancelled = false;
+    const filters = { city, geoZone, finalSubdivision, propertyGroup };
+    const config: ReportConfig = {
+      reportMode,
+      periodDays,
+      refYear,
+      refMonth,
+      refQuarter,
+      startDate: reportMode === "custom" ? customStart : undefined,
+      endDate: reportMode === "custom" ? customEnd : undefined,
+    };
+    setMapPointsLoading(true);
+    void fetchMarketMapPoints(config, filters)
+      .then((response) => {
+        if (!cancelled) setMarketMapPoints(response);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load mapped sales");
+      })
+      .finally(() => {
+        if (!cancelled) setMapPointsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    mapPointsRequested,
+    city,
+    geoZone,
+    finalSubdivision,
+    propertyGroup,
+    reportMode,
+    periodDays,
+    refYear,
+    refMonth,
+    refQuarter,
+    customStart,
+    customEnd,
+  ]);
+
+  useEffect(() => {
+    if (!socialReportOpen || !reportSummary) return;
+    let cancelled = false;
+    const filters = { city, geoZone, finalSubdivision, propertyGroup };
+    const yearAgoConfig = buildYearAgoConfig(
+      reportMode,
+      periodDays,
+      refYear,
+      refMonth,
+      refQuarter,
+      reportSummary.current_start,
+      reportSummary.current_end
+    );
+    setSocialReportLoading(true);
+    setSocialReportError(null);
+    void fetchReportSummary(yearAgoConfig, filters)
+      .then((response) => {
+        if (!cancelled) setSocialYearAgoSummary(response);
+      })
+      .catch((err) => {
+        if (!cancelled) setSocialReportError(err instanceof Error ? err.message : "Failed to load year-over-year comparison");
+      })
+      .finally(() => {
+        if (!cancelled) setSocialReportLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    socialReportOpen,
+    reportSummary,
+    city,
+    geoZone,
+    finalSubdivision,
+    propertyGroup,
+    reportMode,
+    periodDays,
+    refYear,
+    refMonth,
+    refQuarter,
+  ]);
+
   const inventoryTotal = useMemo(() => (inventory?.rows ?? []).reduce((sum, row) => sum + row.count, 0), [inventory]);
   const inventorySegments = useMemo(() => {
     const palette = ["#008c8a", "#2f6fb3", "#d86f1d", "#2d8a5d", "#7a5aa6", "#b14d5e", "#7c8f42", "#6f6f6f"];
@@ -1152,7 +1305,7 @@ export default function App() {
         `Type Group: ${propertyGroup === "SINGLE_FAMILY" ? "Single Family Home" : "Condo/TH/Other"}`
       );
     }
-    return parts.length ? parts.join(" | ") : "All Selected Markets";
+    return parts.length ? parts.join(" | ") : "Palm Beach County";
   }, [city, geoZone, finalSubdivision, propertyGroup]);
 
   const metricRows = useMemo(() => {
@@ -1203,7 +1356,7 @@ export default function App() {
   const trendRows = trends?.rows ?? [];
   const marketGradeInfo = useMemo(() => getMarketGradeInfo(reportSummary), [reportSummary]);
   const saleMapPoints = useMemo<SaleMapPoint[]>(() => {
-    return (recentListings?.rows ?? [])
+    return (marketMapPoints?.rows ?? [])
       .map((row) => {
         const lat = asNumber(row.geo_lat);
         const lon = asNumber(row.geo_lon);
@@ -1219,7 +1372,13 @@ export default function App() {
         };
       })
       .filter((point): point is SaleMapPoint => point != null);
-  }, [recentListings]);
+  }, [marketMapPoints]);
+  const selectedSubdivisionOption = useMemo(
+    () => (filterOptions?.subdivisions ?? []).find((option) => option.final_subdivision === finalSubdivision) ?? null,
+    [filterOptions, finalSubdivision]
+  );
+  const socialScopeTitle = finalSubdivision || geoZone || city || "Palm Beach County";
+  const socialLocationLabel = city || selectedSubdivisionOption?.city || "Palm Beach County";
   const cmaComps = cmaResult?.comps ?? [];
   const cmaMapPoints = useMemo(() => {
     if (!cmaResult) return [] as Array<{ kind: "subject" | "comp"; label: string; lat: number; lon: number; comp?: CmaComp }>;
@@ -2210,15 +2369,15 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="page-shell dashboard-main">
+      <main className="page-shell dashboard-main" aria-busy={dashboardLoading}>
       <header className="hero dashboard-topbar">
         <div>
           <p className="eyebrow">Palm Beach County Market Overview</p>
           <h1>Market Intelligence Report</h1>
           <p className="hero-copy">
-            {hasMarketSelection
-              ? `Data as of ${formatDateDisplay(reportSummary?.current_end ?? activeWindow.end)}`
-              : "Select a market to load the report."}
+            {dashboardLoading
+              ? "Loading countywide market data..."
+              : `Data as of ${formatDateDisplay(reportSummary?.current_end ?? activeWindow.end)}`}
           </p>
         </div>
         <div className="actions top-actions">
@@ -2229,7 +2388,10 @@ export default function App() {
             {reportExporting ? "Exporting..." : "Export Listings"}
           </button>
           <button className="btn" onClick={printHistoricalReport}>Print Historical</button>
-          <button className="btn primary" onClick={printMarketReport}>Print Market Report</button>
+          <button className="btn" onClick={printMarketReport}>Print Market Report</button>
+          <button className="btn primary" onClick={() => setSocialReportOpen(true)} disabled={dashboardLoading || !reportSummary}>
+            Create Social Report
+          </button>
         </div>
       </header>
 
@@ -2253,10 +2415,11 @@ export default function App() {
 
         <label className="filter-field filter-wide" htmlFor="subdivision">
           <span>Subdivision</span>
-          <select id="subdivision" value={finalSubdivision} onChange={(e) => setFinalSubdivision(e.target.value)}>
-            <option value="">All Subdivisions</option>
-            {(filterOptions?.subdivisions ?? []).map((s) => <option key={s.final_subdivision} value={s.final_subdivision}>{s.final_subdivision} ({s.count})</option>)}
-          </select>
+          <SubdivisionCombobox
+            options={filterOptions?.subdivisions ?? []}
+            value={finalSubdivision}
+            onChange={setFinalSubdivision}
+          />
         </label>
 
         <label className="filter-field" htmlFor="property_group">
@@ -2369,15 +2532,6 @@ export default function App() {
       ) : null}
 
       {activeView === "market" && error ? <section className="error">{error}</section> : null}
-
-      {activeView === "market" && !hasMarketSelection ? (
-        <section className="panel">
-          <h2>Select a market to load the dashboard</h2>
-          <p className="panel-subtitle">
-            Pick a city, geo zone, subdivision, or building type. The report stays idle until you choose a market.
-          </p>
-        </section>
-      ) : null}
 
       {activeView === "cma" ? (
       <section className="panel listings-panel">
@@ -2595,24 +2749,27 @@ export default function App() {
           Current: {reportSummary?.current_start ?? activeWindow.start} to {reportSummary?.current_end ?? activeWindow.end}
         </p>
         <p className="panel-subtitle"><strong>Market Scope:</strong> {marketScopeLabel}</p>
-        <div className="kpi-grid report-grid">
+        <div className="kpi-grid report-grid primary-metrics">
           <MetricVisualCard label="Sold Count" value={formatNumber(reportSummary?.current.sold_count)} delta={formatDelta(reportSummary?.delta_pct.sold_count)} deltaValue={reportSummary?.delta_pct.sold_count} />
-          <MetricVisualCard label="Sales Volume" value={formatMoney(reportSummary?.current.total_sales_volume)} delta={formatDelta(reportSummary?.delta_pct.total_sales_volume)} deltaValue={reportSummary?.delta_pct.total_sales_volume} />
-          <MetricVisualCard label="Median Sold Price" value={formatMoney(reportSummary?.current.median_sold_price)} delta={formatDelta(reportSummary?.delta_pct.median_sold_price)} deltaValue={reportSummary?.delta_pct.median_sold_price} />
-          <MetricVisualCard label="Median PPSF" value={formatMoney(reportSummary?.current.median_price_per_sqft)} delta={formatDelta(reportSummary?.delta_pct.median_price_per_sqft)} deltaValue={reportSummary?.delta_pct.median_price_per_sqft} />
-          <MetricVisualCard label="New Listings" value={formatNumber(reportSummary?.current.new_listings)} delta={formatDelta(reportSummary?.delta_pct.new_listings)} deltaValue={reportSummary?.delta_pct.new_listings} />
-          <MetricVisualCard label="Pending Sales" value={formatNumber(reportSummary?.current.pending_sales)} delta={formatDelta(reportSummary?.delta_pct.pending_sales)} deltaValue={reportSummary?.delta_pct.pending_sales} />
+          <MetricVisualCard label="Avg Sold Price" value={formatMoney(reportSummary?.current.avg_sold_price)} delta={formatDelta(reportSummary?.delta_pct.avg_sold_price)} deltaValue={reportSummary?.delta_pct.avg_sold_price} />
           <MetricVisualCard label="Active Inventory" value={formatNumber(reportSummary?.current.active_inventory)} delta={formatDelta(reportSummary?.delta_pct.active_inventory)} deltaValue={reportSummary?.delta_pct.active_inventory} />
           <MetricVisualCard label="Months Supply" value={formatNumber(reportSummary?.current.months_supply)} delta={formatDelta(reportSummary?.delta_pct.months_supply)} deltaValue={reportSummary?.delta_pct.months_supply} />
           <MetricVisualCard label="Median DOM" value={formatNumber(reportSummary?.current.median_dom)} delta={formatDelta(reportSummary?.delta_pct.median_dom)} deltaValue={reportSummary?.delta_pct.median_dom} />
-          <MetricVisualCard label="Median Discount" value={formatPercent(reportSummary?.current.median_listing_discount)} delta={formatDelta(reportSummary?.delta_pct.median_listing_discount)} deltaValue={reportSummary?.delta_pct.median_listing_discount} />
-          <MetricVisualCard label="Cash Sales %" value={formatPercent(reportSummary?.current.cash_sales_percent)} delta={formatDelta(reportSummary?.delta_pct.cash_sales_percent)} deltaValue={reportSummary?.delta_pct.cash_sales_percent} />
-          <MetricVisualCard label="Avg Sold Price" value={formatMoney(reportSummary?.current.avg_sold_price)} delta={formatDelta(reportSummary?.delta_pct.avg_sold_price)} deltaValue={reportSummary?.delta_pct.avg_sold_price} />
-          <MetricVisualCard
-            label="Market Grade"
-            value={marketGradeInfo.label}
-          />
         </div>
+        <details className="secondary-metrics">
+          <summary>Show supporting metrics and market grade</summary>
+          <div className="kpi-grid report-grid">
+            <MetricVisualCard label="Sales Volume" value={formatMoney(reportSummary?.current.total_sales_volume)} delta={formatDelta(reportSummary?.delta_pct.total_sales_volume)} deltaValue={reportSummary?.delta_pct.total_sales_volume} />
+            <MetricVisualCard label="Median Sold Price" value={formatMoney(reportSummary?.current.median_sold_price)} delta={formatDelta(reportSummary?.delta_pct.median_sold_price)} deltaValue={reportSummary?.delta_pct.median_sold_price} />
+            <MetricVisualCard label="Median PPSF" value={formatMoney(reportSummary?.current.median_price_per_sqft)} delta={formatDelta(reportSummary?.delta_pct.median_price_per_sqft)} deltaValue={reportSummary?.delta_pct.median_price_per_sqft} />
+            <MetricVisualCard label="New Listings" value={formatNumber(reportSummary?.current.new_listings)} delta={formatDelta(reportSummary?.delta_pct.new_listings)} deltaValue={reportSummary?.delta_pct.new_listings} />
+            <MetricVisualCard label="Pending Sales" value={formatNumber(reportSummary?.current.pending_sales)} delta={formatDelta(reportSummary?.delta_pct.pending_sales)} deltaValue={reportSummary?.delta_pct.pending_sales} />
+            <MetricVisualCard label="Median Discount" value={formatPercent(reportSummary?.current.median_listing_discount)} delta={formatDelta(reportSummary?.delta_pct.median_listing_discount)} deltaValue={reportSummary?.delta_pct.median_listing_discount} />
+            <MetricVisualCard label="Cash Sales %" value={formatPercent(reportSummary?.current.cash_sales_percent)} delta={formatDelta(reportSummary?.delta_pct.cash_sales_percent)} deltaValue={reportSummary?.delta_pct.cash_sales_percent} />
+            <MetricVisualCard label="Market Grade" value={marketGradeInfo.label} />
+          </div>
+          <p className="panel-subtitle"><strong>Grade read:</strong> {marketGradeInfo.description}</p>
+        </details>
         <p className="panel-subtitle">
           <strong>Market Grade v2:</strong> {marketGradeInfo.formula}
         </p>
@@ -2650,7 +2807,7 @@ export default function App() {
       </section>
 
       <div className="section-anchor" id="section-neighborhoods">
-        <MarketGeoMap points={saleMapPoints} scopeLabel={marketScopeLabel} />
+        <MarketGeoMap points={saleMapPoints} scopeLabel={marketScopeLabel} loading={mapPointsLoading} />
       </div>
 
       <section className="panel section-anchor" id="section-trends">
@@ -3156,6 +3313,16 @@ export default function App() {
       </>
       ) : null}
       </main>
+      <SocialReportModal
+        open={socialReportOpen}
+        loading={socialReportLoading}
+        error={socialReportError}
+        currentSummary={reportSummary}
+        yearAgoSummary={socialYearAgoSummary}
+        scopeTitle={socialScopeTitle}
+        locationLabel={socialLocationLabel}
+        onClose={() => setSocialReportOpen(false)}
+      />
     </div>
   );
 }

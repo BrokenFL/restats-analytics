@@ -34,7 +34,7 @@ export type InventoryResponse = {
 };
 
 export type CityOption = { city: string; count: number };
-export type SubdivisionOption = { final_subdivision: string; count: number };
+export type SubdivisionOption = { final_subdivision: string; city?: string | null; count: number };
 export type PropertyTypeOption = { property_type: string; count: number };
 export type GeoZoneOption = { geo_zone: string; count: number };
 export type PropertyGroupOption = { value: "ALL" | "SINGLE_FAMILY" | "TOWNHOME_CONDO"; label: string };
@@ -100,6 +100,7 @@ export type ReportPeriodMetrics = {
   active_inventory: number | null;
   months_supply: number | null;
   median_dom: number | null;
+  avg_dom?: number | null;
   median_listing_discount: number | null;
 };
 
@@ -156,6 +157,26 @@ export type ReportListingsResponse = {
   current_end: string;
   row_count: number;
   rows: ReportListing[];
+};
+
+export type MarketMapPoint = {
+  listing_number: string;
+  sold_date: string | null;
+  short_address: string | null;
+  city: string | null;
+  final_subdivision: string | null;
+  sold_price: number | null;
+  geo_lat: number;
+  geo_lon: number;
+};
+
+export type MarketMapPointsResponse = {
+  report_mode: "rolling" | "monthly" | "quarterly" | "annual" | "custom";
+  period_label: string;
+  current_start: string;
+  current_end: string;
+  row_count: number;
+  rows: MarketMapPoint[];
 };
 
 export type SubdivisionRankingRow = {
@@ -510,6 +531,28 @@ export async function fetchReportListings(config: ReportConfig, filters: Filters
     property_group: filters.propertyGroup
   });
   return getJson<ReportListingsResponse>(`/api/market/report-listings${query}`);
+}
+
+export async function fetchMarketMapPoints(
+  config: ReportConfig,
+  filters: Filters = {},
+  limit = 1000
+): Promise<MarketMapPointsResponse> {
+  const query = buildQuery({
+    report_mode: config.reportMode,
+    period_days: config.periodDays,
+    ref_year: config.refYear,
+    ref_month: config.refMonth,
+    ref_quarter: config.refQuarter,
+    start_date: config.startDate,
+    end_date: config.endDate,
+    city: filters.city,
+    final_subdivision: filters.finalSubdivision,
+    geo_zone: filters.geoZone,
+    property_group: filters.propertyGroup,
+    limit,
+  });
+  return getJson<MarketMapPointsResponse>(`/api/market/map-points${query}`);
 }
 
 export async function fetchSubdivisionRankings(

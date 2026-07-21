@@ -110,6 +110,7 @@ class ReportPeriodMetricsResponse(BaseModel):
     active_inventory: Optional[float] = None
     months_supply: Optional[float] = None
     median_dom: Optional[float] = None
+    avg_dom: Optional[float] = None
     median_listing_discount: Optional[float] = None
     cash_sales_percent: Optional[float] = None
 
@@ -747,6 +748,10 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
     dom_df = dom_df[(dom_df["effective_active_end_date"] >= start_ts) & (dom_df["effective_active_end_date"] <= end_ts)]
     dom_series = (dom_df["effective_active_end_date"] - dom_df["listing_date"]).dt.days
 
+    sold_dom_df = sold[sold["listing_date"].notna() & sold["effective_active_end_date"].notna()].copy()
+    sold_dom_series = (sold_dom_df["effective_active_end_date"] - sold_dom_df["listing_date"]).dt.days
+    sold_dom_series = sold_dom_series[sold_dom_series > 0]
+
     # Match legacy listing_discount logic: (original_list_price - sold_price) / original_list_price on sold rows.
     discount_series = None
     if "original_list_price" in sold.columns and "sold_price" in sold.columns:
@@ -784,6 +789,7 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
         "active_inventory": active_inventory,
         "months_supply": _safe_number(months_supply),
         "median_dom": _safe_number(dom_series.median()) if dom_series is not None and not dom_series.empty else None,
+        "avg_dom": _safe_number(sold_dom_series.mean()) if not sold_dom_series.empty else None,
         "median_listing_discount": _safe_number(discount_series.median()) if discount_series is not None and not discount_series.empty else None,
         "cash_sales_percent": cash_sales_percent,
     }
@@ -1044,6 +1050,15 @@ def _build_dashboard_bootstrap(
     property_group: Optional[str],
 ) -> dict:
     trend_frequency = "monthly" if report_mode in {"rolling", "custom"} else report_mode
+    current_start, current_end, _, _, _ = _resolve_report_window(
+        report_mode,
+        period_days,
+        ref_year,
+        ref_month,
+        ref_quarter,
+        start_date,
+        end_date,
+    )
     filters = {
         "city": city,
         "finalSubdivision": final_subdivision,
@@ -1079,7 +1094,18 @@ def _build_dashboard_bootstrap(
         future_kpis = executor.submit(summary_kpis, city, final_subdivision, property_type, geo_zone, property_group, sold_since, None)
         future_trends = executor.submit(market_trends, 12, trend_frequency, start_date, end_date, city, final_subdivision, property_type, geo_zone, property_group)
         future_inventory = executor.submit(inventory_by_status, city, final_subdivision, property_type, geo_zone, property_group)
-        future_recent = executor.submit(recent_listings, 25, city, final_subdivision, property_type, geo_zone, property_group, sold_since, start_date, end_date)
+        future_recent = executor.submit(
+            recent_listings,
+            25,
+            city,
+            final_subdivision,
+            property_type,
+            geo_zone,
+            property_group,
+            None,
+            current_start,
+            current_end,
+        )
         future_rankings = executor.submit(subdivision_rankings, report_mode, period_days, ref_year, ref_month, ref_quarter, start_date, end_date, 2, 10, city, property_type, geo_zone, property_group)
         return {
             "config": config,
@@ -1203,6 +1229,7 @@ def _postgres_report_period_metrics(
             COUNT(*) FILTER (WHERE {current_active}) AS current_active_inventory,
             COUNT(*) FILTER (WHERE {current_sales_12}) AS current_sales_12mo,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.current_start AND DATE(d.effective_active_end_date) <= b.current_end) AS current_median_dom,
+            AVG(DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) > DATE(d.listing_date)) AS current_avg_dom,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS current_median_listing_discount,
             (COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold}), 0) AS current_cash_sales_percent,
 
@@ -1219,6 +1246,7 @@ def _postgres_report_period_metrics(
             COUNT(*) FILTER (WHERE {previous_active}) AS previous_active_inventory,
             COUNT(*) FILTER (WHERE {previous_sales_12}) AS previous_sales_12mo,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.previous_start AND DATE(d.effective_active_end_date) <= b.previous_end) AS previous_median_dom,
+            AVG(DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) > DATE(d.listing_date)) AS previous_avg_dom,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS previous_median_listing_discount,
             (COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold}), 0) AS previous_cash_sales_percent
         FROM base d
@@ -1251,6 +1279,7 @@ def _postgres_report_period_metrics(
             else (0 if (row.get("current_active_inventory") or 0) == 0 else 999)
         ),
         "median_dom": _safe_number(row.get("current_median_dom")),
+        "avg_dom": _safe_number(row.get("current_avg_dom")),
         "median_listing_discount": _safe_number(row.get("current_median_listing_discount")),
         "cash_sales_percent": _safe_number(row.get("current_cash_sales_percent")),
     }
@@ -1272,6 +1301,7 @@ def _postgres_report_period_metrics(
             else (0 if (row.get("previous_active_inventory") or 0) == 0 else 999)
         ),
         "median_dom": _safe_number(row.get("previous_median_dom")),
+        "avg_dom": _safe_number(row.get("previous_avg_dom")),
         "median_listing_discount": _safe_number(row.get("previous_median_listing_discount")),
         "cash_sales_percent": _safe_number(row.get("previous_cash_sales_percent")),
     }
@@ -2160,9 +2190,10 @@ def filter_options(
         )
         city_counts: dict[str, int] = {}
         for row in cursor.fetchall():
-            city_name = canonical_city_name(row.get("city"))
+            row_data = dict(row)
+            city_name = canonical_city_name(row_data.get("city"))
             if city_name:
-                city_counts[city_name] = city_counts.get(city_name, 0) + int(row.get("count") or 0)
+                city_counts[city_name] = city_counts.get(city_name, 0) + int(row_data.get("count") or 0)
         cities = [
             {"city": city_name, "count": count}
             for city_name, count in sorted(city_counts.items(), key=lambda item: (-item[1], item[0]))
@@ -2170,7 +2201,7 @@ def filter_options(
 
         cursor.execute(
             f"""
-            SELECT final_subdivision, COUNT(*) AS count
+            SELECT final_subdivision, MIN(city) AS city, COUNT(*) AS count
             FROM listing_details
             WHERE final_subdivision IS NOT NULL AND TRIM(final_subdivision) <> ''
               AND {where_sql}
@@ -2293,6 +2324,83 @@ def recent_listings(
         rows = [dict(r) for r in cursor.fetchall()]
 
     return {"rows": rows, "limit": limit}
+
+
+@app.get("/api/market/map-points")
+def market_map_points(
+    report_mode: str = Query(default="rolling", pattern="^(rolling|monthly|quarterly|annual|custom)$"),
+    period_days: int = Query(default=30, ge=7, le=366),
+    ref_year: Optional[int] = Query(default=None),
+    ref_month: Optional[int] = Query(default=None, ge=1, le=12),
+    ref_quarter: Optional[int] = Query(default=None, ge=1, le=4),
+    start_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+    city: Optional[str] = Query(default=None),
+    final_subdivision: Optional[str] = Query(default=None),
+    property_type: Optional[str] = Query(default=None),
+    geo_zone: Optional[str] = Query(default=None),
+    property_group: Optional[str] = Query(default="ALL"),
+    limit: int = Query(default=1000, ge=1, le=2500),
+) -> dict:
+    """Return lightweight, period-scoped geocoded closings for the map."""
+    current_start, current_end, _, _, period_label = _resolve_report_window(
+        report_mode=report_mode,
+        period_days=period_days,
+        ref_year=ref_year,
+        ref_month=ref_month,
+        ref_quarter=ref_quarter,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    where_clauses = [
+        "sold_date IS NOT NULL",
+        "sold_date >= ?",
+        "sold_date <= ?",
+        "geo_lat IS NOT NULL",
+        "geo_lon IS NOT NULL",
+        "COALESCE(cabana_flag, 0) = 0",
+    ]
+    params: list[str] = [current_start, current_end]
+    _append_common_filters(
+        where_clauses,
+        params,
+        city,
+        final_subdivision,
+        property_type,
+        geo_zone=geo_zone,
+        property_group=property_group,
+    )
+
+    with closing(get_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT
+                listing_number,
+                DATE(sold_date) AS sold_date,
+                short_address,
+                city,
+                final_subdivision,
+                sold_price,
+                geo_lat,
+                geo_lon
+            FROM listing_details
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY DATE(sold_date) DESC, sold_price DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+
+    return {
+        "report_mode": report_mode,
+        "period_label": period_label,
+        "current_start": current_start,
+        "current_end": current_end,
+        "row_count": len(rows),
+        "rows": rows,
+    }
 
 
 @app.get("/api/market/report-summary", response_model=ReportSummaryResponse)

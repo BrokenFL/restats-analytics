@@ -709,6 +709,8 @@ body {
 .dashboard-shell {
   display: grid;
   grid-template-columns: 272px minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
   min-height: 100vh;
 }
 
@@ -817,6 +819,7 @@ body {
 
 .page-shell.dashboard-main {
   max-width: none;
+  min-width: 0;
   width: 100%;
   margin: 0;
   padding: 28px 28px 42px;
@@ -1466,6 +1469,285 @@ body {
   font-size: 13px;
 }
 
+.map-data-alternative {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.map-data-alternative summary,
+.secondary-metrics summary {
+  color: #087f76;
+  font-size: 13px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.map-data-alternative .table-wrap {
+  max-height: 360px;
+  margin-top: 12px;
+}
+
+.secondary-metrics {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px 14px;
+}
+
+.secondary-metrics[open] summary {
+  margin-bottom: 12px;
+}
+
+.secondary-metrics .kpi-grid {
+  margin-bottom: 10px;
+}
+
+.subdivision-combobox {
+  position: relative;
+}
+
+.subdivision-combobox input {
+  padding-right: 38px;
+}
+
+.combobox-clear {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #667085;
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.combobox-clear:hover,
+.combobox-clear:focus-visible {
+  background: #eef4f6;
+  color: #17284a;
+}
+
+.combobox-list {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  border: 1px solid #dbe1ea;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 18px 45px rgba(16, 24, 40, 0.16);
+}
+
+.combobox-list li {
+  display: grid;
+  gap: 2px;
+  border-radius: 6px;
+  padding: 9px 10px;
+  color: #18233d;
+  cursor: pointer;
+}
+
+.combobox-list li.active,
+.combobox-list li:hover {
+  background: #f1f8f7;
+}
+
+.combobox-list li.selected {
+  color: #087f76;
+  font-weight: 750;
+}
+
+.combobox-list small {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.combobox-list .combobox-empty {
+  color: #667085;
+  cursor: default;
+}
+
+.social-modal-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(9, 23, 44, 0.68);
+  overflow-y: auto;
+}
+
+.social-modal {
+  width: min(1120px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 14px;
+  background: #f8fafb;
+  box-shadow: 0 30px 90px rgba(4, 14, 31, 0.36);
+  padding: 22px;
+}
+
+.social-modal-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.social-modal-header h2 {
+  margin: 3px 0 5px;
+  color: #111827;
+  font-size: 24px;
+}
+
+.social-modal-header p {
+  margin: 0;
+  color: #667085;
+  font-size: 13px;
+}
+
+.social-modal-header .eyebrow {
+  color: #087f76;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.modal-close {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: #fff;
+  color: #344054;
+  font: inherit;
+  font-size: 25px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.social-platform-tabs {
+  display: inline-flex;
+  margin: 18px 0;
+  border: 1px solid #dbe1ea;
+  border-radius: 8px;
+  background: #fff;
+  padding: 3px;
+}
+
+.social-platform-tabs button {
+  min-width: 112px;
+  height: 36px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #475467;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.social-platform-tabs button.active {
+  background: var(--teal-soft);
+  color: #087f76;
+}
+
+.social-modal-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.social-preview-wrap {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+}
+
+.social-preview {
+  display: block;
+  width: min(100%, 560px);
+  height: auto;
+  border: 1px solid #ddded9;
+  border-radius: 4px;
+  background: #fbf8f3;
+  box-shadow: 0 18px 50px rgba(16, 24, 40, 0.14);
+}
+
+.social-download {
+  width: min(100%, 560px);
+}
+
+.social-preview-wrap > p,
+.social-source-note {
+  margin: 0;
+  color: #667085;
+  font-size: 12px;
+}
+
+.social-copy-column {
+  display: grid;
+  gap: 10px;
+}
+
+.social-copy-column label {
+  display: grid;
+  gap: 7px;
+  color: #172033;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.social-copy-column textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #dbe1ea;
+  border-radius: 8px;
+  background: #fff;
+  color: #344054;
+  padding: 11px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.social-report-state {
+  min-height: 260px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed #cfd7e2;
+  border-radius: 10px;
+  color: #667085;
+  background: #fff;
+}
+
+.social-report-state.error {
+  color: #b42318;
+  border-color: #f1b7b2;
+  background: #fff7f6;
+}
+
 @media (max-width: 1280px) and (min-width: 901px) {
   .dashboard-topbar {
     grid-template-columns: 1fr;
@@ -1511,8 +1793,20 @@ body {
 
   .sidebar {
     position: static;
+    width: 100%;
+    min-width: 0;
     height: auto;
     padding: 16px;
+  }
+
+  .dashboard-main,
+  .dashboard-topbar,
+  .filter-grid,
+  .market-dashboard-grid,
+  .market-main-column {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .sidebar-nav {
@@ -1590,5 +1884,49 @@ body {
 
   .top-actions .profile-avatar {
     display: none;
+  }
+
+  .filter-actions {
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: stretch;
+  }
+
+  .filter-actions .period-pill {
+    flex: 1 1 30%;
+    min-width: 0;
+  }
+
+  .filter-actions .reset-btn {
+    flex: 1 1 100%;
+    margin: 8px 0 0;
+  }
+
+  .social-modal-backdrop {
+    padding: 0;
+    align-items: start;
+  }
+
+  .social-modal {
+    width: 100%;
+    min-height: 100vh;
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+    padding: 16px;
+  }
+
+  .social-modal-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .social-platform-tabs {
+    display: flex;
+  }
+
+  .social-platform-tabs button {
+    flex: 1;
   }
 }
