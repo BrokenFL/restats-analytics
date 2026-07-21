@@ -100,7 +100,6 @@ export type ReportPeriodMetrics = {
   active_inventory: number | null;
   months_supply: number | null;
   median_dom: number | null;
-  avg_dom?: number | null;
   median_listing_discount: number | null;
 };
 

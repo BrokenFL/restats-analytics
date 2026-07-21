@@ -103,11 +103,11 @@ export function SocialReportModal({
     return {
       sold: current?.sold_count ?? null,
       avgPrice: current?.avg_sold_price ?? null,
-      avgDom: current?.avg_dom ?? null,
+      medianDom: current?.median_dom ?? null,
       saleToList: current?.avg_sp_lp ?? null,
       soldYoy: percentChange(current?.sold_count, prior?.sold_count),
       avgPriceYoy: percentChange(current?.avg_sold_price, prior?.avg_sold_price),
-      avgDomYoy: percentChange(current?.avg_dom, prior?.avg_dom),
+      medianDomYoy: percentChange(current?.median_dom, prior?.median_dom),
       saleToListYoy: percentChange(current?.avg_sp_lp, prior?.avg_sp_lp),
     };
   }, [currentSummary, yearAgoSummary]);
@@ -120,15 +120,15 @@ export function SocialReportModal({
 
   const caption = useMemo(() => {
     const sold = metrics.sold == null ? "N/A" : Math.round(metrics.sold).toLocaleString();
-    const avgDom = metrics.avgDom == null ? "N/A" : Math.round(metrics.avgDom).toLocaleString();
+    const medianDom = metrics.medianDom == null ? "N/A" : Math.round(metrics.medianDom).toLocaleString();
     if (platform === "linkedin") {
-      return `${scopeTitle} | ${periodLabel}\n\n${sold} closed sales (${formatYoy(metrics.soldYoy, true)}), an average sold price of ${compactMoney(metrics.avgPrice)} (${formatYoy(metrics.avgPriceYoy)}), ${avgDom} average days on market (${formatYoy(metrics.avgDomYoy, true)}), and ${metrics.saleToList == null ? "N/A" : `${metrics.saleToList.toFixed(1)}%`} average sale-to-list (${formatYoy(metrics.saleToListYoy)}).\n\nMLS data through ${dataThroughLabel}.`;
+      return `${scopeTitle} | ${periodLabel}\n\n${sold} closed sales (${formatYoy(metrics.soldYoy, true)}), an average sold price of ${compactMoney(metrics.avgPrice)} (${formatYoy(metrics.avgPriceYoy)}), ${medianDom} median days on market (${formatYoy(metrics.medianDomYoy, true)}), and ${metrics.saleToList == null ? "N/A" : `${metrics.saleToList.toFixed(1)}%`} average sale-to-list (${formatYoy(metrics.saleToListYoy)}).\n\nMLS data through ${dataThroughLabel}.`;
     }
-    return `${scopeTitle} ${periodLabel} market snapshot ✨\n\n${sold} closed sales · ${compactMoney(metrics.avgPrice)} average sold price · ${avgDom} average days on market · ${metrics.saleToList == null ? "N/A" : `${metrics.saleToList.toFixed(1)}%`} sale-to-list.\n\nMLS data through ${dataThroughLabel}.\n\n#PalmBeachCountyRealEstate #MarketUpdate #ReStats`;
+    return `${scopeTitle} ${periodLabel} market snapshot ✨\n\n${sold} closed sales · ${compactMoney(metrics.avgPrice)} average sold price · ${medianDom} median days on market · ${metrics.saleToList == null ? "N/A" : `${metrics.saleToList.toFixed(1)}%`} sale-to-list.\n\nMLS data through ${dataThroughLabel}.\n\n#PalmBeachCountyRealEstate #MarketUpdate #ReStats`;
   }, [dataThroughLabel, metrics, periodLabel, platform, scopeTitle]);
 
   const altText = useMemo(() => {
-    return `${scopeTitle} ${periodLabel} market snapshot. ${metrics.sold == null ? "No" : Math.round(metrics.sold)} closed sales, ${compactMoney(metrics.avgPrice)} average sold price, ${metrics.avgDom == null ? "unavailable" : Math.round(metrics.avgDom)} average days on market, and ${metrics.saleToList == null ? "unavailable" : `${metrics.saleToList.toFixed(1)} percent`} average sale-to-list ratio. Year-over-year changes are ${formatYoy(metrics.soldYoy, true)} for sales, ${formatYoy(metrics.avgPriceYoy)} for average sold price, ${formatYoy(metrics.avgDomYoy, true)} for days on market, and ${formatYoy(metrics.saleToListYoy)} for sale-to-list. MLS data through ${dataThroughLabel}.`;
+    return `${scopeTitle} ${periodLabel} market snapshot. ${metrics.sold == null ? "No" : Math.round(metrics.sold)} closed sales, ${compactMoney(metrics.avgPrice)} average sold price, ${metrics.medianDom == null ? "unavailable" : Math.round(metrics.medianDom)} median days on market, and ${metrics.saleToList == null ? "unavailable" : `${metrics.saleToList.toFixed(1)} percent`} average sale-to-list ratio. Year-over-year changes are ${formatYoy(metrics.soldYoy, true)} for sales, ${formatYoy(metrics.avgPriceYoy)} for average sold price, ${formatYoy(metrics.medianDomYoy, true)} for median days on market, and ${formatYoy(metrics.saleToListYoy)} for sale-to-list. MLS data through ${dataThroughLabel}.`;
   }, [dataThroughLabel, metrics, periodLabel, scopeTitle]);
 
   useEffect(() => {
@@ -195,7 +195,7 @@ export function SocialReportModal({
 
       const cards = [
         { value: compactMoney(metrics.avgPrice), label: "AVG SOLD PRICE", yoy: metrics.avgPriceYoy, tone: metrics.avgPriceYoy != null && metrics.avgPriceYoy >= 0 ? COLORS.teal : COLORS.orange },
-        { value: metrics.avgDom == null ? "—" : Math.round(metrics.avgDom).toLocaleString(), label: "AVG DAYS ON MARKET", yoy: metrics.avgDomYoy, tone: metrics.avgDomYoy != null && metrics.avgDomYoy < 0 ? COLORS.teal : COLORS.orange },
+        { value: metrics.medianDom == null ? "—" : Math.round(metrics.medianDom).toLocaleString(), label: "MEDIAN DOM", yoy: metrics.medianDomYoy, tone: metrics.medianDomYoy != null && metrics.medianDomYoy < 0 ? COLORS.teal : COLORS.orange },
         { value: metrics.saleToList == null ? "—" : `${metrics.saleToList.toFixed(1)}%`, label: "AVG SALE-TO-LIST", yoy: metrics.saleToListYoy, tone: metrics.saleToListYoy != null && metrics.saleToListYoy >= 0 ? COLORS.teal : COLORS.orange },
       ];
       cards.forEach((card, index) => {

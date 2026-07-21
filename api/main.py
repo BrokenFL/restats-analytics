@@ -110,7 +110,6 @@ class ReportPeriodMetricsResponse(BaseModel):
     active_inventory: Optional[float] = None
     months_supply: Optional[float] = None
     median_dom: Optional[float] = None
-    avg_dom: Optional[float] = None
     median_listing_discount: Optional[float] = None
     cash_sales_percent: Optional[float] = None
 
@@ -748,10 +747,6 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
     dom_df = dom_df[(dom_df["effective_active_end_date"] >= start_ts) & (dom_df["effective_active_end_date"] <= end_ts)]
     dom_series = (dom_df["effective_active_end_date"] - dom_df["listing_date"]).dt.days
 
-    sold_dom_df = sold[sold["listing_date"].notna() & sold["effective_active_end_date"].notna()].copy()
-    sold_dom_series = (sold_dom_df["effective_active_end_date"] - sold_dom_df["listing_date"]).dt.days
-    sold_dom_series = sold_dom_series[sold_dom_series > 0]
-
     # Match legacy listing_discount logic: (original_list_price - sold_price) / original_list_price on sold rows.
     discount_series = None
     if "original_list_price" in sold.columns and "sold_price" in sold.columns:
@@ -789,7 +784,6 @@ def _compute_period_metrics(df: pd.DataFrame, start_iso: str, end_iso: str) -> d
         "active_inventory": active_inventory,
         "months_supply": _safe_number(months_supply),
         "median_dom": _safe_number(dom_series.median()) if dom_series is not None and not dom_series.empty else None,
-        "avg_dom": _safe_number(sold_dom_series.mean()) if not sold_dom_series.empty else None,
         "median_listing_discount": _safe_number(discount_series.median()) if discount_series is not None and not discount_series.empty else None,
         "cash_sales_percent": cash_sales_percent,
     }
@@ -1229,7 +1223,6 @@ def _postgres_report_period_metrics(
             COUNT(*) FILTER (WHERE {current_active}) AS current_active_inventory,
             COUNT(*) FILTER (WHERE {current_sales_12}) AS current_sales_12mo,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.current_start AND DATE(d.effective_active_end_date) <= b.current_end) AS current_median_dom,
-            AVG(DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) > DATE(d.listing_date)) AS current_avg_dom,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {current_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS current_median_listing_discount,
             (COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {current_sold}), 0) AS current_cash_sales_percent,
 
@@ -1246,7 +1239,6 @@ def _postgres_report_period_metrics(
             COUNT(*) FILTER (WHERE {previous_active}) AS previous_active_inventory,
             COUNT(*) FILTER (WHERE {previous_sales_12}) AS previous_sales_12mo,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) >= b.previous_start AND DATE(d.effective_active_end_date) <= b.previous_end) AS previous_median_dom,
-            AVG(DATE(d.effective_active_end_date) - DATE(d.listing_date)) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.listing_date IS NOT NULL AND d.effective_active_end_date IS NOT NULL AND DATE(d.effective_active_end_date) > DATE(d.listing_date)) AS previous_avg_dom,
             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ((d.original_list_price - d.sold_price) / NULLIF(d.original_list_price, 0)) * 100) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND d.original_list_price > 0 AND d.sold_price IS NOT NULL) AS previous_median_listing_discount,
             (COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold} AND UPPER(COALESCE({buyer_financing_expr}, '')) LIKE '%CASH%')) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE {cabana_predicate} AND {previous_sold}), 0) AS previous_cash_sales_percent
         FROM base d
@@ -1279,7 +1271,6 @@ def _postgres_report_period_metrics(
             else (0 if (row.get("current_active_inventory") or 0) == 0 else 999)
         ),
         "median_dom": _safe_number(row.get("current_median_dom")),
-        "avg_dom": _safe_number(row.get("current_avg_dom")),
         "median_listing_discount": _safe_number(row.get("current_median_listing_discount")),
         "cash_sales_percent": _safe_number(row.get("current_cash_sales_percent")),
     }
@@ -1301,7 +1292,6 @@ def _postgres_report_period_metrics(
             else (0 if (row.get("previous_active_inventory") or 0) == 0 else 999)
         ),
         "median_dom": _safe_number(row.get("previous_median_dom")),
-        "avg_dom": _safe_number(row.get("previous_avg_dom")),
         "median_listing_discount": _safe_number(row.get("previous_median_listing_discount")),
         "cash_sales_percent": _safe_number(row.get("previous_cash_sales_percent")),
     }

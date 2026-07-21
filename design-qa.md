@@ -1,37 +1,47 @@
 # Design QA
 
-## Source and implementation
+## Source visual truth
 
-- Approved reference: `/Users/brookesnader/.codex/generated_images/019f84c5-50c3-7233-a093-224fc9fad0c5/exec-c706abd0-1295-433f-8c66-ce1ca88fcfd8.png`
-- Desktop implementation view: `output/playwright/restats-audit-2026-07-21/social-report-desktop.png`
-- Focused 1080-square implementation: `output/playwright/restats-audit-2026-07-21/social-report-card-cropped.png`
-- State: Boca Raton, Woodfield Country Club, June 2026, LinkedIn tab
+- Six-card dashboard request: `/tmp/codex-remote-attachments/019f84c5-50c3-7233-a093-224fc9fad0c5/17FFC1C9-9DDD-4DD4-BBE0-795894D6DC60/1-Photo-1.jpg`
+- Missing-stat social card: `/tmp/codex-remote-attachments/019f84c5-50c3-7233-a093-224fc9fad0c5/17FFC1C9-9DDD-4DD4-BBE0-795894D6DC60/2-Photo-2.jpg`
 
-## Comparison
+## Rendered implementation
 
-The approved reference and the rendered implementation were opened together and compared at the same square-card state. The implementation preserves the approved hierarchy, navy/teal/orange palette, ivory architectural background, four-stat layout, and a year-over-year indicator inside every statistic card.
+- Dashboard capture: `output/playwright/restats-audit-2026-07-21/six-primary-cards-focused-final.png`
+- Social-report capture: `output/playwright/restats-audit-2026-07-21/median-dom-fix-desktop.png`
+- Desktop viewport: 1267 by 713 CSS pixels
+- Mobile viewport check: 390 by 844 target, 386-pixel rendered viewport
+- State: Palm Beach, monthly report, June 2026
 
-### Full-view findings
+## Full-view comparison evidence
 
-- Typography: Heading, numeric hierarchy, metric labels, and supporting text are clear and consistent. The implementation uses the product's existing font stack rather than embedding a new display font.
-- Layout: The subdivision, period, hero statistic, three supporting statistics, and source footer follow the approved reading order. Spacing remains balanced at desktop and mobile sizes.
-- Color: Navy typography, teal rules, orange increase markers, and muted decrease markers match the approved direction and meet the intended editorial tone.
-- Image quality: The generated architectural background is used as a real raster asset and remains crisp at the 1080 by 1080 export size.
-- Copy and data: All four metrics show exact live values and year-over-year changes. Caption, source note, and alt text match the rendered card.
+Each user screenshot was opened in the same comparison input as its matching rendered implementation. The dashboard now presents six primary MLS cards in a balanced three-by-two grid while keeping Market Grade in the side-panel Market Pulse only. The social report preserves the approved square editorial layout and replaces the unavailable average-DOM statistic with the existing Median DOM metric.
 
-### Focused-region findings
+## Focused-region comparison evidence
 
-- Primary statistic: `13 CLOSED SALES` and `UP 333% YOY` remain grouped in the main card.
-- Supporting statistics: Average sold price, average days on market, and average sale-to-list each include their own up/down year-over-year note inside the same card.
-- Footer: Location and MLS-through date are legible without competing with the metrics.
+- Primary dashboard cards: Sold Count, Avg Sold Price, Median Sold Price, Active Inventory, Months Supply, and Median DOM are all populated for Palm Beach June 2026.
+- Supporting section: The disclosure is labeled `Show supporting metrics`; there is no Market Grade card, grade formula, grade read, or component-score block in the main column.
+- Social statistic row: `137 MEDIAN DOM` is rendered with `down 11.3% YOY`; the caption and alt text both say median days on market.
 
-## QA history
+## Fidelity surfaces
 
-1. Initial desktop comparison found no P0 or P1 mismatches. Small ornamental differences from the image reference were accepted so the export remains deterministic and data-driven.
-2. Mobile inspection found a P2 horizontal-overflow issue in the dashboard shell and filter actions. The layout constraints and wrapping rules were corrected.
-3. Post-fix browser checks at a 390-pixel target viewport reported a 386-pixel viewport and 386-pixel document width, with the dialog contained inside the viewport.
-4. Final browser state confirmed the LinkedIn tab, correct 1080-square export metadata, correct caption and alt text, 13 report-period closing rows, 13 mapped sales, and accessible pressed-state map controls.
+- Fonts and typography: The existing ReStats font stack, metric hierarchy, weights, and numeric emphasis are preserved. A small primary-label adjustment prevents truncation at the desktop three-column width.
+- Spacing and layout rhythm: Six primary cards fill two complete rows with consistent gaps and alignment. The Market Pulse remains visually separate in the right column.
+- Colors and visual tokens: Existing white cards, navy text, teal positive states, red negative states, borders, and shadows remain unchanged.
+- Image quality and asset fidelity: The approved ivory architectural raster background remains sharp and correctly scaled in the social export.
+- Copy and content: No social caption or alt text references average DOM or displays `N/A`. Market Grade appears only in the existing side-panel experience.
 
-## Result
+## Findings and comparison history
 
-passed
+1. P1: The source screenshot showed `AVG DAYS ON MARKET` as unavailable because that field was absent from cached monthly summaries. Fixed by using the established `median_dom` metric and its year-over-year comparison throughout the image, caption, and alt text. Post-fix evidence shows `137 MEDIAN DOM` and `down 11.3% YOY`.
+2. P2: Adding the sixth primary card initially caused several labels to ellipsize at the desktop width. Fixed by tightening the card icon track, gap, padding, and primary-label size. Post-fix DOM measurements show every primary label's scroll width equal to its client width.
+3. Mobile follow-up: At the phone breakpoint the primary grid becomes one column, every label fits, and document width equals viewport width, so there is no horizontal overflow.
+
+## Interaction and console checks
+
+- Tested City, Date Range, Month, and Social Report controls.
+- Confirmed the Palm Beach June report produces all six primary metrics and the corrected social asset.
+- Confirmed the Instagram caption and alt text use Median DOM.
+- Browser console error count: 0.
+
+final result: passed

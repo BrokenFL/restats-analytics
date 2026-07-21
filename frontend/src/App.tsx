@@ -2752,33 +2752,22 @@ export default function App() {
         <div className="kpi-grid report-grid primary-metrics">
           <MetricVisualCard label="Sold Count" value={formatNumber(reportSummary?.current.sold_count)} delta={formatDelta(reportSummary?.delta_pct.sold_count)} deltaValue={reportSummary?.delta_pct.sold_count} />
           <MetricVisualCard label="Avg Sold Price" value={formatMoney(reportSummary?.current.avg_sold_price)} delta={formatDelta(reportSummary?.delta_pct.avg_sold_price)} deltaValue={reportSummary?.delta_pct.avg_sold_price} />
+          <MetricVisualCard label="Median Sold Price" value={formatMoney(reportSummary?.current.median_sold_price)} delta={formatDelta(reportSummary?.delta_pct.median_sold_price)} deltaValue={reportSummary?.delta_pct.median_sold_price} />
           <MetricVisualCard label="Active Inventory" value={formatNumber(reportSummary?.current.active_inventory)} delta={formatDelta(reportSummary?.delta_pct.active_inventory)} deltaValue={reportSummary?.delta_pct.active_inventory} />
           <MetricVisualCard label="Months Supply" value={formatNumber(reportSummary?.current.months_supply)} delta={formatDelta(reportSummary?.delta_pct.months_supply)} deltaValue={reportSummary?.delta_pct.months_supply} />
           <MetricVisualCard label="Median DOM" value={formatNumber(reportSummary?.current.median_dom)} delta={formatDelta(reportSummary?.delta_pct.median_dom)} deltaValue={reportSummary?.delta_pct.median_dom} />
         </div>
         <details className="secondary-metrics">
-          <summary>Show supporting metrics and market grade</summary>
+          <summary>Show supporting metrics</summary>
           <div className="kpi-grid report-grid">
             <MetricVisualCard label="Sales Volume" value={formatMoney(reportSummary?.current.total_sales_volume)} delta={formatDelta(reportSummary?.delta_pct.total_sales_volume)} deltaValue={reportSummary?.delta_pct.total_sales_volume} />
-            <MetricVisualCard label="Median Sold Price" value={formatMoney(reportSummary?.current.median_sold_price)} delta={formatDelta(reportSummary?.delta_pct.median_sold_price)} deltaValue={reportSummary?.delta_pct.median_sold_price} />
             <MetricVisualCard label="Median PPSF" value={formatMoney(reportSummary?.current.median_price_per_sqft)} delta={formatDelta(reportSummary?.delta_pct.median_price_per_sqft)} deltaValue={reportSummary?.delta_pct.median_price_per_sqft} />
             <MetricVisualCard label="New Listings" value={formatNumber(reportSummary?.current.new_listings)} delta={formatDelta(reportSummary?.delta_pct.new_listings)} deltaValue={reportSummary?.delta_pct.new_listings} />
             <MetricVisualCard label="Pending Sales" value={formatNumber(reportSummary?.current.pending_sales)} delta={formatDelta(reportSummary?.delta_pct.pending_sales)} deltaValue={reportSummary?.delta_pct.pending_sales} />
             <MetricVisualCard label="Median Discount" value={formatPercent(reportSummary?.current.median_listing_discount)} delta={formatDelta(reportSummary?.delta_pct.median_listing_discount)} deltaValue={reportSummary?.delta_pct.median_listing_discount} />
             <MetricVisualCard label="Cash Sales %" value={formatPercent(reportSummary?.current.cash_sales_percent)} delta={formatDelta(reportSummary?.delta_pct.cash_sales_percent)} deltaValue={reportSummary?.delta_pct.cash_sales_percent} />
-            <MetricVisualCard label="Market Grade" value={marketGradeInfo.label} />
           </div>
-          <p className="panel-subtitle"><strong>Grade read:</strong> {marketGradeInfo.description}</p>
         </details>
-        <p className="panel-subtitle">
-          <strong>Market Grade v2:</strong> {marketGradeInfo.formula}
-        </p>
-        <p className="panel-subtitle">
-          <strong>Grade Read:</strong> {marketGradeInfo.description}
-        </p>
-        <p className="panel-subtitle">
-          <strong>Component Scores:</strong> Pace {marketGradeInfo.pace == null ? "N/A" : marketGradeInfo.pace.toFixed(1)} | Supply {marketGradeInfo.supply == null ? "N/A" : marketGradeInfo.supply.toFixed(1)} | Pricing {marketGradeInfo.pricing == null ? "N/A" : marketGradeInfo.pricing.toFixed(1)} | Demand {marketGradeInfo.demand == null ? "N/A" : marketGradeInfo.demand.toFixed(1)}
-        </p>
         <p className="panel-subtitle">
           Deltas vs previous period: Sold {formatDelta(reportSummary?.delta_pct.sold_count)} | Volume {formatDelta(reportSummary?.delta_pct.total_sales_volume)} | Median Price {formatDelta(reportSummary?.delta_pct.median_sold_price)} | DOM {formatDelta(reportSummary?.delta_pct.median_dom)} | Cash {formatDelta(reportSummary?.delta_pct.cash_sales_percent)}
         </p>

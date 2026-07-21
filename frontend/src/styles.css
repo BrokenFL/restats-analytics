@@ -1101,10 +1101,10 @@ body {
 }
 
 .metric-visual-card {
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 36px minmax(0, 1fr);
   min-height: 98px;
-  gap: 12px;
-  padding: 16px;
+  gap: 8px;
+  padding: 12px;
   background: #fff;
 }
 
@@ -1112,8 +1112,8 @@ body {
 .metric-icon-fallback {
   grid-column: 1;
   grid-row: 1;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   padding: 7px;
   background: #f0f5ff;
@@ -1130,6 +1130,10 @@ body {
   text-transform: none;
   letter-spacing: 0;
   font-weight: 600;
+}
+
+.primary-metrics .metric-visual-label {
+  font-size: 12px;
 }
 
 .metric-visual-value {
