@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -70,13 +72,104 @@ def _status_upper(df):
     return df.get("status", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
 
 
-def _primary_inventory_mask(df):
+def _normalize_inventory_identity(value):
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).upper().strip()
+    if text in {"", "NAN", "NAT", "NONE", "NULL"}:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
+def _listing_number_series(df):
+    return df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
+
+
+def _new_listing_code_mask(df):
+    """Return rows using the newer B/R MLS listing-number formats."""
+    return _listing_number_series(df).str.match(r"^(?:B\d+|R\d+)$", na=False)
+
+
+def _inventory_identity_series(df):
+    """Build a unit-aware exact identity for inventory deduplication.
+
+    Full normalized address plus city is preferred because parcel_id can be
+    shared by multiple condominium units. Parcel id is only a fallback when an
+    address is unavailable.
     """
-    Inventory metrics should use primary MLS-style listing ids only.
-    Exclude legacy/secondary feed ids that overcount active supply.
+    address = df.get("short_address", pd.Series(index=df.index, dtype="object")).map(_normalize_inventory_identity)
+    city = df.get("city", pd.Series(index=df.index, dtype="object")).map(_normalize_inventory_identity)
+    parcel = df.get("parcel_id", pd.Series(index=df.index, dtype="object")).map(_normalize_inventory_identity)
+
+    identity = pd.Series("", index=df.index, dtype="object")
+    has_address = address.ne("")
+    identity.loc[has_address] = "address:" + city.loc[has_address] + ":" + address.loc[has_address]
+    has_parcel_without_address = ~has_address & parcel.ne("")
+    identity.loc[has_parcel_without_address] = "parcel:" + parcel.loc[has_parcel_without_address]
+    return identity
+
+
+def inventory_eligibility_mask(df, as_of_date=None):
+    """Return listing rows eligible for inventory metrics.
+
+    B and ordinary R records are current MLS formats. RX remains eligible when
+    no newer exact B/R record exists. When a property has one or more exact B/R
+    rows, only its newest B/R row is retained; this also prevents repeated B
+    relists or old R rows from overcounting inventory. AX/FX remain excluded
+    pending a separate source decision.
     """
-    listing_numbers = df.get("listing_number", pd.Series(index=df.index, dtype="object")).astype(str).str.upper().str.strip()
-    return ~listing_numbers.str.startswith(("B", "RX-", "AX-", "FX-"))
+    listing_numbers = _listing_number_series(df)
+    base_eligible = ~listing_numbers.str.startswith(("AX-", "FX-"))
+    if df.empty or "listing_date" not in df.columns:
+        return base_eligible
+
+    listing_dates = pd.to_datetime(df["listing_date"], errors="coerce")
+    cutoff = pd.Timestamp(as_of_date) if as_of_date is not None else pd.Timestamp.now()
+    identity = _inventory_identity_series(df)
+    dated_rows = base_eligible & identity.ne("") & listing_dates.notna() & (listing_dates <= cutoff)
+    new_rows = dated_rows & _new_listing_code_mask(df)
+    if not new_rows.any():
+        return base_eligible
+
+    status_change_dates = pd.to_datetime(
+        df.get("status_change_date", pd.Series(index=df.index, dtype="object")),
+        errors="coerce",
+    )
+    rank_frame = pd.DataFrame(
+        {
+            "identity": identity.loc[new_rows],
+            "listing_date": listing_dates.loc[new_rows],
+            "status_change_date": status_change_dates.loc[new_rows],
+            "listing_number": listing_numbers.loc[new_rows],
+            "row_position": [df.index.get_loc(index) for index in df.index[new_rows]],
+        },
+        index=df.index[new_rows],
+    )
+    rank_frame["source_rank"] = _new_listing_code_mask(df).loc[new_rows].map({True: 0, False: 1})
+    winners = (
+        rank_frame.sort_values(
+            ["identity", "listing_date", "source_rank", "status_change_date", "listing_number"],
+            ascending=[True, False, True, False, False],
+            na_position="last",
+        )
+        .drop_duplicates("identity")
+    )
+
+    eligible = base_eligible.copy()
+    for identity_value, group in rank_frame.groupby("identity", sort=False):
+        winner_position = int(winners.loc[winners["identity"].eq(identity_value), "row_position"].iloc[0])
+        group_positions = [
+            df.index.get_loc(index)
+            for index in df.index[dated_rows & identity.eq(identity_value)]
+        ]
+        eligible.iloc[group_positions] = False
+        eligible.iloc[winner_position] = True
+    return eligible
+
+
+def _primary_inventory_mask(df, as_of_date=None):
+    """Backward-compatible inventory eligibility alias."""
+    return inventory_eligibility_mask(df, as_of_date=as_of_date)
 
 
 def _non_cabana_mask(df):
@@ -94,7 +187,7 @@ def is_active_now(df, as_of_date=None):
     if "effective_active_end_date" not in df.columns:
         return pd.Series(False, index=df.index)
     status_active = _status_upper(df).isin(ACTIVE_LIKE_STATUSES)
-    return _primary_inventory_mask(df) & _non_cabana_mask(df) & status_active & (
+    return inventory_eligibility_mask(df, as_of_date=as_of) & _non_cabana_mask(df) & status_active & (
         df["effective_active_end_date"].isna() | (df["effective_active_end_date"] > as_of)
     )
 
@@ -109,7 +202,7 @@ def is_active_as_of(df, snapshot_date):
     if "listing_date" not in df.columns or "effective_active_end_date" not in df.columns:
         return pd.Series(False, index=df.index)
     status_active = _status_upper(df).isin(ACTIVE_LIKE_STATUSES)
-    return _primary_inventory_mask(df) & _non_cabana_mask(df) & (df["listing_date"] <= snapshot_ts) & (
+    return inventory_eligibility_mask(df, as_of_date=snapshot_ts) & _non_cabana_mask(df) & (df["listing_date"] <= snapshot_ts) & (
         (df["effective_active_end_date"] > snapshot_ts)
         | (df["effective_active_end_date"].isna() & status_active)
     )
@@ -289,7 +382,7 @@ def pending_inventory(df, freq, start, end):
         else:
             df[c] = pd.NaT
 
-    df = df[df["under_contract_date"].notna() & _primary_inventory_mask(df) & _non_cabana_mask(df)]
+    df = df[df["under_contract_date"].notna() & inventory_eligibility_mask(df, as_of_date=pd.Timestamp(end)) & _non_cabana_mask(df)]
 
     # Determine Pending End Date (Earliest of Sold/Fallthrough/Cancel/Withdraw)
     df["calc_pending_end"] = pd.NaT
