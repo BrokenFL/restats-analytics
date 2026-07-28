@@ -1153,7 +1153,12 @@ def _should_skip_from_date(cities) -> bool:
     return bool(normalized) and normalized.issubset(FULL_CITY_REFRESH_CITIES)
 
 
-def _backup_and_import(csv_files, db_file: str, backup_dir: str) -> Path:
+def _backup_and_import(
+    csv_files,
+    db_file: str,
+    backup_dir: str,
+    reconcile_active_inventory: bool = False,
+) -> Path:
     db_path = Path(db_file)
     if not db_path.exists():
         raise SystemExit(f"DB file not found: {db_file}")
@@ -1170,6 +1175,8 @@ def _backup_and_import(csv_files, db_file: str, backup_dir: str) -> Path:
         "--skip-archive",
         *[str(Path(path).resolve()) for path in csv_files],
     ]
+    if reconcile_active_inventory:
+        cmd.append("--reconcile-active-inventory")
     proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=False)
     if proc.returncode != 0:
         raise SystemExit(f"CSV import failed with exit code {proc.returncode}")
@@ -2077,6 +2084,11 @@ def parse_args():
         help="Import downloaded CSVs into --db-file after export completes.",
     )
     p.add_argument(
+        "--reconcile-active-inventory",
+        action="store_true",
+        help="Retire existing active rows absent from this authoritative city refresh.",
+    )
+    p.add_argument(
         "--backup-dir",
         default="tmp",
         help="Directory for DB backups before --import-to-db runs.",
@@ -2264,7 +2276,12 @@ def main():
     if args.import_to_db:
         if not exported_csvs:
             raise SystemExit("--import-to-db requires at least one exported CSV. Add --export-each-search.")
-        backup_path = _backup_and_import(exported_csvs, args.db_file, args.backup_dir)
+        backup_path = _backup_and_import(
+            exported_csvs,
+            args.db_file,
+            args.backup_dir,
+            reconcile_active_inventory=args.reconcile_active_inventory,
+        )
         print(f"db_backup={backup_path}")
 
 

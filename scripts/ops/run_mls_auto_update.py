@@ -88,10 +88,22 @@ def parse_args():
         action="store_true",
         help="Skip rebuilding cached monthly report snapshots.",
     )
+    parser.add_argument(
+        "--skip-active-reconciliation",
+        action="store_true",
+        help="Do not retire active rows absent from the full-city MLS refresh.",
+    )
     return parser.parse_args()
 
 
-def _run_city_refresh(city: str, template: str, headless: bool, status_mode: str, from_date: str | None) -> None:
+def _run_city_refresh(
+    city: str,
+    template: str,
+    headless: bool,
+    status_mode: str,
+    from_date: str | None,
+    reconcile_active_inventory: bool,
+) -> None:
     city_slug = slugify_label(city)
     cmd = [
         sys.executable,
@@ -115,6 +127,8 @@ def _run_city_refresh(city: str, template: str, headless: bool, status_mode: str
         "--backup-dir",
         "tmp",
     ]
+    if reconcile_active_inventory:
+        cmd.append("--reconcile-active-inventory")
     if from_date:
         cmd.extend(["--from-date", from_date])
     else:
@@ -241,6 +255,7 @@ def main() -> int:
                 headless=args.headless,
                 status_mode=args.status_mode,
                 from_date=args.from_date,
+                reconcile_active_inventory=not args.skip_active_reconciliation,
             )
             city_runs.append({"city": city, "status": "success"})
 

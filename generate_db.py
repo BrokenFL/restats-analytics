@@ -46,6 +46,11 @@ def parse_args():
         action="store_true",
         help="Do not move processed CSVs into processed_archive after a successful load.",
     )
+    parser.add_argument(
+        "--reconcile-active-inventory",
+        action="store_true",
+        help="Treat incoming city exports as authoritative current inventory and retire absent active rows.",
+    )
     return parser.parse_args()
 
 
@@ -101,7 +106,12 @@ def main():
         regular_files = [path for path in csv_files if not _is_board_file(path)]
 
         if regular_files:
-            process_and_load_data(regular_files, args.db_name, create_new=False)
+            process_and_load_data(
+                regular_files,
+                args.db_name,
+                create_new=False,
+                reconcile_active_inventory=args.reconcile_active_inventory,
+            )
         if board_files:
             print(f"🧹 Filtering board files to closed-only rows before import: {len(board_files)} file(s)")
             filtered_paths = []

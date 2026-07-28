@@ -28,6 +28,7 @@ class MlsAutoUpdateWorkflowTests(unittest.TestCase):
             pbc_download_dir="output/pbc_exports",
             pbc_backup_dir="tmp",
             skip_snapshot_refresh=False,
+            skip_active_reconciliation=False,
         )
 
         def record(name, result=None):

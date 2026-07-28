@@ -90,6 +90,16 @@ def _new_listing_code_mask(df):
     return _listing_number_series(df).str.match(r"^(?:B\d+|R\d+)$", na=False)
 
 
+def _listing_source_rank(df):
+    """Rank current source codes for exact-identity winner selection."""
+    listing_numbers = _listing_number_series(df)
+    rank = pd.Series(3, index=df.index, dtype="int64")
+    rank.loc[listing_numbers.str.match(r"^B\d+$", na=False)] = 0
+    rank.loc[listing_numbers.str.match(r"^R\d+$", na=False)] = 1
+    rank.loc[listing_numbers.str.startswith("RX-")] = 2
+    return rank
+
+
 def _inventory_identity_series(df):
     """Build a unit-aware exact identity for inventory deduplication.
 
@@ -145,7 +155,7 @@ def inventory_eligibility_mask(df, as_of_date=None):
         },
         index=df.index[new_rows],
     )
-    rank_frame["source_rank"] = _new_listing_code_mask(df).loc[new_rows].map({True: 0, False: 1})
+    rank_frame["source_rank"] = _listing_source_rank(df).loc[new_rows]
     winners = (
         rank_frame.sort_values(
             ["identity", "listing_date", "source_rank", "status_change_date", "listing_number"],
