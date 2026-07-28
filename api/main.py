@@ -1238,8 +1238,10 @@ def _postgres_report_period_metrics(
                 {_postgres_inventory_identity_expr('d')} AS inventory_identity,
                 CASE
                     WHEN UPPER(COALESCE(d.listing_number, '')) LIKE 'B%'
-                      OR UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
-                    THEN 0 ELSE 1
+                    THEN 0
+                    WHEN UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
+                    THEN 1
+                    ELSE 2
                 END AS source_rank
             FROM listing_details d
             CROSS JOIN bounds b
@@ -1257,7 +1259,7 @@ def _postgres_report_period_metrics(
             SELECT DISTINCT p.period_key, s.inventory_identity
             FROM inventory_periods p
             CROSS JOIN inventory_source s
-            WHERE s.source_rank = 0
+            WHERE s.source_rank IN (0, 1)
               AND s.listing_date IS NOT NULL
               AND s.listing_date < (p.period_end + INTERVAL '1 day')
               AND s.inventory_identity <> ''
@@ -1271,7 +1273,7 @@ def _postgres_report_period_metrics(
                     s.listing_number
                 FROM inventory_source s
                 WHERE s.listing_date IS NOT NULL
-                  AND s.source_rank = 0
+                  AND s.source_rank IN (0, 1)
                   AND s.listing_date < (p.period_end + INTERVAL '1 day')
                   AND s.inventory_identity <> ''
                 ORDER BY s.inventory_identity,
@@ -1446,8 +1448,10 @@ def _postgres_period_series(
                 {_postgres_inventory_identity_expr('d')} AS inventory_identity,
                 CASE
                     WHEN UPPER(COALESCE(d.listing_number, '')) LIKE 'B%'
-                      OR UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
-                    THEN 0 ELSE 1
+                    THEN 0
+                    WHEN UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
+                    THEN 1
+                    ELSE 2
                 END AS source_rank
             FROM listing_details d
             WHERE UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%'
@@ -1457,7 +1461,7 @@ def _postgres_period_series(
             SELECT DISTINCT p.period_key, s.inventory_identity
             FROM inventory_periods p
             CROSS JOIN inventory_source s
-            WHERE s.source_rank = 0
+            WHERE s.source_rank IN (0, 1)
               AND s.listing_date IS NOT NULL
               AND s.listing_date < (p.period_end + INTERVAL '1 day')
               AND s.inventory_identity <> ''
@@ -1471,7 +1475,7 @@ def _postgres_period_series(
                     s.listing_number
                 FROM inventory_source s
                 WHERE s.listing_date IS NOT NULL
-                  AND s.source_rank = 0
+                  AND s.source_rank IN (0, 1)
                   AND s.listing_date < (p.period_end + INTERVAL '1 day')
                   AND s.inventory_identity <> ''
                 ORDER BY s.inventory_identity,

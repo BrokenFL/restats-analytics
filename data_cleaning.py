@@ -15,6 +15,8 @@ from city_utils import canonical_city_name
 
 # --- 1. SETUP & CONFIGURATION ---
 
+ACTIVE_INVENTORY_STATUSES = ("A", "ACTIVE", "ACT", "CS", "COMING SOON")
+
 # Configure Logging
 log_dir = "logs"
 os.makedirs(log_dir, exist_ok=True)
@@ -646,18 +648,21 @@ def _addr_norm(v):
 
 def _mls_canonical_rank(listing_number: str) -> int:
     """
-    Lower is better. New FlexMLS `B...`/`R...` records outrank legacy `RX-...` records.
+    Lower is better. New FlexMLS `B...` records outrank ordinary `R...`
+    records, which outrank legacy `RX-...` records.
     """
     s = str(listing_number).upper().strip()
-    if re.fullmatch(r"(?:B|R)\d+", s):
+    if re.fullmatch(r"B\d+", s):
         return 0
-    if s.startswith("RX-"):
+    if re.fullmatch(r"R\d+", s):
         return 1
-    if s.startswith("AX-"):
+    if s.startswith("RX-"):
         return 2
-    if s.startswith("TX-"):
+    if s.startswith("AX-"):
         return 3
-    return 4
+    if s.startswith("TX-"):
+        return 4
+    return 5
 
 
 def _is_primary_mls(v) -> bool:
@@ -1187,6 +1192,88 @@ def backfill_missing_city_in_db(conn) -> int:
     return len(updates)
 
 
+def reconcile_stale_active_inventory(conn, incoming_df: pd.DataFrame, refreshed_at=None) -> dict:
+    """Retire active rows absent from an explicitly authoritative city refresh.
+
+    The normal importer is an upsert because historical sold rows must remain in
+    the database. A full city MLS refresh is different: its active rows are the
+    current source of truth, so an older active row that is missing from that
+    refresh must stop counting as current inventory. We preserve the row and
+    history, but set the derived ``effective_active_end_date`` to the refresh
+    timestamp. This helper is only called by the guarded full-refresh path.
+    """
+    required = {"listing_number", "city", "status"}
+    if incoming_df.empty or not required.issubset(incoming_df.columns):
+        return {"cities": {}, "retired_total": 0}
+
+    incoming = incoming_df[["listing_number", "city", "status"]].copy()
+    incoming["listing_number"] = incoming["listing_number"].astype(str).str.upper().str.strip()
+    incoming["city"] = incoming["city"].map(canonical_city_name)
+    incoming["city_key"] = incoming["city"].fillna("").astype(str).str.upper().str.strip()
+    incoming["status_key"] = incoming["status"].astype(str).str.upper().str.strip()
+    incoming = incoming[
+        incoming["listing_number"].ne("")
+        & incoming["city_key"].ne("")
+        & incoming["status_key"].isin(ACTIVE_INVENTORY_STATUSES)
+    ]
+    if incoming.empty:
+        return {"cities": {}, "retired_total": 0}
+
+    refresh_ts = pd.Timestamp(refreshed_at) if refreshed_at is not None else pd.Timestamp.now()
+    refresh_ts = refresh_ts.normalize()
+    refresh_value = refresh_ts.to_pydatetime().replace(microsecond=0).isoformat(sep=" ")
+    status_placeholders = ",".join("?" for _ in ACTIVE_INVENTORY_STATUSES)
+    city_stats = {}
+    retired_total = 0
+
+    for city_key, city_rows in incoming.groupby("city_key", sort=True):
+        incoming_ids = set(city_rows["listing_number"])
+        params = [city_key, *ACTIVE_INVENTORY_STATUSES, refresh_value]
+        existing = pd.read_sql_query(
+            f"""
+            SELECT listing_number
+            FROM listing_details
+            WHERE UPPER(TRIM(COALESCE(city, ''))) = ?
+              AND UPPER(TRIM(COALESCE(status, ''))) IN ({status_placeholders})
+              AND UPPER(TRIM(COALESCE(listing_number, ''))) NOT LIKE 'PBC-%'
+              AND (
+                    effective_active_end_date IS NULL
+                 OR DATE(effective_active_end_date) >= DATE(?)
+              )
+            """,
+            conn,
+            params=params,
+        )
+        existing_ids = set(existing["listing_number"].astype(str).str.upper().str.strip())
+        stale_ids = sorted(existing_ids - incoming_ids)
+
+        if stale_ids:
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"""
+                UPDATE listing_details
+                   SET effective_active_end_date = ?
+                 WHERE listing_number IN ({placeholders})
+                   AND (
+                         effective_active_end_date IS NULL
+                      OR DATE(effective_active_end_date) >= DATE(?)
+                   )
+                """,
+                (refresh_value, *stale_ids, refresh_value),
+            )
+            retired_total += len(stale_ids)
+
+        city_stats[city_key] = {
+            "incoming_active": len(incoming_ids),
+            "existing_active": len(existing_ids),
+            "retired": len(stale_ids),
+        }
+
+    if retired_total:
+        conn.commit()
+    return {"cities": city_stats, "retired_total": retired_total, "refreshed_at": refresh_value}
+
+
 def infer_missing_city(conn, incoming_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
     Infer missing city values for incoming MLS rows using:
@@ -1364,7 +1451,13 @@ def clean_csv(file_stream, lookup_dict, property_type_overrides=None):
         if col not in final_df.columns: final_df[col] = pd.NA
     return final_df
 
-def process_and_load_data(csv_files, db_filename, create_new=False):
+def process_and_load_data(
+    csv_files,
+    db_filename,
+    create_new=False,
+    reconcile_active_inventory=False,
+    refresh_date=None,
+):
     """
     Orchestrates the Loading -> Cleaning -> Upserting workflow.
     """
@@ -1461,6 +1554,10 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
         except Exception as e:
             logger.error(f"City inference error: {e}")
 
+        # Preserve active IDs from the authoritative refresh before duplicate
+        # cleanup can discard an incoming row in favor of an older DB row.
+        authoritative_active_frame = final_merged.copy()
+
         # Preserve richer values from weaker old MLS rows before an incoming R-record replaces them.
         try:
             final_merged, inherited_rows, inherited_fields = backfill_incoming_from_existing_mls(
@@ -1501,6 +1598,18 @@ def process_and_load_data(csv_files, db_filename, create_new=False):
         for col in db_columns:
             if col not in final_merged.columns: final_merged[col] = pd.NA
         final_merged = final_merged[db_columns]
+
+        if reconcile_active_inventory:
+            reconciliation = reconcile_stale_active_inventory(
+                data_loader.conn,
+                authoritative_active_frame,
+                refreshed_at=refresh_date,
+            )
+            logger.info(
+                "Full-refresh active inventory reconciliation: retired %s stale rows; cities=%s",
+                reconciliation.get("retired_total", 0),
+                reconciliation.get("cities", {}),
+            )
 
         logger.info(f"Inserting {len(final_merged)} records...")
         try:

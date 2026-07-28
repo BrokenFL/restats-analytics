@@ -1,10 +1,11 @@
+import sqlite3
 import unittest
 
 import pandas as pd
 
 import data_analysis_functions as daf
 from api.main import _is_active_as_of_mask, _is_active_now_mask
-from data_cleaning import _mls_canonical_rank
+from data_cleaning import _mls_canonical_rank, reconcile_stale_active_inventory
 
 
 def listing(
@@ -111,8 +112,51 @@ class InventoryEligibilityTests(unittest.TestCase):
 
     def test_b_is_current_rank_with_r_and_outranks_rx(self):
         self.assertEqual(_mls_canonical_rank("B26017908"), 0)
-        self.assertEqual(_mls_canonical_rank("R11170001"), 0)
-        self.assertEqual(_mls_canonical_rank("RX-11100001"), 1)
+        self.assertEqual(_mls_canonical_rank("R11170001"), 1)
+        self.assertEqual(_mls_canonical_rank("RX-11100001"), 2)
+
+    def test_full_city_refresh_retires_absent_active_rows_but_preserves_history(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE listing_details (
+                listing_number TEXT PRIMARY KEY,
+                city TEXT,
+                status TEXT,
+                effective_active_end_date TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO listing_details VALUES (?, ?, ?, ?)",
+            [
+                ("R11163959", "Wellington", "A", None),
+                ("R11104016", "Wellington", "A", None),
+                ("R11100001", "Wellington", "A", None),
+                ("RX-11100002", "Wellington", "C", "2026-03-01 00:00:00"),
+                ("PBC-734144-2026", "Wellington", "A", None),
+            ],
+        )
+
+        incoming = pd.DataFrame(
+            [
+                listing("B26017908", short_address="3704 Siena Circle"),
+                listing("B26037464", short_address="4023 Siena Circle"),
+                listing("B26034889", short_address="4452 Siena Circle"),
+                listing("B26021340", short_address="4591 Siena Circle"),
+                listing("R11100001", short_address="1 Main Street"),
+            ]
+        )
+
+        result = reconcile_stale_active_inventory(conn, incoming, refreshed_at="2026-07-28")
+        self.assertEqual(result["retired_total"], 2)
+        rows = dict(conn.execute("SELECT listing_number, effective_active_end_date FROM listing_details").fetchall())
+        self.assertEqual(rows["R11163959"], "2026-07-28 00:00:00")
+        self.assertEqual(rows["R11104016"], "2026-07-28 00:00:00")
+        self.assertIsNone(rows["R11100001"])
+        self.assertIsNone(rows["PBC-734144-2026"])
+        self.assertEqual(rows["RX-11100002"], "2026-03-01 00:00:00")
+        conn.close()
 
 
 if __name__ == "__main__":
