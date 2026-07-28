@@ -646,10 +646,10 @@ def _addr_norm(v):
 
 def _mls_canonical_rank(listing_number: str) -> int:
     """
-    Lower is better. New FlexMLS `R...` records outrank legacy `RX-...` records.
+    Lower is better. New FlexMLS `B...`/`R...` records outrank legacy `RX-...` records.
     """
     s = str(listing_number).upper().strip()
-    if re.fullmatch(r"R\d+", s):
+    if re.fullmatch(r"(?:B|R)\d+", s):
         return 0
     if s.startswith("RX-"):
         return 1
