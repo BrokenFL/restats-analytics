@@ -34,33 +34,39 @@ def run_and_stream(cmd, cwd, log_path):
     return code
 
 
-def build_mls_cmd(run_ts, cities, max_export_records):
-    return (
-        "python3 -u CMA/mls_quicksearch_export_from_cma.py "
-        "--search-mode city "
+def build_refresh_cmd(run_ts, cities, max_export_records, skip_mls=False, skip_pbc=False):
+    """Build the single guarded runner command used by scheduled refreshes."""
+    del run_ts  # retained in the function signature for log/CLI compatibility
+    cmd = (
+        "python3 -u scripts/ops/run_mls_auto_update.py "
         f"--cities {shlex.quote(cities)} "
-        "--derive-from-db "
-        "--export-each-search "
-        "--import-to-db "
         "--headless "
-        f"--download-dir {shlex.quote(f'output/mls_exports/automation_{run_ts}')} "
-        f"--debug-dir {shlex.quote(f'output/mls_debug/automation_{run_ts}')} "
-        '--db-file "mls.db" '
-        '--backup-dir "backups" '
-        f"--max-export-records {int(max_export_records)}"
+        f"--max-export-records {int(max_export_records)} "
+        "--mls-overlap-days 45 "
+        "--closed-lookback-days 180 "
+        "--pbc-overlap-days 90"
+    )
+    if skip_mls:
+        cmd += " --skip-mls"
+    if skip_pbc:
+        cmd += " --skip-pbc"
+    return cmd
+
+
+def build_mls_cmd(run_ts, cities, max_export_records):
+    """Backward-compatible alias for callers that schedule the full refresh."""
+    return (
+        build_refresh_cmd(
+            run_ts,
+            cities,
+            max_export_records,
+            skip_pbc=True,
+        )
     )
 
 
 def build_pbc_cmd(run_ts, cities):
-    return (
-        "python3 -u run_pbc_city_refresh.py "
-        f"--cities {shlex.quote(cities)} "
-        "--from-last-imported "
-        "--headless "
-        f"--download-dir {shlex.quote(f'output/pbc_exports/automation_{run_ts}')} "
-        '--db-file "mls.db" '
-        '--backup-dir "backups"'
-    )
+    return build_refresh_cmd(run_ts, cities, 4000, skip_mls=True)
 
 
 def parse_args():
@@ -85,25 +91,21 @@ def main():
 
     failures = []
 
-    if not args.skip_mls:
-        mls_code = run_and_stream(
-            build_mls_cmd(run_ts, args.cities, args.max_export_records),
+    if not args.skip_mls or not args.skip_pbc:
+        refresh_code = run_and_stream(
+            build_refresh_cmd(
+                run_ts,
+                args.cities,
+                args.max_export_records,
+                skip_mls=args.skip_mls,
+                skip_pbc=args.skip_pbc,
+            ),
             cwd=project_root,
             log_path=log_path,
         )
-        print(f"mls_exit_code={mls_code}")
-        if mls_code != 0:
-            failures.append(f"mls_exit_code={mls_code}")
-
-    if not args.skip_pbc and not failures:
-        pbc_code = run_and_stream(
-            build_pbc_cmd(run_ts, args.cities),
-            cwd=project_root,
-            log_path=log_path,
-        )
-        print(f"pbc_exit_code={pbc_code}")
-        if pbc_code != 0:
-            failures.append(f"pbc_exit_code={pbc_code}")
+        print(f"refresh_exit_code={refresh_code}")
+        if refresh_code != 0:
+            failures.append(f"refresh_exit_code={refresh_code}")
 
     if failures:
         print("market_refresh_status=error")

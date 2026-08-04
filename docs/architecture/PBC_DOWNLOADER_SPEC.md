@@ -38,7 +38,8 @@ This document explains how the off-market sales downloader works in this project
 - `--city` municipality name
 - `--start-date MM/DD/YYYY`
 - `--end-date MM/DD/YYYY`
-- `--from-last-imported` (auto starts at last imported PBC sold date +1 day)
+- `--from-last-imported` (auto starts at the last imported PBC sold date minus the configured overlap; default 90 days)
+- `--overlap-days N` (bounded re-read window for late-arriving county sales; importer deduplicates overlapping rows)
 - `--non-interactive` (no prompts)
 
 Example:

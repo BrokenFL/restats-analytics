@@ -7,8 +7,43 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Volumes/ExternalSSD/projects/restats-analytics/scripts/ops/run_mls_auto_update.sh</string>
+        <string>/usr/bin/osascript</string>
+        <string>-e</string>
+        <string>do shell script "cd /Users/brookesnader; /bin/rm -f /Users/brookesnader/Library/Logs/ReStats/mls-auto-update.status"</string>
+        <string>-e</string>
+        <string>tell application "Terminal" to do script "cd /Volumes/ExternalSSD/projects/restats-analytics; /bin/zsh /Volumes/ExternalSSD/projects/restats-analytics/scripts/ops/run_mls_auto_update.sh &gt;&gt; /Users/brookesnader/Library/Logs/ReStats/mls-auto-update-terminal.log 2&gt;&amp;1; exit_code=$?; echo exit_code=$exit_code &gt; /Users/brookesnader/Library/Logs/ReStats/mls-auto-update.status; exit $exit_code"</string>
+        <string>-e</string>
+        <string>set deadline to (current date) + 7200</string>
+        <string>-e</string>
+        <string>repeat</string>
+        <string>-e</string>
+        <string>try</string>
+        <string>-e</string>
+        <string>set statusText to do shell script "cd /Users/brookesnader; /bin/cat /Users/brookesnader/Library/Logs/ReStats/mls-auto-update.status"</string>
+        <string>-e</string>
+        <string>exit repeat</string>
+        <string>-e</string>
+        <string>on error</string>
+        <string>-e</string>
+        <string>if (current date) is greater than deadline then error "Timed out waiting for the ReStats MLS status marker."</string>
+        <string>-e</string>
+        <string>delay 5</string>
+        <string>-e</string>
+        <string>end repeat</string>
+        <string>-e</string>
+        <string>if statusText does not contain "exit_code=0" then error statusText</string>
     </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brookesnader</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/brookesnader</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <false/>
@@ -22,9 +57,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Volumes/ExternalSSD/projects/restats-analytics/logs/launchagent_mls_auto_update.out.log</string>
+    <string>/Users/brookesnader/Library/Logs/ReStats/mls-auto-update.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Volumes/ExternalSSD/projects/restats-analytics/logs/launchagent_mls_auto_update.err.log</string>
+    <string>/Users/brookesnader/Library/Logs/ReStats/mls-auto-update.err.log</string>
 </dict>
 </plist>

@@ -8,7 +8,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -39,6 +39,8 @@ FLEXMLS_RESOURCE_CARD_HREF = "https://flr.flexmls.com/openid_rp?provider_id=71"
 ALL_STATUS_CODES = ["A", "H", "P", "PWC_U", "C", "E", "W", "O", "L"]
 FULL_CITY_REFRESH_CITIES = {"SOUTH PALM BEACH"}
 MAX_EXPORT_RECORDS = 4000
+DEFAULT_DB_OVERLAP_DAYS = 45
+PAGE_LOAD_TIMEOUT_SEC = 60
 RESIDENTIAL_QUICK_SEARCH_TEMPLATE_ID = "20231129214456095779000000"
 RESIDENTIAL_QUICK_SEARCH_VIEW_ID = "20231129213900299116000000"
 ENV_CANDIDATE_FILES = (
@@ -62,6 +64,14 @@ KEYCHAIN_EMAIL_SERVICES = (
     "FlexMLS",
     "MLS",
 )
+
+
+def _navigate(driver, url: str) -> None:
+    """Navigate without allowing a third-party resource to hang the scan forever."""
+    try:
+        driver.get(url)
+    except TimeoutException:
+        print(f"navigation_timeout url={url}; continuing with the loaded document", file=sys.stderr)
 
 
 def _load_local_env_defaults() -> None:
@@ -479,7 +489,7 @@ def _wait_for_flex_shell(
                 _capture_debug(driver, debug_dir, "resource_panels_launch_flex")
             except Exception:
                 try:
-                    driver.get(FLEXMLS_RESOURCE_CARD_HREF)
+                    _navigate(driver, FLEXMLS_RESOURCE_CARD_HREF)
                 except Exception:
                     pass
             time.sleep(1.0)
@@ -494,7 +504,7 @@ def _wait_for_flex_shell(
 
         # Flex occasionally returns a transient 500 on callback; retry entrypoint.
         if "Internal Server Error (500)" in title or "openid_rp/assets/flexmls_rails_http_status/error" in driver.page_source:
-            driver.get(START_URL)
+            _navigate(driver, START_URL)
             time.sleep(1.0)
             continue
 
@@ -519,7 +529,7 @@ def _wait_for_flex_shell(
             else:
                 # Force callback path again when page stays on spinner.
                 if "oauth/authorize" in url or "Authorize" in title:
-                    driver.get(START_URL)
+                    _navigate(driver, START_URL)
 
         if "apps.flexmls.com/ticket" in url:
             _handle_ticket_login_if_present(driver, wait, username=username, password=password)
@@ -531,7 +541,7 @@ def _wait_for_flex_shell(
 
 
 def login(driver, wait: WebDriverWait, email: str, password: str, debug_dir: str) -> None:
-    driver.get(LOGIN_URL)
+    _navigate(driver, LOGIN_URL)
     _capture_debug(driver, debug_dir, "start_url")
     try:
         wait.until(EC.url_contains(LOGIN_PAGE_URL_FRAGMENT))
@@ -587,7 +597,7 @@ def login(driver, wait: WebDriverWait, email: str, password: str, debug_dir: str
 
 def _open_quick_search(driver, wait: WebDriverWait, debug_dir: str) -> None:
     _set_residential_quick_search_preferences(driver)
-    driver.get(QUICK_SEARCH_URL)
+    _navigate(driver, QUICK_SEARCH_URL)
     _switch_to_latest_window(driver)
     found = _switch_to_context_with_selector(driver, "#enabled_7, #t_7, input[name='t_7']", timeout_sec=30)
     if not found:
@@ -1116,7 +1126,13 @@ def _wait_for_csv(download_dir: str, timeout_sec: int = 180):
     raise TimeoutException(f"CSV did not download in {download_dir} within {timeout_sec}s")
 
 
-def _derive_from_date_from_db(db_file: str, cities) -> str:
+def _derive_from_date_from_db(
+    db_file: str,
+    cities,
+    overlap_days: int = DEFAULT_DB_OVERLAP_DAYS,
+) -> str:
+    if overlap_days < 0:
+        raise SystemExit("--overlap-days must be zero or greater.")
     city_vals = [str(c).strip().upper() for c in cities if str(c).strip()]
     if not city_vals:
         raise SystemExit("No cities supplied for DB-derived start date.")
@@ -1145,7 +1161,8 @@ def _derive_from_date_from_db(db_file: str, cities) -> str:
     max_dt = max(pd.to_datetime(v, errors="coerce") for v in candidates)
     if pd.isna(max_dt):
         raise SystemExit(f"Could not derive a valid start date for cities: {', '.join(cities)}")
-    return max_dt.strftime("%m/%d/%Y")
+    start_dt = max_dt - timedelta(days=overlap_days)
+    return start_dt.strftime("%m/%d/%Y")
 
 
 def _should_skip_from_date(cities) -> bool:
@@ -2071,7 +2088,13 @@ def parse_args():
     p.add_argument(
         "--derive-from-db",
         action="store_true",
-        help="Derive --from-date from the latest date already present in the DB for the selected city/cities.",
+        help="Derive --from-date from the latest date already present in the DB, with the configured overlap.",
+    )
+    p.add_argument(
+        "--overlap-days",
+        type=int,
+        default=DEFAULT_DB_OVERLAP_DAYS,
+        help="Days to overlap the DB-derived status-date cutoff to capture late updates.",
     )
     p.add_argument(
         "--db-file",
@@ -2178,7 +2201,11 @@ def main():
                 row["from_date"] = ""
                 print(f"derived_from_date[{row['name']}]=SKIPPED_FULL_CITY_REFRESH")
             else:
-                row["from_date"] = _derive_from_date_from_db(args.db_file, row["cities"])
+                row["from_date"] = _derive_from_date_from_db(
+                    args.db_file,
+                    row["cities"],
+                    overlap_days=args.overlap_days,
+                )
                 print(f"derived_from_date[{row['name']}]={row['from_date']}")
     elif args.from_date:
         for row in search_terms:
@@ -2195,6 +2222,7 @@ def main():
     Path(args.debug_dir).mkdir(parents=True, exist_ok=True)
 
     options = webdriver.ChromeOptions()
+    options.page_load_strategy = "eager"
     if args.headless:
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1502,900")
@@ -2214,6 +2242,11 @@ def main():
     service_port = _pick_chromedriver_port(args.chromedriver_port)
     print(f"chromedriver_port={service_port}")
     driver = webdriver.Chrome(service=Service(port=service_port), options=options)
+    # Selenium 4.43 exposes the HTTP timeout through the command executor's
+    # client config; using it avoids the deprecated set_timeout() call.
+    driver.command_executor._client_config.timeout = PAGE_LOAD_TIMEOUT_SEC
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SEC)
+    driver.set_script_timeout(PAGE_LOAD_TIMEOUT_SEC)
     try:
         driver.execute_cdp_cmd(
             "Page.setDownloadBehavior",

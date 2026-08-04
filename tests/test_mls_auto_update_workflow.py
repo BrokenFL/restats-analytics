@@ -29,6 +29,10 @@ class MlsAutoUpdateWorkflowTests(unittest.TestCase):
             pbc_backup_dir="tmp",
             skip_snapshot_refresh=False,
             skip_active_reconciliation=False,
+            mls_overlap_days=45,
+            closed_lookback_days=180,
+            skip_closed_backfill=True,
+            pbc_overlap_days=90,
         )
 
         def record(name, result=None):
@@ -72,6 +76,22 @@ class MlsAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertLess(calls.index("pbc"), calls.index("cleanup"))
         self.assertLess(calls.index("cleanup"), calls.index("sync"))
         self.assertLess(calls.index("sync"), calls.index("snapshot"))
+
+    @patch.object(workflow.subprocess, "run")
+    def test_derived_city_refresh_passes_overlap(self, run):
+        workflow._run_city_refresh(
+            city="Palm Beach",
+            template="AIDataSet",
+            headless=True,
+            status_mode="all",
+            from_date=None,
+            reconcile_active_inventory=False,
+            overlap_days=45,
+        )
+        command = run.call_args.args[0]
+        self.assertIn("--derive-from-db", command)
+        self.assertIn("--overlap-days", command)
+        self.assertIn("45", command)
 
 
 if __name__ == "__main__":

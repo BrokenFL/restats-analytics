@@ -72,6 +72,15 @@ def get_last_imported_pbc_sale_date(target_city=None):
         return None
 
 
+def pbc_overlap_start_date(latest, overlap_days=90):
+    """Return the inclusive PBC start date after applying a late-arrival overlap."""
+    if overlap_days < 0:
+        raise ValueError("PBC overlap days must be zero or greater")
+    if latest is None:
+        return None
+    return latest - timedelta(days=overlap_days)
+
+
 def get_existing_sales_from_db():
     """
     Load existing PCN + Sale Date combinations from the database.
@@ -685,6 +694,7 @@ def run_scraper(
     headless=False,
     download_folder=None,
     chromedriver_port=9516,
+    last_imported_overlap_days=90,
 ):
     # --- PHASE 0: USER INPUTS ---
     print("\n--- PBC Property Scraper Configuration ---")
@@ -717,8 +727,12 @@ def run_scraper(
     if use_last_imported and not start_date:
         latest = get_last_imported_pbc_sale_date(target_city if search_mode == "municipality" else None)
         if latest:
-            start_date = (latest + timedelta(days=1)).strftime("%m/%d/%Y")
-            print(f"✓ Using last imported PBC date +1 day: {start_date}")
+            overlap_start = pbc_overlap_start_date(latest, last_imported_overlap_days)
+            start_date = overlap_start.strftime("%m/%d/%Y")
+            print(
+                "✓ Using last imported PBC date minus "
+                f"{last_imported_overlap_days} day overlap: {start_date}"
+            )
         else:
             print("Note: No prior PBC import date found; using default start date.")
 
@@ -1228,7 +1242,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--from-last-imported",
         action="store_true",
-        help="Set start date to last imported PBC sold_date + 1 day (optionally filtered by city)."
+        help="Set start date to the last imported PBC sold_date minus the configured overlap (optionally filtered by city)."
+    )
+    parser.add_argument(
+        "--overlap-days",
+        type=int,
+        default=90,
+        help="Days to overlap the last imported PBC sold-date watermark.",
     )
     parser.add_argument(
         "--non-interactive",
@@ -1260,6 +1280,7 @@ if __name__ == "__main__":
         headless=args.headless,
         download_folder=args.download_dir,
         chromedriver_port=args.chromedriver_port,
+        last_imported_overlap_days=args.overlap_days,
     )
     if isinstance(result, dict):
         print(f"result_status={result.get('status')}")

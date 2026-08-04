@@ -41,9 +41,34 @@ class CityExportStampingTests(unittest.TestCase):
                     ),
                 )
             self.assertEqual(
-                _derive_from_date_from_db(str(path), ["Palm Beach"]),
+                _derive_from_date_from_db(str(path), ["Palm Beach"], overlap_days=0),
                 (today - timedelta(days=1)).strftime("%m/%d/%Y"),
             )
+
+    def test_derived_start_date_applies_configured_overlap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mls.db"
+            today = date.today()
+            with sqlite3.connect(path) as conn:
+                conn.execute(
+                    """CREATE TABLE listing_details (
+                        city TEXT, listing_date TEXT, status_change_date TEXT,
+                        under_contract_date TEXT, sold_date TEXT, withdrawn_date TEXT,
+                        temp_off_market_date TEXT, cancel_date TEXT, expiration_date TEXT
+                    )"""
+                )
+                conn.execute(
+                    "INSERT INTO listing_details (city, sold_date) VALUES (?, ?)",
+                    ("Palm Beach", (today - timedelta(days=1)).isoformat()),
+                )
+            self.assertEqual(
+                _derive_from_date_from_db(str(path), ["Palm Beach"], overlap_days=7),
+                (today - timedelta(days=8)).strftime("%m/%d/%Y"),
+            )
+
+    def test_negative_overlap_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            _derive_from_date_from_db(":memory:", ["Palm Beach"], overlap_days=-1)
 
 
 if __name__ == "__main__":

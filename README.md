@@ -198,7 +198,7 @@ Current menu options:
 - Interactive scraper:
   - `python3 PalmBeachProrpertyScraper.py`
 - Automation mode:
-  - `python3 PalmBeachProrpertyScraper.py --city "Palm Beach" --from-last-imported`
+  - `python3 PalmBeachProrpertyScraper.py --city "Palm Beach" --from-last-imported --overlap-days 90`
 - Custom date range:
   - `python3 PalmBeachProrpertyScraper.py --city "Palm Beach" --start-date 01/01/2024 --end-date 12/31/2024`
 - Import scraped CSV:
@@ -242,7 +242,7 @@ Current menu options:
 ## Unattended MLS auto-update runner
 
 - Non-interactive runner:
-  - `python3 scripts/ops/run_mls_auto_update.py --headless`
+  - `python3 scripts/ops/run_mls_auto_update.py --headless` (45-day MLS overlap, 180-day closed-history safety pass, 90-day PBC overlap, parity gate)
 - Default flow now includes both:
   - MLS quick-search refresh/import for the configured markets
   - county off-market municipality refresh/import for the same markets
@@ -252,11 +252,12 @@ Current menu options:
   - `scripts/ops/run_mls_auto_update.sh`
 - LaunchAgent template:
   - `scripts/ops/com.brookesnader.restats.mls-auto-update.plist`
+- The LaunchAgent starts the guarded wrapper through the user-session Terminal (the external SSD checkout is not readable by a background launchd process on this Mac), waits for the Terminal job, propagates its exit code, and logs under `~/Library/Logs/ReStats/`; the wrapper fails if the SSD checkout or package environment is unavailable.
 - Cloud sync runner:
   - `python3 scripts/ops/sync_sqlite_to_supabase.py`
 - Important macOS note:
   - the current SSD repo path is `/Volumes/ExternalSSD/projects/restats-analytics`
-  - the checked-in LaunchAgent template now runs the SSD wrapper script directly
+  - the checked-in LaunchAgent template starts the SSD wrapper through the logged-in user session's Terminal because background launchd cannot read this external-volume checkout on this Mac
   - the checked-in LaunchAgent template is scheduled for `9:15 PM` local time and does not force an immediate run when installed
 - The auto-update runner now follows one ordered refresh flow by default:
   - refresh local SQLite from MLS

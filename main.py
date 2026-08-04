@@ -96,11 +96,15 @@ def _latest_pbc_sold_date(city=None):
         return None
 
 
-def get_last_pbc_date_plus_one(city=None, fallback_global=True):
+def get_last_pbc_date_plus_one(city=None, fallback_global=True, overlap_days=90):
     """
-    Resolve incremental PBC start date MM/DD/YYYY from latest imported sold_date.
+    Resolve an overlapped PBC start date from the latest imported sold_date.
+    The legacy function name is retained for callers, but the start date is
+    intentionally moved backwards to capture late-arriving county records.
     Returns dict with city/global baselines for logging.
     """
+    if overlap_days < 0:
+        raise ValueError("PBC overlap days must be zero or greater")
     city_latest = _latest_pbc_sold_date(city) if city else None
     global_latest = _latest_pbc_sold_date(None)
     baseline = city_latest or (global_latest if fallback_global else None)
@@ -111,8 +115,9 @@ def get_last_pbc_date_plus_one(city=None, fallback_global=True):
             "global_latest": global_latest,
             "baseline": None,
             "source": "none",
+            "overlap_days": overlap_days,
         }
-    dt = datetime.strptime(baseline, "%Y-%m-%d") + timedelta(days=1)
+    dt = datetime.strptime(baseline, "%Y-%m-%d") - timedelta(days=overlap_days)
     source = "city" if city_latest else "global_fallback"
     return {
         "start_date": dt.strftime("%m/%d/%Y"),
@@ -120,6 +125,7 @@ def get_last_pbc_date_plus_one(city=None, fallback_global=True):
         "global_latest": global_latest,
         "baseline": baseline,
         "source": source,
+        "overlap_days": overlap_days,
     }
 
 def clear_screen():
@@ -960,13 +966,13 @@ def run_off_market_scraper_automation():
     """
     Automated off-market full pipeline:
     - Cities: Palm Beach + Wellington
-    - Per-city start date: last imported PBC sold_date + 1 day
+    - Per-city start date: last imported PBC sold_date minus a 90-day overlap
     - Import each newly generated ENHANCED CSV into DB
     - Run cabana merge in DB
     """
     print("\n--- Off-Market Full Pipeline (Automation Mode v2: Palm Beach + Wellington) ---")
     target_cities = ["Palm Beach", "Wellington"]
-    print("Cities: Palm Beach + Wellington | Date mode: per-city incremental from last imported PBC sold date (+1 day)")
+    print("Cities: Palm Beach + Wellington | Date mode: per-city incremental with a 90-day late-arrival overlap")
     started_ts = datetime.now().isoformat(timespec="seconds")
     city_runs = []
     try:
@@ -977,7 +983,7 @@ def run_off_market_scraper_automation():
             if date_meta["start_date"]:
                 print(
                     f"\nCity: {city} | incremental from {date_meta['source']} baseline "
-                    f"{date_meta['baseline']} (+1 day => {date_meta['start_date']})"
+                    f"{date_meta['baseline']} (-{date_meta['overlap_days']} days => {date_meta['start_date']})"
                 )
             else:
                 print(f"\nCity: {city} | no prior PBC sold_date found; scraper default will be used")
@@ -991,7 +997,7 @@ def run_off_market_scraper_automation():
             if date_meta["start_date"]:
                 cmd.extend(["--start-date", date_meta["start_date"]])
             else:
-                cmd.append("--from-last-imported")
+                cmd.extend(["--from-last-imported", "--overlap-days", "90"])
             try:
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError as city_err:
@@ -1125,7 +1131,8 @@ def run_off_market_scraper_custom():
         start_date = date_meta["start_date"]
         print(
             f"Using incremental start date for {city}: {start_date} "
-            f"(baseline {date_meta['baseline']} from {date_meta['source']})"
+            f"(baseline {date_meta['baseline']} from {date_meta['source']}, "
+            f"-{date_meta['overlap_days']} day overlap)"
         )
     started_ts = datetime.now().isoformat(timespec="seconds")
     started_at = time.time()
@@ -1230,77 +1237,24 @@ def run_off_market_scraper_custom():
 
 def run_mls_update_automation():
     """
-    Automated MLS update pipeline using fresh city Quick Search exports.
+    Run the shared MLS pipeline used by scheduled operations.
+
+    Keeping this menu action as a thin wrapper prevents it from drifting away
+    from the rolling closed-history refresh and source-parity publication gate.
     """
     print("\n--- MLS Update (Fresh city search -> export -> import) ---")
     print("Markets: " + ", ".join(DEFAULT_MLS_MARKETS))
-    started_ts = datetime.now().isoformat(timespec="seconds")
-    template = "AIDataSet"
-    city_runs = []
-
+    cmd = [
+        sys.executable,
+        os.path.join("scripts", "ops", "run_mls_auto_update.py"),
+        "--skip-pbc",
+    ]
     try:
-        for city in DEFAULT_MLS_MARKETS:
-            city_slug = slugify_label(city)
-            cmd = [
-                sys.executable,
-                "CMA/mls_quicksearch_export_from_cma.py",
-                "--search-mode", "city",
-                "--cities", city,
-                "--derive-from-db",
-                "--status-mode", "all",
-                "--export-each-search",
-                "--export-template", template,
-                "--download-dir", os.path.join("output", f"mls_exports_{city_slug}"),
-                "--debug-dir", os.path.join("output", f"mls_debug_{city_slug}"),
-                "--import-to-db",
-                "--db-file", "mls.db",
-                "--backup-dir", "tmp",
-            ]
-            print(f"\nCity update: {city}")
-            subprocess.run(cmd, check=True)
-            city_runs.append({"city": city, "status": "success"})
-
-        run_subdivision_master_sync()
-        run_cross_source_duplicate_cleanup()
-        run_rx_board_duplicate_cleanup()
-        run_off_market_sync_audit()
-        run_pbc_geo_zone_audit_and_fix()
-        run_property_type_normalization()
-        run_property_type_override_sync()
-        run_cabana_flag_sync()
-        run_data_quality_guardrails()
-        run_duplicate_audit_summary()
-        run_mls_gap_batch_audit(pause=False)
-        cloud_sync = run_cloud_database_sync()
-        write_last_run(
-            pipeline_name="mls_auto_update",
-            status="success",
-            started_at=started_ts,
-            details={
-                "mode": "fresh_city_quicksearch",
-                "cities": city_runs,
-                "template": template,
-                "cloud_sync": cloud_sync,
-            },
-        )
+        subprocess.run(cmd, check=True)
         print("\n✅ MLS update pipeline complete.")
     except subprocess.CalledProcessError as e:
-        write_last_run(
-            pipeline_name="mls_auto_update",
-            status="failed",
-            started_at=started_ts,
-            error=e,
-            details={"mode": "fresh_city_quicksearch", "cities": city_runs, "template": template},
-        )
         print(f"\nError running MLS update pipeline: {e}")
     except Exception as e:
-        write_last_run(
-            pipeline_name="mls_auto_update",
-            status="failed",
-            started_at=started_ts,
-            error=e,
-            details={"mode": "fresh_city_quicksearch", "cities": city_runs, "template": template},
-        )
         print(f"\nAn unexpected error occurred: {e}")
     input("\nPress Enter to continue...")
 

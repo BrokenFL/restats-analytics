@@ -57,7 +57,13 @@ def parse_args():
     p.add_argument(
         "--from-last-imported",
         action="store_true",
-        help="Use last imported PBC sold_date + 1 day per city.",
+        help="Use the last imported PBC sold_date minus the configured overlap per city.",
+    )
+    p.add_argument(
+        "--overlap-days",
+        type=int,
+        default=90,
+        help="Days to overlap the county sold-date watermark.",
     )
     p.add_argument("--start-date", help="Optional fixed start date MM/DD/YYYY for all cities.")
     p.add_argument("--end-date", help="Optional fixed end date MM/DD/YYYY for all cities.")
@@ -97,6 +103,7 @@ def main():
             headless=args.headless,
             download_folder=str(city_download_dir),
             chromedriver_port=args.chromedriver_port + index - 1,
+            last_imported_overlap_days=args.overlap_days,
         ) or {}
 
         status = scrape_result.get("status")
