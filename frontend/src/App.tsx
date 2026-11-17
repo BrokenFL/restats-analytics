@@ -990,6 +990,7 @@ export default function App() {
   const now = new Date();
   const { year: nowYear, month: nowMonth } = monthDateParts(now);
   const nowQuarter = Math.floor((nowMonth - 1) / 3) + 1;
+  const completedMonth = monthDateParts(new Date(nowYear, nowMonth - 2, 1));
 
   const [selectedCity, setSelectedCity] = useState<string | null>(null);
   const hasMarketSelection = selectedCity !== null;
@@ -998,11 +999,14 @@ export default function App() {
   const [finalSubdivision, setFinalSubdivision] = useState("");
   const [propertyGroup, setPropertyGroup] = useState<PropertyGroup>("ALL");
 
-  const [reportMode, setReportMode] = useState<ReportMode>("rolling");
+  const [reportMode, setReportMode] = useState<ReportMode>("monthly");
   const [periodDays, setPeriodDays] = useState(30);
-  const [refYear, setRefYear] = useState(nowYear);
-  const [refMonth, setRefMonth] = useState(nowMonth);
+  const [calendarYear, setCalendarYear] = useState(nowYear);
+  const [monthlyYear, setMonthlyYear] = useState(completedMonth.year);
+  const [monthlyMonth, setMonthlyMonth] = useState(completedMonth.month);
   const [refQuarter, setRefQuarter] = useState(nowQuarter);
+  const refYear = reportMode === "monthly" ? monthlyYear : calendarYear;
+  const refMonth = reportMode === "monthly" ? monthlyMonth : nowMonth;
   const [customStart, setCustomStart] = useState(todayMinusDays(30));
   const [customEnd, setCustomEnd] = useState(toIsoDate(now));
   const [seriesFrequency, setSeriesFrequency] = useState<"monthly" | "quarterly" | "annual">("monthly");
@@ -2500,8 +2504,8 @@ export default function App() {
         <label className="filter-field" htmlFor="reportMode">
           <span>Date Range</span>
           <select id="reportMode" value={reportMode} onChange={(e) => setReportMode(e.target.value as ReportMode)}>
-            <option value="rolling">Rolling Window</option>
             <option value="monthly">Monthly Report</option>
+            <option value="rolling">Rolling Window</option>
             <option value="quarterly">Quarterly Report</option>
             <option value="annual">Annual Report</option>
             <option value="custom">Custom Date Range</option>
@@ -2525,14 +2529,18 @@ export default function App() {
           <>
             <label className="filter-field filter-compact" htmlFor="year">
               <span>Year</span>
-              <select id="year" value={refYear} onChange={(e) => setRefYear(Number(e.target.value))}>
+              <select id="year" value={monthlyYear} onChange={(e) => setMonthlyYear(Number(e.target.value))}>
                 {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
               </select>
             </label>
             <label className="filter-field filter-compact" htmlFor="month">
               <span>Month</span>
-              <select id="month" value={refMonth} onChange={(e) => setRefMonth(Number(e.target.value))}>
-                {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => <option key={m} value={m}>{m}</option>)}
+              <select id="month" value={monthlyMonth} onChange={(e) => setMonthlyMonth(Number(e.target.value))}>
+                {Array.from({ length: 12 }, (_, i) => (
+                  <option key={i} value={i + 1}>
+                    {new Date(2000, i, 1).toLocaleString("en-US", { month: "long" })}
+                  </option>
+                ))}
               </select>
             </label>
           </>
@@ -2542,7 +2550,7 @@ export default function App() {
           <>
             <label className="filter-field filter-compact" htmlFor="qyear">
               <span>Year</span>
-              <select id="qyear" value={refYear} onChange={(e) => setRefYear(Number(e.target.value))}>
+              <select id="qyear" value={calendarYear} onChange={(e) => setCalendarYear(Number(e.target.value))}>
                 {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
               </select>
             </label>
@@ -2558,7 +2566,7 @@ export default function App() {
         {reportMode === "annual" ? (
           <label className="filter-field filter-compact" htmlFor="ayear">
             <span>Year</span>
-            <select id="ayear" value={refYear} onChange={(e) => setRefYear(Number(e.target.value))}>
+            <select id="ayear" value={calendarYear} onChange={(e) => setCalendarYear(Number(e.target.value))}>
               {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
             </select>
           </label>
