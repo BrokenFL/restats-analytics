@@ -1080,7 +1080,7 @@ def _build_dashboard_bootstrap(
             property_group,
         )
         future_kpis = executor.submit(summary_kpis, city, final_subdivision, property_type, geo_zone, property_group, sold_since, None)
-        future_trends = executor.submit(market_trends, 12, trend_frequency, start_date, end_date, city, final_subdivision, property_type, geo_zone, property_group)
+        future_trends = executor.submit(market_trends, 12, trend_frequency, current_start, current_end, city, final_subdivision, property_type, geo_zone, property_group)
         future_inventory = executor.submit(inventory_by_status, city, final_subdivision, property_type, geo_zone, property_group)
         future_recent = executor.submit(
             recent_listings,

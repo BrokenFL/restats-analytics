@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  fetchDashboardBootstrap,
   fetchFilterOptions,
+  fetchInventory,
   fetchMarketMapPoints,
   fetchMarketPeriodSeries,
+  fetchRecentListingsForRange,
   fetchReportListings,
   fetchReportSummary,
+  fetchSubdivisionRankings,
+  fetchTrends,
   runCma,
   type CmaComp,
   type CmaRunResponse,
-  type DashboardBootstrapResponse,
   type PeriodSeriesResponse,
   type RecentListingsResponse,
   type ReportConfig,
@@ -18,7 +20,6 @@ import {
   type TrendsResponse,
   type FilterOptionsResponse,
   type InventoryResponse,
-  type KpisResponse,
   type MarketMapPointsResponse
 } from "./api";
 import { SocialReportModal } from "./components/SocialReportModal";
@@ -986,7 +987,6 @@ export default function App() {
   const { year: nowYear, month: nowMonth } = monthDateParts(now);
   const nowQuarter = Math.floor((nowMonth - 1) / 3) + 1;
 
-  const [soldSince, setSoldSince] = useState(todayMinusDays(30));
   const [city, setCity] = useState("");
   const [geoZone, setGeoZone] = useState("");
   const [finalSubdivision, setFinalSubdivision] = useState("");
@@ -1006,7 +1006,6 @@ export default function App() {
   const [builderMetricB, setBuilderMetricB] = useState<BuilderMetricKey>("median_sold_price");
   const chartMakerRef = useRef<HTMLDivElement | null>(null);
 
-  const [kpis, setKpis] = useState<KpisResponse | null>(null);
   const [trends, setTrends] = useState<TrendsResponse | null>(null);
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [recentListings, setRecentListings] = useState<RecentListingsResponse | null>(null);
@@ -1016,6 +1015,8 @@ export default function App() {
   const [marketMapPoints, setMarketMapPoints] = useState<MarketMapPointsResponse | null>(null);
   const [filterOptions, setFilterOptions] = useState<FilterOptionsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dashboardErrors, setDashboardErrors] = useState<string[]>([]);
+  const [reloadDashboard, setReloadDashboard] = useState(0);
   const [dashboardLoading, setDashboardLoading] = useState(true);
   const [reportExporting, setReportExporting] = useState(false);
   const [cmaParcel, setCmaParcel] = useState("");
@@ -1040,29 +1041,40 @@ export default function App() {
     [reportMode, periodDays, refYear, refMonth, refQuarter, customStart, customEnd]
   );
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     async function loadFilters() {
       try {
         const options = await fetchFilterOptions({
           city,
           geoZone,
           propertyGroup,
-        });
-        if (!cancelled) setFilterOptions(options);
+        }, controller.signal);
+        if (!controller.signal.aborted) setFilterOptions(options);
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load filter options");
+        if (!controller.signal.aborted) setError(err instanceof Error ? err.message : "Failed to load filter options");
       }
     }
     void loadFilters();
-    return () => {
-      cancelled = true;
-    };
-  }, [city, geoZone, propertyGroup]);
+    return () => controller.abort();
+  }, [city, geoZone, propertyGroup, reloadDashboard]);
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const { signal } = controller;
     setError(null);
+    setDashboardErrors([]);
     setDashboardLoading(true);
+    setReportSummary(null);
+    setTrends(null);
+    setInventory(null);
+    setRecentListings(null);
+    setRankings(null);
+
+    if (reportMode === "custom" && (!customStart || !customEnd || customStart > customEnd)) {
+      setDashboardErrors(["Enter a valid start and end date."]);
+      setDashboardLoading(false);
+      return;
+    }
 
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     const config: ReportConfig = {
@@ -1074,34 +1086,29 @@ export default function App() {
       startDate: reportMode === "custom" ? customStart : undefined,
       endDate: reportMode === "custom" ? customEnd : undefined
     };
-
-    const handleLoadError = (err: unknown, fallback: string) => {
-      if (cancelled) return;
-      setError(err instanceof Error ? err.message : fallback);
-    };
-
-    void fetchDashboardBootstrap(config, filters, soldSince)
-      .then((payload: DashboardBootstrapResponse) => {
-        if (cancelled) return;
-        setReportSummary(payload.report_summary);
-        setKpis(payload.kpis);
-        setTrends(payload.trends);
-        setInventory(payload.inventory);
-        setRecentListings(payload.recent_listings);
-        setRankings(payload.rankings);
-        if (payload.filter_options) setFilterOptions(payload.filter_options);
-        setDashboardLoading(false);
-      })
-      .catch((err) => {
-        handleLoadError(err, "Failed to load dashboard bootstrap");
-        if (!cancelled) setDashboardLoading(false);
+    const { start, end } = activeWindow;
+    const trendFrequency = reportMode === "rolling" || reportMode === "custom" ? "monthly" : reportMode;
+    const loadPanel = <T,>(request: Promise<T>, publish: (value: T) => void, label: string) => {
+      return request.then((value) => {
+        if (!signal.aborted) publish(value);
+      }).catch((err: unknown) => {
+        if (signal.aborted) return;
+        const detail = err instanceof Error ? err.message : "Request failed.";
+        setDashboardErrors((previous) => [...previous, `${label}: ${detail}`]);
       });
-
-    return () => {
-      cancelled = true;
     };
+
+    void loadPanel(fetchReportSummary(config, filters, signal), setReportSummary, "Overview").finally(() => {
+      if (!signal.aborted) setDashboardLoading(false);
+    });
+    void loadPanel(fetchTrends(12, filters, trendFrequency, start, end, signal), setTrends, "Sales Trend");
+    void loadPanel(fetchInventory(filters, signal), setInventory, "Inventory Mix");
+    void loadPanel(fetchRecentListingsForRange(25, filters, start, end, undefined, signal), setRecentListings, "Recent Closings");
+    void loadPanel(fetchSubdivisionRankings(config, 2, 10, filters, signal), setRankings, "Top Subdivision Momentum");
+
+    return () => controller.abort();
   }, [
-    soldSince,
+    activeWindow,
     city,
     geoZone,
     finalSubdivision,
@@ -1113,6 +1120,7 @@ export default function App() {
     refQuarter,
     customStart,
     customEnd,
+    reloadDashboard,
   ]);
 
   useEffect(() => {
@@ -1140,7 +1148,9 @@ export default function App() {
 
   useEffect(() => {
     if (!historicalSeriesRequested) return;
-    let cancelled = false;
+    const controller = new AbortController();
+    const { signal } = controller;
+    setPeriodSeries(null);
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     void fetchMarketPeriodSeries(
       seriesFrequency,
@@ -1149,18 +1159,17 @@ export default function App() {
       reportMode === "custom" ? customEnd : undefined,
       refYear,
       refMonth,
-      refQuarter
+      refQuarter,
+      signal
     )
       .then((seriesResp) => {
-        if (!cancelled) setPeriodSeries(seriesResp);
+        if (!signal.aborted) setPeriodSeries(seriesResp);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load historical market stats");
+        if (!signal.aborted) setError(err instanceof Error ? err.message : "Failed to load historical market stats");
       });
 
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
   }, [
     historicalSeriesRequested,
     city,
@@ -1195,7 +1204,13 @@ export default function App() {
 
   useEffect(() => {
     if (!mapPointsRequested) return;
-    let cancelled = false;
+    const controller = new AbortController();
+    const { signal } = controller;
+    setMarketMapPoints(null);
+    if (reportMode === "custom" && (!customStart || !customEnd || customStart > customEnd)) {
+      setMapPointsLoading(false);
+      return;
+    }
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     const config: ReportConfig = {
       reportMode,
@@ -1207,19 +1222,17 @@ export default function App() {
       endDate: reportMode === "custom" ? customEnd : undefined,
     };
     setMapPointsLoading(true);
-    void fetchMarketMapPoints(config, filters)
+    void fetchMarketMapPoints(config, filters, 1000, signal)
       .then((response) => {
-        if (!cancelled) setMarketMapPoints(response);
+        if (!signal.aborted) setMarketMapPoints(response);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load mapped sales");
+        if (!signal.aborted) setError(err instanceof Error ? err.message : "Failed to load mapped sales");
       })
       .finally(() => {
-        if (!cancelled) setMapPointsLoading(false);
+        if (!signal.aborted) setMapPointsLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
   }, [
     mapPointsRequested,
     city,
@@ -2376,19 +2389,19 @@ export default function App() {
           <h1>Market Intelligence Report</h1>
           <p className="hero-copy">
             {dashboardLoading
-              ? "Loading countywide market data..."
-              : `Data as of ${formatDateDisplay(reportSummary?.current_end ?? activeWindow.end)}`}
+              ? `Loading ${marketScopeLabel} market data…`
+              : reportSummary ? `Report through ${formatDateDisplay(reportSummary.current_end)}` : "Overview unavailable"}
           </p>
         </div>
         <div className="actions top-actions">
-          <button className="btn" onClick={() => downloadCsv("recent_closings.csv", (recentListings?.rows ?? []) as Array<Record<string, unknown>>)}>
+          <button className="btn" disabled={!recentListings?.rows.length} onClick={() => downloadCsv("recent_closings.csv", (recentListings?.rows ?? []) as Array<Record<string, unknown>>)}>
             Export Recent Closings
           </button>
           <button className="btn" onClick={() => void exportReportListings()} disabled={reportExporting}>
             {reportExporting ? "Exporting..." : "Export Listings"}
           </button>
           <button className="btn" onClick={printHistoricalReport}>Print Historical</button>
-          <button className="btn" onClick={printMarketReport}>Print Market Report</button>
+          <button className="btn" disabled={dashboardLoading || !reportSummary} onClick={printMarketReport}>Print Market Report</button>
           <button className="btn primary" onClick={() => setSocialReportOpen(true)} disabled={dashboardLoading || !reportSummary}>
             Create Social Report
           </button>
@@ -2399,7 +2412,11 @@ export default function App() {
       <section className="filter-grid dashboard-filterbar">
         <label className="filter-field" htmlFor="city">
           <span>City</span>
-          <select id="city" value={city} onChange={(e) => setCity(e.target.value)}>
+          <select id="city" value={city} onChange={(e) => {
+            setCity(e.target.value);
+            setGeoZone("");
+            setFinalSubdivision("");
+          }}>
             <option value="">All Cities</option>
             {(filterOptions?.cities ?? []).map((c) => <option key={c.city} value={c.city}>{c.city} ({c.count})</option>)}
           </select>
@@ -2407,7 +2424,10 @@ export default function App() {
 
         <label className="filter-field" htmlFor="geo_zone">
           <span>Geo Zone</span>
-          <select id="geo_zone" value={geoZone} onChange={(e) => setGeoZone(e.target.value)}>
+          <select id="geo_zone" value={geoZone} onChange={(e) => {
+            setGeoZone(e.target.value);
+            setFinalSubdivision("");
+          }}>
             <option value="">All Geo Zones</option>
             {(filterOptions?.geo_zones ?? []).map((g) => <option key={g.geo_zone} value={g.geo_zone}>{g.geo_zone} ({g.count})</option>)}
           </select>
@@ -2424,7 +2444,10 @@ export default function App() {
 
         <label className="filter-field" htmlFor="property_group">
           <span>Building Type</span>
-          <select id="property_group" value={propertyGroup} onChange={(e) => setPropertyGroup(e.target.value as PropertyGroup)}>
+          <select id="property_group" value={propertyGroup} onChange={(e) => {
+            setPropertyGroup(e.target.value as PropertyGroup);
+            setFinalSubdivision("");
+          }}>
             {(filterOptions?.property_groups ?? []).map((pg) => <option key={pg.value} value={pg.value}>{pg.label}</option>)}
           </select>
         </label>
@@ -2509,11 +2532,6 @@ export default function App() {
           </>
         ) : null}
 
-        <label className="filter-field" htmlFor="soldSince">
-          <span>KPI Since</span>
-          <input id="soldSince" type="date" value={soldSince} onChange={(e) => setSoldSince(e.target.value)} />
-        </label>
-
         <div className="filter-actions">
           <button className={`period-pill ${seriesFrequency === "monthly" ? "active" : ""}`} type="button" onClick={() => setSeriesFrequency("monthly")}>Monthly</button>
           <button className={`period-pill ${seriesFrequency === "quarterly" ? "active" : ""}`} type="button" onClick={() => setSeriesFrequency("quarterly")}>Quarterly</button>
@@ -2532,6 +2550,12 @@ export default function App() {
       ) : null}
 
       {activeView === "market" && error ? <section className="error">{error}</section> : null}
+      {activeView === "market" && dashboardErrors.length > 0 ? (
+        <section className="error">
+          <div role="status">{dashboardErrors.map((message) => <p key={message}>{message}</p>)}</div>
+          <button className="btn" type="button" onClick={() => setReloadDashboard((previous) => previous + 1)}>Retry dashboard</button>
+        </section>
+      ) : null}
 
       {activeView === "cma" ? (
       <section className="panel listings-panel">

@@ -338,19 +338,21 @@ export type CmaRunResponse = {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
-async function getJson<T>(path: string): Promise<T> {
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${API_BASE}${path}`;
+  const timeout = signal && AbortSignal.timeout(45_000);
   let response: Response;
   try {
-    response = await fetch(url);
+    response = await fetch(url, { signal: signal && timeout ? AbortSignal.any([signal, timeout]) : undefined });
+    if (!response.ok) {
+      throw new Error(`API request failed (${response.status} ${response.statusText}) at ${url}`);
+    }
+    return (await response.json()) as T;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "Unknown network error";
-    throw new Error(`Cannot reach API at ${url}. ${msg}`);
+    if (timeout?.aborted && !signal?.aborted) throw new Error("The request timed out. Please try again.");
+    if (err instanceof TypeError) throw new Error(`Cannot reach API at ${url}. ${err.message}`);
+    throw err;
   }
-  if (!response.ok) {
-    throw new Error(`API request failed (${response.status} ${response.statusText}) at ${url}`);
-  }
-  return (await response.json()) as T;
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
@@ -410,7 +412,8 @@ export async function fetchTrends(
   filters: Filters = {},
   frequency: "monthly" | "quarterly" | "annual" = "monthly",
   startDate?: string,
-  endDate?: string
+  endDate?: string,
+  signal?: AbortSignal
 ): Promise<TrendsResponse> {
   const query = buildQuery({
     months,
@@ -422,26 +425,26 @@ export async function fetchTrends(
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<TrendsResponse>(`/api/market/trends${query}`);
+  return getJson<TrendsResponse>(`/api/market/trends${query}`, signal);
 }
 
-export async function fetchInventory(filters: Filters = {}): Promise<InventoryResponse> {
+export async function fetchInventory(filters: Filters = {}, signal?: AbortSignal): Promise<InventoryResponse> {
   const query = buildQuery({
     city: filters.city,
     final_subdivision: filters.finalSubdivision,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<InventoryResponse>(`/api/inventory/by-status${query}`);
+  return getJson<InventoryResponse>(`/api/inventory/by-status${query}`, signal);
 }
 
-export async function fetchFilterOptions(filters: Filters = {}): Promise<FilterOptionsResponse> {
+export async function fetchFilterOptions(filters: Filters = {}, signal?: AbortSignal): Promise<FilterOptionsResponse> {
   const query = buildQuery({
     city: filters.city,
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<FilterOptionsResponse>(`/api/filters/options${query}`);
+  return getJson<FilterOptionsResponse>(`/api/filters/options${query}`, signal);
 }
 
 export async function fetchDashboardBootstrap(
@@ -483,7 +486,8 @@ export async function fetchRecentListingsForRange(
   filters: Filters = {},
   startDate?: string,
   endDate?: string,
-  soldSince?: string
+  soldSince?: string,
+  signal?: AbortSignal
 ): Promise<RecentListingsResponse> {
   const query = buildQuery({
     limit,
@@ -495,10 +499,10 @@ export async function fetchRecentListingsForRange(
     end_date: endDate,
     sold_since: soldSince
   });
-  return getJson<RecentListingsResponse>(`/api/listings/recent${query}`);
+  return getJson<RecentListingsResponse>(`/api/listings/recent${query}`, signal);
 }
 
-export async function fetchReportSummary(config: ReportConfig, filters: Filters = {}): Promise<ReportSummaryResponse> {
+export async function fetchReportSummary(config: ReportConfig, filters: Filters = {}, signal?: AbortSignal): Promise<ReportSummaryResponse> {
   const query = buildQuery({
     report_mode: config.reportMode,
     period_days: config.periodDays,
@@ -512,7 +516,7 @@ export async function fetchReportSummary(config: ReportConfig, filters: Filters 
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<ReportSummaryResponse>(`/api/market/report-summary${query}`);
+  return getJson<ReportSummaryResponse>(`/api/market/report-summary${query}`, signal);
 }
 
 export async function fetchReportListings(config: ReportConfig, filters: Filters = {}): Promise<ReportListingsResponse> {
@@ -535,7 +539,8 @@ export async function fetchReportListings(config: ReportConfig, filters: Filters
 export async function fetchMarketMapPoints(
   config: ReportConfig,
   filters: Filters = {},
-  limit = 1000
+  limit = 1000,
+  signal?: AbortSignal
 ): Promise<MarketMapPointsResponse> {
   const query = buildQuery({
     report_mode: config.reportMode,
@@ -551,14 +556,15 @@ export async function fetchMarketMapPoints(
     property_group: filters.propertyGroup,
     limit,
   });
-  return getJson<MarketMapPointsResponse>(`/api/market/map-points${query}`);
+  return getJson<MarketMapPointsResponse>(`/api/market/map-points${query}`, signal);
 }
 
 export async function fetchSubdivisionRankings(
   config: ReportConfig,
   minSales: number,
   limit: number,
-  filters: Filters = {}
+  filters: Filters = {},
+  signal?: AbortSignal
 ): Promise<SubdivisionRankingsResponse> {
   const query = buildQuery({
     report_mode: config.reportMode,
@@ -574,7 +580,7 @@ export async function fetchSubdivisionRankings(
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<SubdivisionRankingsResponse>(`/api/market/subdivision-rankings${query}`);
+  return getJson<SubdivisionRankingsResponse>(`/api/market/subdivision-rankings${query}`, signal);
 }
 
 export async function fetchOpsStatus(): Promise<OpsStatusResponse> {
@@ -608,7 +614,8 @@ export async function fetchMarketPeriodSeries(
   endDate?: string,
   endYear?: number,
   endMonth?: number,
-  endQuarter?: number
+  endQuarter?: number,
+  signal?: AbortSignal
 ): Promise<PeriodSeriesResponse> {
   const query = buildQuery({
     frequency,
@@ -622,7 +629,7 @@ export async function fetchMarketPeriodSeries(
     geo_zone: filters.geoZone,
     property_group: filters.propertyGroup
   });
-  return getJson<PeriodSeriesResponse>(`/api/market/period-series${query}`);
+  return getJson<PeriodSeriesResponse>(`/api/market/period-series${query}`, signal);
 }
 
 export async function runCma(parcel: string, asOfDate?: string, topN = 15): Promise<CmaRunResponse> {
