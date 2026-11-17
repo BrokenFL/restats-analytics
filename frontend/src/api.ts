@@ -337,22 +337,70 @@ export type CmaRunResponse = {
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+const DASHBOARD_REQUEST_TIMEOUT_MS = 60_000;
+const API_STARTUP_TIMEOUT_MS = 120_000;
+const API_READY_TTL_MS = 60_000;
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+let apiReadyUntil = 0;
+let apiStartup: Promise<void> | undefined;
+
+async function requestJson<T>(path: string, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+  if (signal?.aborted) throw new DOMException("Request aborted", "AbortError");
+
+  // Older browsers support AbortController without the static AbortSignal helpers.
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  let timedOut = false;
+  signal?.addEventListener("abort", cancel, { once: true });
+  const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   const url = `${API_BASE}${path}`;
-  const timeout = signal && AbortSignal.timeout(45_000);
-  let response: Response;
+
   try {
-    response = await fetch(url, { signal: signal && timeout ? AbortSignal.any([signal, timeout]) : undefined });
+    const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
       throw new Error(`API request failed (${response.status} ${response.statusText}) at ${url}`);
     }
     return (await response.json()) as T;
   } catch (err) {
-    if (timeout?.aborted && !signal?.aborted) throw new Error("The request timed out. Please try again.");
+    if (timedOut && !signal?.aborted) throw new Error("The request timed out. Please try again.");
     if (err instanceof TypeError) throw new Error(`Cannot reach API at ${url}. ${err.message}`);
     throw err;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", cancel);
   }
+}
+
+async function checkApiReadiness(): Promise<void> {
+  const deadline = Date.now() + API_STARTUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const health = await requestJson<{ ok: boolean }>("/api/health", undefined, Math.min(45_000, deadline - Date.now()));
+      if (health.ok === true) {
+        apiReadyUntil = Date.now() + API_READY_TTL_MS;
+        return;
+      }
+    } catch {
+      // The hosting proxy can return an error or close the request during startup.
+    }
+    const retryDelay = Math.min(2_000, deadline - Date.now());
+    if (retryDelay > 0) await new Promise((resolve) => setTimeout(resolve, retryDelay));
+  }
+  throw new Error("The data service is taking too long to respond. Please try again.");
+}
+
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  if (!signal) return requestJson<T>(path);
+
+  // All dashboard panels share one startup check, including across selector changes.
+  if (Date.now() >= apiReadyUntil) {
+    apiStartup ??= checkApiReadiness().finally(() => { apiStartup = undefined; });
+    await apiStartup;
+  }
+  return requestJson<T>(path, signal, DASHBOARD_REQUEST_TIMEOUT_MS);
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
