@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  fetchCityOptions,
   fetchFilterOptions,
   fetchInventory,
   fetchMarketMapPoints,
@@ -12,6 +13,7 @@ import {
   runCma,
   type CmaComp,
   type CmaRunResponse,
+  type CityOption,
   type PeriodSeriesResponse,
   type RecentListingsResponse,
   type ReportConfig,
@@ -27,6 +29,8 @@ import { SubdivisionCombobox } from "./components/SubdivisionCombobox";
 
 type PropertyGroup = "ALL" | "SINGLE_FAMILY" | "TOWNHOME_CONDO";
 type ReportMode = "rolling" | "monthly" | "quarterly" | "annual" | "custom";
+const DEFAULT_MARKET_CITIES = ["Boca Raton", "Delray Beach", "Palm Beach", "South Palm Beach", "Wellington"];
+const MARKET_PLACEHOLDER = "__choose_market";
 type SnapshotMetricKey =
   | "sold_count"
   | "total_sales_volume"
@@ -987,7 +991,9 @@ export default function App() {
   const { year: nowYear, month: nowMonth } = monthDateParts(now);
   const nowQuarter = Math.floor((nowMonth - 1) / 3) + 1;
 
-  const [city, setCity] = useState("");
+  const [selectedCity, setSelectedCity] = useState<string | null>(null);
+  const hasMarketSelection = selectedCity !== null;
+  const city = selectedCity ?? "";
   const [geoZone, setGeoZone] = useState("");
   const [finalSubdivision, setFinalSubdivision] = useState("");
   const [propertyGroup, setPropertyGroup] = useState<PropertyGroup>("ALL");
@@ -1014,10 +1020,11 @@ export default function App() {
   const [periodSeries, setPeriodSeries] = useState<PeriodSeriesResponse | null>(null);
   const [marketMapPoints, setMarketMapPoints] = useState<MarketMapPointsResponse | null>(null);
   const [filterOptions, setFilterOptions] = useState<FilterOptionsResponse | null>(null);
+  const [cityOptions, setCityOptions] = useState<CityOption[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dashboardErrors, setDashboardErrors] = useState<string[]>([]);
   const [reloadDashboard, setReloadDashboard] = useState(0);
-  const [dashboardLoading, setDashboardLoading] = useState(true);
+  const [dashboardLoading, setDashboardLoading] = useState(false);
   const [reportExporting, setReportExporting] = useState(false);
   const [cmaParcel, setCmaParcel] = useState("");
   const [cmaAsOfDate, setCmaAsOfDate] = useState(toIsoDate(new Date()));
@@ -1042,6 +1049,19 @@ export default function App() {
   );
   useEffect(() => {
     const controller = new AbortController();
+    void fetchCityOptions(controller.signal).then(({ cities }) => {
+      if (!controller.signal.aborted) setCityOptions(cities);
+    }).catch(() => {
+      // The full filter response also includes the city list.
+    });
+    return () => controller.abort();
+  }, [reloadDashboard]);
+
+  useEffect(() => {
+    setFilterOptions(null);
+    if (!hasMarketSelection) return;
+
+    const controller = new AbortController();
     async function loadFilters() {
       try {
         const options = await fetchFilterOptions({
@@ -1056,19 +1076,19 @@ export default function App() {
     }
     void loadFilters();
     return () => controller.abort();
-  }, [city, geoZone, propertyGroup, reloadDashboard]);
+  }, [hasMarketSelection, city, geoZone, propertyGroup, reloadDashboard]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    const { signal } = controller;
     setError(null);
     setDashboardErrors([]);
-    setDashboardLoading(true);
+    setDashboardLoading(hasMarketSelection);
     setReportSummary(null);
     setTrends(null);
     setInventory(null);
     setRecentListings(null);
     setRankings(null);
+
+    if (!hasMarketSelection) return;
 
     if (reportMode === "custom" && (!customStart || !customEnd || customStart > customEnd)) {
       setDashboardErrors(["Enter a valid start and end date."]);
@@ -1076,6 +1096,8 @@ export default function App() {
       return;
     }
 
+    const controller = new AbortController();
+    const { signal } = controller;
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     const config: ReportConfig = {
       reportMode,
@@ -1099,15 +1121,17 @@ export default function App() {
     };
 
     void loadPanel(fetchReportSummary(config, filters, signal), setReportSummary, "Overview").finally(() => {
-      if (!signal.aborted) setDashboardLoading(false);
+      if (signal.aborted) return;
+      setDashboardLoading(false);
+      void loadPanel(fetchInventory(filters, signal), setInventory, "Inventory Mix");
     });
     void loadPanel(fetchTrends(12, filters, trendFrequency, start, end, signal), setTrends, "Sales Trend");
-    void loadPanel(fetchInventory(filters, signal), setInventory, "Inventory Mix");
     void loadPanel(fetchRecentListingsForRange(25, filters, start, end, undefined, signal), setRecentListings, "Recent Closings");
     void loadPanel(fetchSubdivisionRankings(config, 2, 10, filters, signal), setRankings, "Top Subdivision Momentum");
 
     return () => controller.abort();
   }, [
+    hasMarketSelection,
     activeWindow,
     city,
     geoZone,
@@ -1124,6 +1148,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!hasMarketSelection) return;
     if (activeSection === "trends") {
       setHistoricalSeriesRequested(true);
       return;
@@ -1144,13 +1169,13 @@ export default function App() {
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [activeSection]);
+  }, [hasMarketSelection, activeSection]);
 
   useEffect(() => {
-    if (!historicalSeriesRequested) return;
+    setPeriodSeries(null);
+    if (!hasMarketSelection || dashboardLoading || !historicalSeriesRequested) return;
     const controller = new AbortController();
     const { signal } = controller;
-    setPeriodSeries(null);
     const filters = { city, geoZone, finalSubdivision, propertyGroup };
     void fetchMarketPeriodSeries(
       seriesFrequency,
@@ -1171,6 +1196,8 @@ export default function App() {
 
     return () => controller.abort();
   }, [
+    hasMarketSelection,
+    dashboardLoading,
     historicalSeriesRequested,
     city,
     geoZone,
@@ -1186,6 +1213,7 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!hasMarketSelection) return;
     if (activeSection === "neighborhoods") {
       setMapPointsRequested(true);
       return;
@@ -1200,13 +1228,16 @@ export default function App() {
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [activeSection]);
+  }, [hasMarketSelection, activeSection]);
 
   useEffect(() => {
-    if (!mapPointsRequested) return;
+    setMarketMapPoints(null);
+    if (!hasMarketSelection || dashboardLoading || !mapPointsRequested) {
+      setMapPointsLoading(false);
+      return;
+    }
     const controller = new AbortController();
     const { signal } = controller;
-    setMarketMapPoints(null);
     if (reportMode === "custom" && (!customStart || !customEnd || customStart > customEnd)) {
       setMapPointsLoading(false);
       return;
@@ -1234,6 +1265,8 @@ export default function App() {
       });
     return () => controller.abort();
   }, [
+    hasMarketSelection,
+    dashboardLoading,
     mapPointsRequested,
     city,
     geoZone,
@@ -1309,6 +1342,7 @@ export default function App() {
   }, []);
 
   const marketScopeLabel = useMemo(() => {
+    if (!hasMarketSelection) return "Choose a market";
     const parts: string[] = [];
     if (city) parts.push(`City: ${city}`);
     if (geoZone) parts.push(`Geo: ${geoZone}`);
@@ -1319,7 +1353,10 @@ export default function App() {
       );
     }
     return parts.length ? parts.join(" | ") : "Palm Beach County";
-  }, [city, geoZone, finalSubdivision, propertyGroup]);
+  }, [hasMarketSelection, city, geoZone, finalSubdivision, propertyGroup]);
+
+  const cityCounts = new Map((filterOptions?.cities ?? cityOptions ?? []).map((option) => [option.city, option.count]));
+  const availableCities = [...new Set([...DEFAULT_MARKET_CITIES, ...cityCounts.keys()])].sort();
 
   const metricRows = useMemo(() => {
     if (!reportSummary) return [];
@@ -2355,6 +2392,7 @@ export default function App() {
           <span className="brand-mark" aria-hidden="true">⌂</span>
           <span>ReStats</span>
         </div>
+        {hasMarketSelection ? <>
         <nav className="sidebar-nav" aria-label="Dashboard sections">
           {([
             { id: "overview", label: "Overview", icon: "⌂" },
@@ -2380,6 +2418,7 @@ export default function App() {
           <span>{marketScopeLabel}</span>
           <span>{reportSummary?.period_label ?? `${activeWindow.start} to ${activeWindow.end}`}</span>
         </div>
+        </> : null}
       </aside>
 
       <main className="page-shell dashboard-main" aria-busy={dashboardLoading}>
@@ -2388,12 +2427,14 @@ export default function App() {
           <p className="eyebrow">Palm Beach County Market Overview</p>
           <h1>Market Intelligence Report</h1>
           <p className="hero-copy">
-            {dashboardLoading
-              ? `Loading ${marketScopeLabel} market data…`
-              : reportSummary ? `Report through ${formatDateDisplay(reportSummary.current_end)}` : "Overview unavailable"}
+            {!hasMarketSelection
+              ? "Choose a city to view market stats, or select All Cities for the countywide report."
+              : dashboardLoading
+                ? `Loading ${city || "Palm Beach County"} market data…`
+                : reportSummary ? `Report through ${formatDateDisplay(reportSummary.current_end)}` : "Overview unavailable"}
           </p>
         </div>
-        <div className="actions top-actions">
+        {hasMarketSelection ? <div className="actions top-actions">
           <button className="btn" disabled={!recentListings?.rows.length} onClick={() => downloadCsv("recent_closings.csv", (recentListings?.rows ?? []) as Array<Record<string, unknown>>)}>
             Export Recent Closings
           </button>
@@ -2405,23 +2446,27 @@ export default function App() {
           <button className="btn primary" onClick={() => setSocialReportOpen(true)} disabled={dashboardLoading || !reportSummary}>
             Create Social Report
           </button>
-        </div>
+        </div> : null}
       </header>
 
       {activeView === "market" ? (
-      <section className="filter-grid dashboard-filterbar">
+      <section className={`filter-grid dashboard-filterbar${hasMarketSelection ? "" : " choose-market"}`}>
         <label className="filter-field" htmlFor="city">
           <span>City</span>
-          <select id="city" value={city} onChange={(e) => {
-            setCity(e.target.value);
+          <select id="city" value={selectedCity ?? MARKET_PLACEHOLDER} onChange={(e) => {
+            setSelectedCity(e.target.value);
             setGeoZone("");
             setFinalSubdivision("");
           }}>
+            <option value={MARKET_PLACEHOLDER} disabled>Choose a market</option>
             <option value="">All Cities</option>
-            {(filterOptions?.cities ?? []).map((c) => <option key={c.city} value={c.city}>{c.city} ({c.count})</option>)}
+            {availableCities.map((name) => (
+              <option key={name} value={name}>{name}{cityCounts.has(name) ? ` (${cityCounts.get(name)})` : ""}</option>
+            ))}
           </select>
         </label>
 
+        {hasMarketSelection ? <>
         <label className="filter-field" htmlFor="geo_zone">
           <span>Geo Zone</span>
           <select id="geo_zone" value={geoZone} onChange={(e) => {
@@ -2540,12 +2585,19 @@ export default function App() {
             className="btn reset-btn"
             type="button"
             onClick={() => {
-              setCity(""); setGeoZone(""); setFinalSubdivision(""); setPropertyGroup("ALL");
+              setSelectedCity(null);
+              setGeoZone("");
+              setFinalSubdivision("");
+              setPropertyGroup("ALL");
+              setActiveSection("overview");
+              setHistoricalSeriesRequested(false);
+              setMapPointsRequested(false);
             }}
           >
             Reset
           </button>
         </div>
+        </> : null}
       </section>
       ) : null}
 
@@ -2763,7 +2815,7 @@ export default function App() {
       </section>
       ) : null}
 
-      {activeView === "market" ? (
+      {activeView === "market" && hasMarketSelection ? (
       <>
       <div className="market-dashboard-grid">
       <div className="market-main-column">

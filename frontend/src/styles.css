@@ -960,6 +960,10 @@ body {
   gap: 14px 16px;
 }
 
+.dashboard-filterbar.choose-market {
+  max-width: 24rem;
+}
+
 .filter-field {
   flex: 1 1 172px;
   min-width: 156px;

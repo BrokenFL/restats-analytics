@@ -486,6 +486,10 @@ export async function fetchInventory(filters: Filters = {}, signal?: AbortSignal
   return getJson<InventoryResponse>(`/api/inventory/by-status${query}`, signal);
 }
 
+export async function fetchCityOptions(signal: AbortSignal): Promise<{ cities: CityOption[] }> {
+  return getJson<{ cities: CityOption[] }>("/api/filters/cities", signal);
+}
+
 export async function fetchFilterOptions(filters: Filters = {}, signal?: AbortSignal): Promise<FilterOptionsResponse> {
   const query = buildQuery({
     city: filters.city,

@@ -1,10 +1,11 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
 import data_analysis_functions as daf
-from api.main import _is_active_as_of_mask, _is_active_now_mask, _load_market_analysis_frame
+from api.main import _is_active_as_of_mask, _is_active_now_mask, _load_market_analysis_frame, _status_bucket_series, inventory_by_status
 from data_cleaning import _mls_canonical_rank, reconcile_stale_active_inventory
 
 
@@ -117,6 +118,18 @@ class InventoryEligibilityTests(unittest.TestCase):
 
         self.assertEqual(_is_active_as_of_mask(frame, pd.Timestamp("2026-10-31")).tolist(), [False, True])
         self.assertEqual(_is_active_as_of_mask(frame, pd.Timestamp("2026-11-30")).tolist(), [False, False])
+
+    def test_grouped_inventory_keeps_existing_status_buckets(self):
+        conn = sqlite3.connect(":memory:")
+        statuses = ["A", " active ", "P", "Under Contract", "unknown value", None, ""]
+        frame = pd.DataFrame({"status": statuses + ["A"], "cabana_flag": [0] * len(statuses) + [1]})
+        frame.to_sql("listing_details", conn, index=False)
+
+        with patch("api.main.get_connection", return_value=conn):
+            result = inventory_by_status(None, None, None, None, "ALL")
+
+        expected = _status_bucket_series(frame.iloc[:-1]).value_counts().to_dict()
+        self.assertEqual({row["status"]: row["count"] for row in result["rows"]}, expected)
 
     def test_castellina_b_listings_remain_eligible_without_counterparts(self):
         frame = pd.DataFrame(

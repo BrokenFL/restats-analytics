@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import logging
+from collections import Counter
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -1148,7 +1149,8 @@ def _postgres_report_period_metrics(
     history_start: str,
 ) -> tuple[dict, dict]:
     """Compute report metrics in Postgres without shipping a wide dataframe to pandas."""
-    cabana_predicate = "COALESCE(d.cabana_flag, 0) = 0" if _listing_details_has_column("cabana_flag") else "TRUE"
+    cabana_flag_expr = "d.cabana_flag" if _listing_details_has_column("cabana_flag") else "0"
+    cabana_predicate = "COALESCE(d.cabana_flag, 0) = 0"
     buyer_financing_expr = "d.buyer_financing" if _listing_details_has_column("buyer_financing") else "NULL"
     active_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('A', 'ACTIVE', 'ACT', 'COMING SOON', 'CS')"
     pending_status = "UPPER(TRIM(COALESCE(d.status, ''))) IN ('P', 'PENDING', 'U', 'UNDER CONTRACT', 'D', 'BACKUP', 'L')"
@@ -1162,21 +1164,26 @@ def _postgres_report_period_metrics(
     def pending_sales_window(start_ref: str, end_ref: str) -> str:
         return f"DATE(d.under_contract_date) >= b.{start_ref} AND DATE(d.under_contract_date) <= b.{end_ref}"
 
-    def active_inventory(end_ref: str) -> str:
-        period_key = "'current'" if end_ref == "current_end" else "'previous'"
-        primary_predicate = _postgres_inventory_predicate(period_key)
+    def eligible_inventory(end_ref: str, winner_ref: str) -> str:
         return (
-            f"{cabana_predicate} AND {primary_predicate} "
+            "(UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%' "
+            "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%' "
+            f"AND (d.listing_date IS NULL OR {winner_ref}.listing_number IS NULL "
+            f"OR d.listing_date >= b.{end_ref} + INTERVAL '1 day' "
+            f"OR d.listing_number = {winner_ref}.listing_number))"
+        )
+
+    def active_inventory(end_ref: str, winner_ref: str) -> str:
+        return (
+            f"{cabana_predicate} AND {eligible_inventory(end_ref, winner_ref)} "
             f"AND d.listing_date IS NOT NULL AND DATE(d.listing_date) <= b.{end_ref} "
             f"AND (DATE(d.effective_active_end_date) > b.{end_ref} "
             f"OR (d.effective_active_end_date IS NULL AND {active_status}))"
         )
 
-    def pending_inventory(end_ref: str) -> str:
-        period_key = "'current'" if end_ref == "current_end" else "'previous'"
-        primary_predicate = _postgres_inventory_predicate(period_key)
+    def pending_inventory(end_ref: str, winner_ref: str) -> str:
         return (
-            f"{cabana_predicate} AND {primary_predicate} "
+            f"{cabana_predicate} AND {eligible_inventory(end_ref, winner_ref)} "
             f"AND d.under_contract_date IS NOT NULL AND DATE(d.under_contract_date) <= b.{end_ref} "
             f"AND (d.sold_date IS NULL OR DATE(d.sold_date) > b.{end_ref}) "
             f"AND (d.effective_active_end_date IS NULL OR DATE(d.effective_active_end_date) > b.{end_ref} "
@@ -1191,10 +1198,10 @@ def _postgres_report_period_metrics(
             f"AND DATE(d.sold_date) <= {effective_end}"
         )
 
-    current_active = active_inventory("current_end")
-    previous_active = active_inventory("previous_end")
-    current_pending_inventory = pending_inventory("current_end")
-    previous_pending_inventory = pending_inventory("previous_end")
+    current_active = active_inventory("current_end", "current_winner")
+    previous_active = active_inventory("previous_end", "previous_winner")
+    current_pending_inventory = pending_inventory("current_end", "current_winner")
+    previous_pending_inventory = pending_inventory("previous_end", "previous_winner")
     current_sales_12 = twelve_month_sales("current_end")
     previous_sales_12 = twelve_month_sales("previous_end")
     current_sold = sold_window("current_start", "current_end")
@@ -1213,18 +1220,26 @@ def _postgres_report_period_metrics(
                 CAST(? AS date) AS previous_end,
                 CAST(? AS date) AS history_start
         ),
-        base AS (
-            SELECT d.*
+        history AS MATERIALIZED (
+            SELECT
+                d.listing_number, d.listing_date, d.under_contract_date, d.sold_date,
+                d.effective_active_end_date, d.status, d.sold_price, d.list_price,
+                d.original_list_price, d.sqft_living, d.status_change_date,
+                d.city, d.geo_zone, d.final_subdivision, d.property_type,
+                {cabana_flag_expr} AS cabana_flag,
+                {buyer_financing_expr} AS buyer_financing,
+                {_postgres_inventory_identity_expr('d')} AS inventory_identity
             FROM listing_details d
             CROSS JOIN bounds b
+            WHERE DATE(d.sold_date) >= b.history_start
+               OR DATE(d.listing_date) >= b.history_start
+               OR DATE(d.under_contract_date) >= b.history_start
+               OR d.effective_active_end_date IS NULL
+               OR DATE(d.effective_active_end_date) >= b.history_start
+        ),
+        base AS (
+            SELECT * FROM history
             WHERE {where_sql}
-              AND (
-                    DATE(d.sold_date) >= b.history_start
-                 OR DATE(d.listing_date) >= b.history_start
-                 OR DATE(d.under_contract_date) >= b.history_start
-                 OR d.effective_active_end_date IS NULL
-                 OR DATE(d.effective_active_end_date) >= b.history_start
-              )
         ),
         inventory_periods AS (
             SELECT 'current'::text AS period_key, current_end AS period_end FROM bounds
@@ -1236,46 +1251,22 @@ def _postgres_report_period_metrics(
                 d.listing_number,
                 d.listing_date,
                 d.status_change_date,
-                {_postgres_inventory_identity_expr('d')} AS inventory_identity,
-                CASE
-                    WHEN UPPER(COALESCE(d.listing_number, '')) LIKE 'B%'
-                    THEN 0
-                    WHEN UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
-                    THEN 1
-                    ELSE 2
-                END AS source_rank
-            FROM listing_details d
+                d.inventory_identity,
+                CASE WHEN UPPER(d.listing_number) LIKE 'B%' THEN 0 ELSE 1 END AS source_rank
+            FROM history d
             CROSS JOIN bounds b
-            WHERE UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%'
-              AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%'
-              AND (
-                    DATE(d.sold_date) >= b.history_start
-                 OR DATE(d.listing_date) >= b.history_start
-                 OR DATE(d.under_contract_date) >= b.history_start
-                 OR d.effective_active_end_date IS NULL
-                 OR DATE(d.effective_active_end_date) >= b.history_start
-              )
-        ),
-        inventory_new_keys AS (
-            SELECT DISTINCT p.period_key, s.inventory_identity
-            FROM inventory_periods p
-            CROSS JOIN inventory_source s
-            WHERE s.source_rank IN (0, 1)
-              AND s.listing_date IS NOT NULL
-              AND s.listing_date < (p.period_end + INTERVAL '1 day')
-              AND s.inventory_identity <> ''
+            WHERE (UPPER(d.listing_number) LIKE 'B%' OR UPPER(d.listing_number) ~ '^R[0-9]+$')
+              AND d.listing_date < (GREATEST(b.current_end, b.previous_end) + INTERVAL '1 day')
         ),
         inventory_winners AS (
-            SELECT p.period_key, p.period_end, latest.listing_number
+            SELECT p.period_key, latest.inventory_identity, latest.listing_number
             FROM inventory_periods p
             CROSS JOIN LATERAL (
                 SELECT DISTINCT ON (s.inventory_identity)
                     s.inventory_identity,
                     s.listing_number
                 FROM inventory_source s
-                WHERE s.listing_date IS NOT NULL
-                  AND s.source_rank IN (0, 1)
-                  AND s.listing_date < (p.period_end + INTERVAL '1 day')
+                WHERE s.listing_date < (p.period_end + INTERVAL '1 day')
                   AND s.inventory_identity <> ''
                 ORDER BY s.inventory_identity,
                          s.listing_date DESC,
@@ -1323,6 +1314,10 @@ def _postgres_report_period_metrics(
         FROM base d
         CROSS JOIN bounds b
         CROSS JOIN max_dates m
+        LEFT JOIN inventory_winners current_winner
+            ON current_winner.period_key = 'current' AND current_winner.inventory_identity = d.inventory_identity
+        LEFT JOIN inventory_winners previous_winner
+            ON previous_winner.period_key = 'previous' AND previous_winner.inventory_identity = d.inventory_identity
     """
 
     cursor = conn.cursor()
@@ -2251,22 +2246,49 @@ def inventory_by_status(
     where_sql = " AND ".join(where_clauses)
 
     with closing(get_connection()) as conn:
-        df = _read_sql_query(
+        groups = _read_sql_query(
             f"""
-            SELECT status
+            SELECT status, COUNT(*) AS count
             FROM listing_details
             WHERE {where_sql}
+            GROUP BY status
             """,
             conn,
             params=params,
         )
-    if df.empty:
-        rows = []
-    else:
-        counts = _status_bucket_series(df).value_counts()
-        rows = [{"status": str(k), "count": int(v)} for k, v in counts.items()]
+    if groups.empty:
+        return {"rows": []}
 
-    return {"rows": rows}
+    counts = groups.groupby(_status_bucket_series(groups))["count"].sum().sort_values(ascending=False)
+    return {"rows": [{"status": str(status), "count": int(count)} for status, count in counts.items()]}
+
+
+def _city_options(cursor) -> list[dict]:
+    cursor.execute(
+        """
+        SELECT city, COUNT(*) AS count
+        FROM listing_details
+        WHERE city IS NOT NULL AND TRIM(city) <> ''
+        GROUP BY city
+        ORDER BY count DESC, city ASC
+        LIMIT 200
+        """
+    )
+    city_counts: Counter[str] = Counter()
+    for row in cursor.fetchall():
+        city_name = canonical_city_name(row["city"])
+        if city_name:
+            city_counts[city_name] += row["count"]
+    return [
+        {"city": city_name, "count": count}
+        for city_name, count in sorted(city_counts.items(), key=lambda item: (-item[1], item[0]))[:200]
+    ]
+
+
+@app.get("/api/filters/cities")
+def city_filter_options() -> dict:
+    with closing(get_connection()) as conn:
+        return {"cities": _city_options(conn.cursor())}
 
 
 @app.get("/api/filters/options")
@@ -2291,26 +2313,7 @@ def filter_options(
 
     with closing(get_connection()) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT city, COUNT(*) AS count
-            FROM listing_details
-            WHERE city IS NOT NULL AND TRIM(city) <> ''
-            GROUP BY city
-            ORDER BY count DESC, city ASC
-            LIMIT 200
-            """
-        )
-        city_counts: dict[str, int] = {}
-        for row in cursor.fetchall():
-            row_data = dict(row)
-            city_name = canonical_city_name(row_data.get("city"))
-            if city_name:
-                city_counts[city_name] = city_counts.get(city_name, 0) + int(row_data.get("count") or 0)
-        cities = [
-            {"city": city_name, "count": count}
-            for city_name, count in sorted(city_counts.items(), key=lambda item: (-item[1], item[0]))
-        ][:200]
+        cities = _city_options(cursor)
 
         cursor.execute(
             f"""
