@@ -13,7 +13,7 @@
         <string>-e</string>
         <string>tell application "Terminal" to do script "cd /Volumes/ExternalSSD/projects/restats-analytics; /bin/zsh /Volumes/ExternalSSD/projects/restats-analytics/scripts/ops/run_mls_auto_update.sh &gt;&gt; /Users/brookesnader/Library/Logs/ReStats/mls-auto-update-terminal.log 2&gt;&amp;1; exit_code=$?; echo exit_code=$exit_code &gt; /Users/brookesnader/Library/Logs/ReStats/mls-auto-update.status; exit $exit_code"</string>
         <string>-e</string>
-        <string>set deadline to (current date) + 7200</string>
+        <string>set deadline to (current date) + 10800</string>
         <string>-e</string>
         <string>repeat</string>
         <string>-e</string>
@@ -28,6 +28,8 @@
         <string>if (current date) is greater than deadline then error "Timed out waiting for the ReStats MLS status marker."</string>
         <string>-e</string>
         <string>delay 5</string>
+        <string>-e</string>
+        <string>end try</string>
         <string>-e</string>
         <string>end repeat</string>
         <string>-e</string>

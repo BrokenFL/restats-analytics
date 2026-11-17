@@ -144,15 +144,25 @@ def write_last_run(pipeline_name, status, started_at=None, finished_at=None, det
         "pipeline": pipeline_name,
         "status": status,
         "started_at": started_at or datetime.now().isoformat(timespec="seconds"),
-        "finished_at": finished_at or datetime.now().isoformat(timespec="seconds"),
+        "finished_at": finished_at if finished_at is not None else (
+            None if status == "running" else datetime.now().isoformat(timespec="seconds")
+        ),
         "details": details or {},
         "error": str(error) if error else None,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    temp_path = f"{LAST_RUN_PATH}.{os.getpid()}.tmp"
     try:
-        with open(LAST_RUN_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+        # Readers see either the previous complete status or this complete status.
+        os.replace(temp_path, LAST_RUN_PATH)
     except Exception as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
         print(f"⚠️  Could not write last run metadata: {e}")
 
 

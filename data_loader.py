@@ -218,7 +218,7 @@ class DataLoader:
     # ------------------------------------------------------
     # THE NEW UPSERT LOGIC
     # ------------------------------------------------------
-    def upsert_data(self, df, table_name="listing_details"):
+    def upsert_data(self, df, table_name="listing_details", *, commit=True):
         """
         Inserts new records and updates existing records (based on Primary Key).
         """
@@ -239,27 +239,22 @@ class DataLoader:
                 elif pd.api.types.is_datetime64_any_dtype(df_clean[col]):
                     df_clean[col] = df_clean[col].apply(lambda x: x.isoformat() if pd.notna(x) else None)
 
-            # 2. Use a Temporary Table for the incoming data
-            temp_table = "temp_listings_load"
-            df_clean.to_sql(temp_table, self.conn, if_exists='replace', index=False)
-
-            # 3. Perform SQL UPSERT (Insert or Replace)
-            # This relies on listing_number being the PRIMARY KEY
-            columns = ", ".join([f'"{c}"' for c in df_clean.columns])
-            
-            sql = f"""
-            INSERT OR REPLACE INTO {table_name} ({columns})
-            SELECT {columns} FROM {temp_table};
-            """
-            
-            with self.conn:
-                self.conn.execute(sql)
-                self.conn.execute(f"DROP TABLE {temp_table};")
+            # Bind one row at a time so SQLite keeps the caller's transaction
+            # open and the number of parameters is independent of export size.
+            columns = ", ".join(f'"{c}"' for c in df_clean.columns)
+            placeholders = ", ".join("?" for _ in df_clean.columns)
+            values = df_clean.astype(object).where(df_clean.notna(), None)
+            sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
+            self.conn.executemany(sql, values.itertuples(index=False, name=None))
+            if commit:
+                self.conn.commit()
             
             logger.info(f"Successfully upserted {len(df_clean)} rows.")
 
         except Exception as e:
             logger.error(f"Upsert failed: {e}", exc_info=True)
+            if commit:
+                self.conn.rollback()
             raise
 
     @staticmethod

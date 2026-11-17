@@ -628,8 +628,13 @@ def _process_chunk(df_chunk, lookup_dict, property_type_overrides=None):
         if 'unit_number' in df.columns and 'total_floors_stories' in df.columns:
             ph_mask = df['unit_number'].astype(str).str.upper().str.contains('PH', na=False)
             valid_ph_mask = ph_mask & df['total_floors_stories'].notna()
-            if 'unit_floor' not in df.columns: df['unit_floor'] = pd.NA
+            if 'unit_floor' not in df.columns:
+                df['unit_floor'] = pd.Series(pd.NA, index=df.index, dtype='Float64')
             if valid_ph_mask.any():
+                # Integer-only MLS exports infer int64 here. Pandas rejects
+                # assigning nullable Float64 values into that column, even
+                # for whole floors; use the schema's float dtype on both sides.
+                df['unit_floor'] = pd.to_numeric(df['unit_floor'], errors='coerce').astype('Float64')
                 df.loc[valid_ph_mask, 'unit_floor'] = df.loc[valid_ph_mask, 'total_floors_stories'].astype('Float64')
     except Exception as e:
         logger.error(f"Error PH logic: {e}")
@@ -707,26 +712,33 @@ def backfill_incoming_from_existing_mls(conn, incoming_df, day_window_open=7, da
 
     parcel_norms = sorted(
         {
-            p for p in work["parcel_norm"].astype(str).tolist()
-            if p and p != "nan" and len(p) >= 10
+            normalized
+            for raw_value in work["parcel_norm"].tolist()
+            for normalized in [str(raw_value).strip()]
+            if normalized and normalized.lower() not in {"nan", "<na>", "none"} and len(normalized) >= 10
         }
     )
     if not parcel_norms:
         work.drop(columns=["parcel_norm", "addr_norm", "status_group", "canonical_rank"], inplace=True, errors="ignore")
         return work, 0, 0
 
-    placeholders = ",".join(["?"] * len(parcel_norms))
-    existing = pd.read_sql_query(
-        f"""
-        SELECT *
-        FROM listing_details
-        WHERE listing_number NOT LIKE 'PBC-%'
-          AND substr(replace(replace(replace(replace(replace(replace(COALESCE(parcel_id, ''), '-', ''), ' ', ''), '.', ''), '/', ''), '_', ''), '#', ''), 1, 20)
-              IN ({placeholders})
-        """,
-        conn,
-        params=parcel_norms,
-    )
+    batch_size = min(5000, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+    matches = []
+    for offset in range(0, len(parcel_norms), batch_size):
+        batch = parcel_norms[offset : offset + batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        matches.append(pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM listing_details
+            WHERE listing_number NOT LIKE 'PBC-%'
+              AND substr(replace(replace(replace(replace(replace(replace(COALESCE(parcel_id, ''), '-', ''), ' ', ''), '.', ''), '/', ''), '_', ''), '#', ''), 1, 20)
+                  IN ({placeholders})
+            """,
+            conn,
+            params=batch,
+        ))
+    existing = pd.concat(matches, ignore_index=True)
     if existing.empty:
         work.drop(columns=["parcel_norm", "addr_norm", "status_group", "canonical_rank"], inplace=True, errors="ignore")
         return work, 0, 0
@@ -743,16 +755,20 @@ def backfill_incoming_from_existing_mls(conn, incoming_df, day_window_open=7, da
 
     rows_filled = 0
     fields_filled = 0
+    by_parcel = existing.groupby("parcel_norm", sort=False).indices
     for idx, row in work.iterrows():
         if row["canonical_rank"] > 1:
             continue
         if len(str(row["parcel_norm"])) < 10:
             continue
 
-        hits = existing[
-            (existing["parcel_norm"] == row["parcel_norm"])
-            & (existing["listing_number"].astype(str) != str(row["listing_number"]))
-            & (existing["canonical_rank"] > row["canonical_rank"])
+        positions = by_parcel.get(row["parcel_norm"])
+        if positions is None:
+            continue
+        hits = existing.iloc[positions]
+        hits = hits[
+            (hits["listing_number"].astype(str) != str(row["listing_number"]))
+            & (hits["canonical_rank"] > row["canonical_rank"])
         ].copy()
         if hits.empty:
             continue
@@ -805,7 +821,7 @@ def backfill_incoming_from_existing_mls(conn, incoming_df, day_window_open=7, da
     return work, rows_filled, fields_filled
 
 
-def dedupe_against_existing_offmarket(conn, incoming_df, day_window=7):
+def dedupe_against_existing_offmarket(conn, incoming_df, day_window=7, *, commit=True):
     """
     Cross-source duplicate guard:
     If incoming MLS sold rows match existing off-market rows on parcel + sold_date (±window),
@@ -848,10 +864,12 @@ def dedupe_against_existing_offmarket(conn, incoming_df, day_window=7):
         return incoming_df, 0
 
     to_delete = set()
+    by_parcel = existing.groupby("parcel_norm", sort=False).indices
     for _, row in work.iterrows():
-        hits = existing[existing["parcel_norm"] == row["parcel_norm"]]
-        if hits.empty:
+        positions = by_parcel.get(row["parcel_norm"])
+        if positions is None:
             continue
+        hits = existing.iloc[positions]
         deltas = (hits["sold_date"] - row["sold_date"]).abs().dt.days
         dupes = hits[deltas <= day_window]
         if not dupes.empty:
@@ -860,14 +878,14 @@ def dedupe_against_existing_offmarket(conn, incoming_df, day_window=7):
     if not to_delete:
         return incoming_df, 0
 
-    placeholders = ",".join(["?"] * len(to_delete))
-    conn.execute(f"DELETE FROM listing_details WHERE listing_number IN ({placeholders})", tuple(to_delete))
-    conn.commit()
+    conn.executemany("DELETE FROM listing_details WHERE listing_number = ?", ((key,) for key in to_delete))
+    if commit:
+        conn.commit()
     logger.info(f"Removed {len(to_delete)} off-market rows replaced by incoming MLS matches.")
     return incoming_df, len(to_delete)
 
 
-def drop_incoming_duplicates_against_existing_mls(conn, incoming_df, day_window=1):
+def drop_incoming_duplicates_against_existing_mls(conn, incoming_df, day_window=1, *, commit=True):
     """
     Prevent duplicate closed transactions across MLS systems:
     drop incoming sold rows when an existing non-PBC row already matches
@@ -916,10 +934,12 @@ def drop_incoming_duplicates_against_existing_mls(conn, incoming_df, day_window=
 
     drop_indexes = set()
     delete_existing = set()
+    by_parcel = existing.groupby("parcel_norm", sort=False).indices
     for idx, row in sold_rows.iterrows():
-        hits = existing[existing["parcel_norm"] == row["parcel_norm"]]
-        if hits.empty:
+        positions = by_parcel.get(row["parcel_norm"])
+        if positions is None:
             continue
+        hits = existing.iloc[positions]
         # Keep incoming row if it's the same listing_number already in DB;
         # allow upsert to refresh fields (e.g., city backfill on re-import).
         hits = hits[hits["listing_number"].astype(str) != str(row["listing_number"])]
@@ -979,12 +999,12 @@ def drop_incoming_duplicates_against_existing_mls(conn, incoming_df, day_window=
         drop_indexes.add(idx)
 
     if delete_existing:
-        placeholders = ",".join(["?"] * len(delete_existing))
-        conn.execute(
-            f"DELETE FROM listing_details WHERE listing_number IN ({placeholders})",
-            tuple(sorted(delete_existing)),
+        conn.executemany(
+            "DELETE FROM listing_details WHERE listing_number = ?",
+            ((key,) for key in delete_existing),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         logger.info(f"Removed {len(delete_existing)} existing secondary-feed rows replaced by incoming primary MLS rows.")
 
     if not drop_indexes:
@@ -1048,7 +1068,7 @@ def drop_internal_mls_transaction_duplicates(incoming_df: pd.DataFrame) -> tuple
     return out, len(drop_idx)
 
 
-def drop_incoming_open_duplicates_against_existing_mls(conn, incoming_df, day_window=7):
+def drop_incoming_open_duplicates_against_existing_mls(conn, incoming_df, day_window=7, *, commit=True):
     """
     Prevent open inventory duplication across MLS feeds:
     drop incoming non-sold rows when an existing non-PBC row already matches
@@ -1115,11 +1135,15 @@ def drop_incoming_open_duplicates_against_existing_mls(conn, incoming_df, day_wi
 
     drop_idx = set()
     delete_existing = set()
+    by_parcel = existing.groupby("parcel_norm", sort=False).indices
     for idx, row in work.iterrows():
-        hits = existing[
-            (existing["parcel_norm"] == row["parcel_norm"])
-            & (existing["status_group"] == row["status_group"])
-            & (existing["listing_number"].astype(str) != str(row["listing_number"]))
+        positions = by_parcel.get(row["parcel_norm"])
+        if positions is None:
+            continue
+        hits = existing.iloc[positions]
+        hits = hits[
+            (hits["status_group"] == row["status_group"])
+            & (hits["listing_number"].astype(str) != str(row["listing_number"]))
         ]
         if hits.empty:
             continue
@@ -1148,12 +1172,12 @@ def drop_incoming_open_duplicates_against_existing_mls(conn, incoming_df, day_wi
             drop_idx.add(idx)
 
     if delete_existing:
-        placeholders = ",".join(["?"] * len(delete_existing))
-        conn.execute(
-            f"DELETE FROM listing_details WHERE listing_number IN ({placeholders})",
-            tuple(sorted(delete_existing)),
+        conn.executemany(
+            "DELETE FROM listing_details WHERE listing_number = ?",
+            ((key,) for key in delete_existing),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         logger.info(f"Removed {len(delete_existing)} existing open MLS rows replaced by stronger incoming matches.")
 
     if not drop_idx:
@@ -1163,7 +1187,7 @@ def drop_incoming_open_duplicates_against_existing_mls(conn, incoming_df, day_wi
     return out, len(drop_idx)
 
 
-def backfill_missing_city_in_db(conn) -> int:
+def backfill_missing_city_in_db(conn, *, commit=True) -> int:
     """
     One-pass DB backfill for existing rows with missing city using infer_missing_city logic.
     Returns number of rows updated.
@@ -1188,11 +1212,12 @@ def backfill_missing_city_in_db(conn) -> int:
         return 0
     updates = list(to_update.itertuples(index=False, name=None))
     conn.executemany("UPDATE listing_details SET city = ? WHERE listing_number = ?", [(c, l) for l, c in updates])
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(updates)
 
 
-def reconcile_stale_active_inventory(conn, incoming_df: pd.DataFrame, refreshed_at=None) -> dict:
+def reconcile_stale_active_inventory(conn, incoming_df: pd.DataFrame, refreshed_at=None, *, commit=True) -> dict:
     """Retire active rows absent from an explicitly authoritative city refresh.
 
     The normal importer is an upsert because historical sold rows must remain in
@@ -1248,18 +1273,17 @@ def reconcile_stale_active_inventory(conn, incoming_df: pd.DataFrame, refreshed_
         stale_ids = sorted(existing_ids - incoming_ids)
 
         if stale_ids:
-            placeholders = ",".join("?" for _ in stale_ids)
-            conn.execute(
-                f"""
+            conn.executemany(
+                """
                 UPDATE listing_details
                    SET effective_active_end_date = ?
-                 WHERE listing_number IN ({placeholders})
+                 WHERE listing_number = ?
                    AND (
                          effective_active_end_date IS NULL
                       OR DATE(effective_active_end_date) >= DATE(?)
                    )
                 """,
-                (refresh_value, *stale_ids, refresh_value),
+                ((refresh_value, key, refresh_value) for key in stale_ids),
             )
             retired_total += len(stale_ids)
 
@@ -1269,7 +1293,7 @@ def reconcile_stale_active_inventory(conn, incoming_df: pd.DataFrame, refreshed_
             "retired": len(stale_ids),
         }
 
-    if retired_total:
+    if retired_total and commit:
         conn.commit()
     return {"cities": city_stats, "retired_total": retired_total, "refreshed_at": refresh_value}
 
@@ -1396,7 +1420,7 @@ def infer_missing_city(conn, incoming_df: pd.DataFrame) -> tuple[pd.DataFrame, d
     }
 
 
-def correct_rapb_city_from_lookup(conn, lookup_folder="lookups") -> dict:
+def correct_rapb_city_from_lookup(conn, lookup_folder="lookups", *, commit=True) -> dict:
     """
     Correct existing RAPB rows using authoritative lookup-based PCN city mapping.
     """
@@ -1427,7 +1451,8 @@ def correct_rapb_city_from_lookup(conn, lookup_folder="lookups") -> dict:
 
     updates = [(r.lookup_city, r.listing_number) for r in fix.itertuples(index=False)]
     conn.executemany("UPDATE listing_details SET city = ? WHERE listing_number = ?", updates)
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"updated": len(updates), "mismatches_fixed": len(updates)}
 
 # --- 5. MAIN EXECUTION ---
@@ -1435,18 +1460,16 @@ def correct_rapb_city_from_lookup(conn, lookup_folder="lookups") -> dict:
 def clean_csv(file_stream, lookup_dict, property_type_overrides=None):
     processed_chunks = []
     chunk_size = 50000
-    try:
-        reader = pd.read_csv(file_stream, dtype=str, low_memory=False, chunksize=chunk_size, on_bad_lines='warn')
-        for chunk in reader:
-            cleaned_chunk = _process_chunk(chunk, lookup_dict, property_type_overrides)
-            if not cleaned_chunk.empty:
-                processed_chunks.append(cleaned_chunk)
-    except Exception as e:
-        logger.error(f"Error reading CSV: {e}")
-        return pd.DataFrame()
+    reader = pd.read_csv(file_stream, dtype=str, low_memory=False, chunksize=chunk_size)
+    for chunk in reader:
+        cleaned_chunk = _process_chunk(chunk, lookup_dict, property_type_overrides)
+        if not cleaned_chunk.empty:
+            processed_chunks.append(cleaned_chunk)
     
     if not processed_chunks: return pd.DataFrame()
     final_df = pd.concat(processed_chunks, ignore_index=True)
+    if "listing_number" not in final_df or final_df["listing_number"].fillna("").str.strip().eq("").any():
+        raise ValueError("Every MLS row must have a listing number")
     for col in data_dictionary.keys():
         if col not in final_df.columns: final_df[col] = pd.NA
     return final_df
@@ -1466,24 +1489,29 @@ def process_and_load_data(
     property_type_overrides = load_property_type_overrides()
     
     data_loader = DataLoader(db_filename)
-    if not data_loader.create_connection(): return
-
+    if not data_loader.create_connection():
+        raise RuntimeError(f"Could not open {db_filename}")
     try:
-        if create_new:
-            data_loader.conn.execute("DROP TABLE IF EXISTS listing_details")
-            data_loader.create_database()
-        else:
-            data_loader.create_database()
-    except Exception as e:
-        logger.error(f"Schema error: {e}")
-        return
+        _load_listing_files(
+            data_loader, csv_files, lookup_map, property_type_overrides,
+            create_new=create_new, reconcile_active_inventory=reconcile_active_inventory,
+            refresh_date=refresh_date,
+        )
+    finally:
+        data_loader.close_connection()
 
-    if not isinstance(csv_files, list): csv_files = [csv_files]
+
+def _load_listing_files(
+    data_loader, csv_files, lookup_map, property_type_overrides,
+    *, create_new, reconcile_active_inventory, refresh_date,
+):
+    if not isinstance(csv_files, list):
+        csv_files = [csv_files]
+    if not csv_files:
+        raise ValueError("No MLS CSV files to import")
     all_dfs = []
 
     for file_path in csv_files:
-        if not os.path.exists(file_path): continue
-        
         # Encoding detection
         enc = 'utf-8'
         try:
@@ -1497,11 +1525,18 @@ def process_and_load_data(
         try:
             with open(file_path, 'r', encoding=enc, errors='replace') as f:
                 df_clean = clean_csv(f, lookup_map, property_type_overrides)
-            if not df_clean.empty: all_dfs.append(df_clean)
+            if df_clean.empty:
+                raise ValueError("No listing rows were read")
+            all_dfs.append(df_clean)
         except Exception as e:
-            logger.error(f"Failed {file_path}: {e}")
+            raise ValueError(f"Could not load {file_path}: {e}") from e
 
-    if all_dfs:
+    with data_loader.conn:
+        # Include inventory retirement, dedupe and upserts in one transaction.
+        data_loader.conn.execute("BEGIN IMMEDIATE")
+        if create_new:
+            data_loader.conn.execute("DROP TABLE IF EXISTS listing_details")
+        data_loader.create_database()
         final_merged = pd.concat(all_dfs, ignore_index=True)
         # Deduplicate based on most recent update
         if 'listing_number' in final_merged.columns and 'status_change_date' in final_merged.columns:
@@ -1568,8 +1603,9 @@ def process_and_load_data(
                     f"Incoming MLS preservation filled {inherited_fields} fields across "
                     f"{inherited_rows} rows from existing MLS matches."
                 )
-        except Exception as e:
-            logger.error(f"Incoming MLS preservation error: {e}")
+        except Exception:
+            logger.exception("Incoming MLS preservation failed")
+            raise
 
         # Cross-source dedupe: prefer incoming MLS row over old PBC duplicate by parcel+sold_date window.
         try:
@@ -1578,22 +1614,25 @@ def process_and_load_data(
                 logger.info(f"Internal incoming dedupe dropped {dropped_internal} MLS rows.")
 
             final_merged, dropped_existing_open = drop_incoming_open_duplicates_against_existing_mls(
-                data_loader.conn, final_merged, day_window=7
+                data_loader.conn, final_merged, day_window=7, commit=False
             )
             if dropped_existing_open:
                 logger.info(f"Open-listing dedupe dropped {dropped_existing_open} incoming rows.")
 
             final_merged, dropped_existing_mls = drop_incoming_duplicates_against_existing_mls(
-                data_loader.conn, final_merged, day_window=1
+                data_loader.conn, final_merged, day_window=1, commit=False
             )
             if dropped_existing_mls:
                 logger.info(f"Transaction dedupe dropped {dropped_existing_mls} incoming MLS rows already in DB.")
 
-            final_merged, removed_pbc = dedupe_against_existing_offmarket(data_loader.conn, final_merged, day_window=7)
+            final_merged, removed_pbc = dedupe_against_existing_offmarket(
+                data_loader.conn, final_merged, day_window=7, commit=False
+            )
             if removed_pbc:
                 logger.info(f"Cross-source dedupe removed {removed_pbc} existing PBC rows.")
-        except Exception as e:
-            logger.error(f"Cross-source dedupe error: {e}")
+        except Exception:
+            logger.exception("Cross-source dedupe failed")
+            raise
 
         for col in db_columns:
             if col not in final_merged.columns: final_merged[col] = pd.NA
@@ -1604,6 +1643,7 @@ def process_and_load_data(
                 data_loader.conn,
                 authoritative_active_frame,
                 refreshed_at=refresh_date,
+                commit=False,
             )
             logger.info(
                 "Full-refresh active inventory reconciliation: retired %s stale rows; cities=%s",
@@ -1612,23 +1652,14 @@ def process_and_load_data(
             )
 
         logger.info(f"Inserting {len(final_merged)} records...")
-        try:
-            if create_new:
-                data_loader.batch_insert_data(final_merged, 'listing_details')
-            else:
-                data_loader.upsert_data(final_merged, 'listing_details')
-            rapb_city_fix = correct_rapb_city_from_lookup(data_loader.conn, "lookups")
-            if rapb_city_fix.get("updated"):
-                logger.info(f"RAPB city correction updated {rapb_city_fix['updated']} rows via lookup PCN mapping.")
-            # Also backfill older rows still missing city after upsert.
-            updated_city = backfill_missing_city_in_db(data_loader.conn)
-            if updated_city:
-                logger.info(f"City backfill updated {updated_city} existing rows.")
-            logger.info("Complete.")
-        except Exception as e:
-            logger.error(f"Insert failed: {e}")
-
-    data_loader.close_connection()
+        data_loader.upsert_data(final_merged, commit=False)
+        rapb_city_fix = correct_rapb_city_from_lookup(data_loader.conn, "lookups", commit=False)
+        if rapb_city_fix.get("updated"):
+            logger.info(f"RAPB city correction updated {rapb_city_fix['updated']} rows via lookup PCN mapping.")
+        updated_city = backfill_missing_city_in_db(data_loader.conn, commit=False)
+        if updated_city:
+            logger.info(f"City backfill updated {updated_city} existing rows.")
+    logger.info("Complete.")
 
 if __name__ == "__main__":
     pass

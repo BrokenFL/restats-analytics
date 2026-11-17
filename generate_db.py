@@ -47,6 +47,11 @@ def parse_args():
         help="Do not move processed CSVs into processed_archive after a successful load.",
     )
     parser.add_argument(
+        "--defer-rx-cleanup",
+        action="store_true",
+        help="Leave board-overlap cleanup to the enclosing multi-city refresh.",
+    )
+    parser.add_argument(
         "--reconcile-active-inventory",
         action="store_true",
         help="Treat incoming city exports as authoritative current inventory and retire absent active rows.",
@@ -54,7 +59,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_rx_board_cleanup():
+def run_rx_board_cleanup(db_file=DB_NAME):
     """Remove board-overlap sold duplicates by keeping RX listings."""
     script_path = os.path.join("scripts", "maintenance", "clean_rx_board_duplicates.py")
     if not os.path.exists(script_path):
@@ -64,13 +69,13 @@ def run_rx_board_cleanup():
     print("🧹 Running RX board-overlap dedupe (60-day window)...")
     try:
         subprocess.run(
-            [sys.executable, script_path, "--window-days", "60", "--apply"],
+            [sys.executable, script_path, "--db-file", db_file, "--window-days", "60", "--apply"],
             check=True,
         )
     except Exception as e:
         print(f"⚠️  RX board dedupe failed: {e}")
 
-def main():
+def main() -> int:
     args = parse_args()
 
     # 1. Ensure directories exist
@@ -87,14 +92,14 @@ def main():
             print("❌ Missing CSV file(s):")
             for path in missing:
                 print(f"   - {path}")
-            return
+            return 1
     else:
         csv_files = find_input_csvs()
     
     if not csv_files:
         print(f"❌ No CSV files found in '{INPUT_DIR}', '{RAW_INPUT_DIR}', or '{BOARD_INPUT_DIR}'.")
         print(f"   Please drop your new MLS export files in '{RAW_INPUT_DIR}' or board exports in '{BOARD_INPUT_DIR}'.")
-        return
+        return 1
 
     print(f"✅ Found {len(csv_files)} new file(s) to process.")
 
@@ -133,11 +138,13 @@ def main():
                             writer.writerow(row)
                             kept += 1
                 print(f"   - {os.path.basename(src)} -> {kept} closed rows")
-                filtered_paths.append(filtered_path)
+                if kept:
+                    filtered_paths.append(filtered_path)
             if filtered_paths:
                 process_and_load_data(filtered_paths, args.db_name, create_new=False)
         print("🚀 Data successfully merged into database.")
-        run_rx_board_cleanup()
+        if not args.defer_rx_cleanup:
+            run_rx_board_cleanup(args.db_name)
         
         # 4. Move processed files to Archive
         if args.skip_archive:
@@ -159,9 +166,11 @@ def main():
                 print(f"📂 Archived: {filename} -> {dest_path}")
 
         print("✨ All done! You can restart the API/Dashboard.")
+        return 0
 
     except Exception as e:
-        print(f"❌ Error during processing: {e}")
+        print(f"❌ Error during processing: {e}", file=sys.stderr)
+        return 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

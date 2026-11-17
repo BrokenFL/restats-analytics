@@ -18,6 +18,16 @@ from selenium.webdriver.support import expected_conditions as EC
 # --- CONFIGURATION ---
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'Downloads')
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
+NO_RESULTS_MARKERS = (
+    "no records",
+    "no results matched your search criteria",
+)
+
+
+def page_has_no_results_message(page_text):
+    """Recognize the county site's current and legacy empty-result messages."""
+    normalized = " ".join(str(page_text or "").lower().split())
+    return any(marker in normalized for marker in NO_RESULTS_MARKERS)
 
 
 def parse_mmddyyyy(date_str):
@@ -925,24 +935,40 @@ def run_scraper(
             driver.execute_script("arguments[0].click();", csv_button)
             print("✓ CSV Export clicked. Waiting for download...")
         else:
-            # Check if there are any results at all
+            # A missing export control is only a clean no-results outcome when
+            # the page explicitly says so. Otherwise preserve diagnostics and fail.
             try:
-                no_results = driver.find_element(By.XPATH, "//*[contains(text(), 'No records')]")
+                page_text = driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                page_text = ""
+            if page_has_no_results_message(page_text):
                 if formatted_end_date:
                     print(f"No results found for {target_city} from {formatted_date} to {formatted_end_date}")
                 else:
                     print(f"No results found for {target_city} since {formatted_date}")
-            except:
-                print("No CSV button found. The page structure may have changed.")
-                # Take a screenshot for debugging
+                driver.quit()
+                return {
+                    "status": "no_results",
+                    "target": target_label,
+                    "start_date": formatted_date,
+                    "end_date": formatted_end_date,
+                }
+
+            print("PBC CSV export control unavailable and no no-results message was found.")
+            screenshot_path = os.path.join(download_folder, "debug_screenshot.png")
+            try:
                 driver.save_screenshot(os.path.join(download_folder, "debug_screenshot.png"))
-                print(f"Screenshot saved to {download_folder}/debug_screenshot.png")
+                print(f"Screenshot saved to {screenshot_path}")
+            except Exception as exc:
+                print(f"Could not save PBC debug screenshot: {exc}")
             driver.quit()
             return {
-                "status": "no_results",
+                "status": "error",
+                "reason": "csv_export_unavailable",
                 "target": target_label,
                 "start_date": formatted_date,
                 "end_date": formatted_end_date,
+                "debug_screenshot": screenshot_path,
             }
         
         # Wait for file to appear (poll for up to 30 seconds)

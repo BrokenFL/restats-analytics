@@ -22,6 +22,16 @@ def slugify(value):
     return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_") or "city"
 
 
+def emit_city_result(row):
+    """Emit a machine-readable city result as soon as it is known."""
+    print(
+        "pbc_city_result="
+        f"{row['city']}|status={row['status']}|processed={row['processed_count']}|"
+        f"imported={row['imported']}|skipped={row['skipped']}|errors={row['errors']}|csv={row['csv']}",
+        flush=True,
+    )
+
+
 def backup_db(db_file, backup_dir):
     db_path = Path(db_file)
     backup_root = Path(backup_dir)
@@ -91,49 +101,49 @@ def main():
         city_slug = slugify(city)
         city_download_dir = Path(args.download_dir) / city_slug
         city_download_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[{index}/{len(cities)}] PBC municipality refresh: {city}")
+        print(f"[{index}/{len(cities)}] PBC municipality refresh: {city}", flush=True)
 
-        scrape_result = run_scraper(
-            target_city=city,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            use_last_imported=args.from_last_imported,
-            prompt_for_missing=False,
-            search_mode="municipality",
-            headless=args.headless,
-            download_folder=str(city_download_dir),
-            chromedriver_port=args.chromedriver_port + index - 1,
-            last_imported_overlap_days=args.overlap_days,
-        ) or {}
+        try:
+            scrape_result = run_scraper(
+                target_city=city,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                use_last_imported=args.from_last_imported,
+                prompt_for_missing=False,
+                search_mode="municipality",
+                headless=args.headless,
+                download_folder=str(city_download_dir),
+                chromedriver_port=args.chromedriver_port + index - 1,
+                last_imported_overlap_days=args.overlap_days,
+            ) or {}
 
-        status = scrape_result.get("status")
-        if status == "ok":
-            final_csv = scrape_result.get("final_csv") or scrape_result.get("enhanced_csv")
-            print(f"  pbc_csv={final_csv}")
-            if not backup_path:
-                backup_path = backup_db(args.db_file, args.backup_dir)
-                print(f"pbc_db_backup={backup_path}")
-            import_result = import_pbc_data(final_csv, dry_run=False)
-            results.append(
-                {
+            status = scrape_result.get("status")
+            if status == "ok":
+                final_csv = scrape_result.get("final_csv") or scrape_result.get("enhanced_csv")
+                print(f"  pbc_csv={final_csv}", flush=True)
+                if not backup_path:
+                    backup_path = backup_db(args.db_file, args.backup_dir)
+                    print(f"pbc_db_backup={backup_path}", flush=True)
+                import_result = import_pbc_data(final_csv, dry_run=False)
+                import_errors = import_result.get("errors", 0)
+                row = {
                     "city": city,
-                    "status": status,
+                    "status": "error" if import_errors else "ok",
                     "csv": final_csv,
                     "processed_count": scrape_result.get("processed_count", 0),
                     "imported": import_result.get("imported", 0),
                     "skipped": import_result.get("skipped", 0),
-                    "errors": import_result.get("errors", 0),
+                    "errors": import_errors,
                 }
-            )
-            print(
-                f"  pbc_processed={scrape_result.get('processed_count', 0)} "
-                f"pbc_imported={import_result.get('imported', 0)} "
-                f"pbc_skipped={import_result.get('skipped', 0)} "
-                f"pbc_errors={import_result.get('errors', 0)}"
-            )
-        elif status == "no_results":
-            results.append(
-                {
+                if import_errors:
+                    failures.append({"city": city, "reason": f"import_errors={import_errors}"})
+                print(
+                    f"  pbc_processed={row['processed_count']} pbc_imported={row['imported']} "
+                    f"pbc_skipped={row['skipped']} pbc_errors={row['errors']}",
+                    flush=True,
+                )
+            elif status == "no_results":
+                row = {
                     "city": city,
                     "status": status,
                     "csv": "",
@@ -142,13 +152,11 @@ def main():
                     "skipped": 0,
                     "errors": 0,
                 }
-            )
-            print("  no_results=true")
-        else:
-            reason = scrape_result.get("reason", "unknown_error")
-            failures.append({"city": city, "reason": reason})
-            results.append(
-                {
+                print("  no_results=true", flush=True)
+            else:
+                reason = scrape_result.get("reason", "unknown_error")
+                failures.append({"city": city, "reason": reason})
+                row = {
                     "city": city,
                     "status": "error",
                     "csv": "",
@@ -157,21 +165,32 @@ def main():
                     "skipped": 0,
                     "errors": 1,
                 }
-            )
-            print(f"  pbc_error={reason}")
+                print(f"  pbc_error={reason}", flush=True)
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            failures.append({"city": city, "reason": reason})
+            row = {
+                "city": city,
+                "status": "error",
+                "csv": "",
+                "processed_count": 0,
+                "imported": 0,
+                "skipped": 0,
+                "errors": 1,
+            }
+            print(f"  pbc_error={reason}", flush=True)
+
+        results.append(row)
+        emit_city_result(row)
 
     print("PBC city refresh completed.")
     if backup_path:
         print(f"pbc_db_backup={backup_path}")
-    for row in results:
-        print(
-            "pbc_city_result="
-            f"{row['city']}|status={row['status']}|processed={row['processed_count']}|"
-            f"imported={row['imported']}|skipped={row['skipped']}|errors={row['errors']}|csv={row['csv']}"
-        )
     if failures:
-        print("pbc_manual_follow_up=" + ",".join(f"{row['city']}({row['reason']})" for row in failures))
+        print("pbc_manual_follow_up=" + ",".join(f"{row['city']}({row['reason']})" for row in failures), flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,4 +1,5 @@
 import argparse
+from contextlib import closing
 import getpass
 import os
 import re
@@ -64,6 +65,10 @@ KEYCHAIN_EMAIL_SERVICES = (
     "FlexMLS",
     "MLS",
 )
+
+
+class TransientLoginError(TimeoutException):
+    """The MLS provider failed before Quick Search or import began."""
 
 
 def _navigate(driver, url: str) -> None:
@@ -502,6 +507,15 @@ def _wait_for_flex_shell(
             time.sleep(1.0)
             continue
 
+        try:
+            if "identity provider unavailable" in driver.page_source.lower():
+                _capture_debug(driver, debug_dir, "identity_provider_unavailable")
+                raise TransientLoginError("BeachesMLS identity provider reported unavailable during FlexMLS login.")
+        except TimeoutException:
+            raise
+        except Exception:
+            pass
+
         # Flex occasionally returns a transient 500 on callback; retry entrypoint.
         if "Internal Server Error (500)" in title or "openid_rp/assets/flexmls_rails_http_status/error" in driver.page_source:
             _navigate(driver, START_URL)
@@ -540,15 +554,45 @@ def _wait_for_flex_shell(
     raise TimeoutException("Login completed but Flex shell (top_frame) did not load.")
 
 
-def login(driver, wait: WebDriverWait, email: str, password: str, debug_dir: str) -> None:
-    _navigate(driver, LOGIN_URL)
-    _capture_debug(driver, debug_dir, "start_url")
-    try:
-        wait.until(EC.url_contains(LOGIN_PAGE_URL_FRAGMENT))
-    except Exception:
-        pass
-
-    _wait_for_auth_form(driver)
+def login(
+    driver,
+    wait: WebDriverWait,
+    email: str,
+    password: str,
+    debug_dir: str,
+    _retry_shell_handoff: bool = True,
+) -> None:
+    if LOGIN_PAGE_URL_FRAGMENT not in driver.current_url:
+        _navigate(driver, LOGIN_URL)
+    auth_error = None
+    for attempt in range(2):
+        if attempt:
+            # The myTRIBUS auth shell can occasionally return before its login
+            # controls hydrate. Reload the same entrypoint once before failing.
+            _navigate(driver, LOGIN_URL)
+            time.sleep(1.0)
+        _capture_debug(driver, debug_dir, "start_url" if not attempt else "start_url_retry")
+        try:
+            wait.until(EC.url_contains(LOGIN_PAGE_URL_FRAGMENT))
+        except Exception:
+            pass
+        try:
+            _wait_for_auth_form(driver)
+            auth_error = None
+            break
+        except TimeoutException as exc:
+            auth_error = exc
+            _capture_debug(driver, debug_dir, f"auth_form_not_hydrated_attempt_{attempt + 1}")
+    if auth_error is not None:
+        try:
+            current_url = driver.current_url
+            current_title = driver.title
+        except Exception:
+            current_url, current_title = "unknown", "unknown"
+        raise TransientLoginError(
+            "Auth form did not hydrate after two loads of the login entrypoint. "
+            f"url={current_url} title={current_title} last_error={auth_error}"
+        ) from auth_error
     _capture_debug(driver, debug_dir, "auth_form_ready")
     _select_email_mode(driver)
     _capture_debug(driver, debug_dir, "email_mode_selected")
@@ -583,14 +627,31 @@ def login(driver, wait: WebDriverWait, email: str, password: str, debug_dir: str
         pass
     _switch_to_latest_window(driver)
     _handle_ticket_login_if_present(driver, wait, username=email, password=password)
-    _wait_for_flex_shell(
-        driver,
-        wait,
-        username=email,
-        password=password,
-        debug_dir=debug_dir,
-        timeout_sec=90,
-    )
+    try:
+        _wait_for_flex_shell(
+            driver,
+            wait,
+            username=email,
+            password=password,
+            debug_dir=debug_dir,
+            timeout_sec=90,
+        )
+    except TransientLoginError:
+        raise
+    except TimeoutException:
+        if not _retry_shell_handoff:
+            raise
+        _capture_debug(driver, debug_dir, "flex_shell_retry")
+        _navigate(driver, LOGIN_URL)
+        time.sleep(1.0)
+        return login(
+            driver,
+            wait,
+            email=email,
+            password=password,
+            debug_dir=debug_dir,
+            _retry_shell_handoff=False,
+        )
     driver.switch_to.default_content()
     _capture_debug(driver, debug_dir, "after_login")
 
@@ -668,8 +729,9 @@ def _ensure_residential_view(driver, wait: WebDriverWait, debug_dir: str) -> Non
             options: options.map(opt => String(opt.textContent || '').trim())
           };
         }
+        const template = document.querySelector("#hiddenFormElements input[name='template_id']");
         const hasCity = !!document.querySelector("select[data-locationfieldid='city']");
-        if (current && current.value === target.value && hasCity) {
+        if (current && current.value === target.value && template && template.value === arguments[0]) {
           return {ok:true, currentText, targetText:String(target.textContent || '').trim(), hasCity};
         }
         return {
@@ -680,14 +742,14 @@ def _ensure_residential_view(driver, wait: WebDriverWait, debug_dir: str) -> Non
           hasCity
         };
     """
-    result = driver.execute_script(js) or {}
+    result = driver.execute_script(js, RESIDENTIAL_QUICK_SEARCH_TEMPLATE_ID) or {}
     if result.get("ok"):
         _capture_debug(driver, debug_dir, "quick_search_residential_view")
         return
 
     # The view selector controls result columns, not the search template. If Flex
-    # remembered the rental Quick Search, rebuild the Quick Search template through
-    # the page's own loader so the Residential field list, including City, renders.
+    # remembered another template, load the expected Residential template. City
+    # itself may be supplied by the universal Location picker instead.
     loaded = driver.execute_script(
         """
         if (typeof loadNewQuickSearch !== 'function') {
@@ -717,10 +779,23 @@ def _ensure_residential_view(driver, wait: WebDriverWait, debug_dir: str) -> Non
         )
 
     try:
-        wait.until(lambda d: d.execute_script("return !!document.querySelector(\"select[data-locationfieldid='city']\")"))
+        wait.until(
+            lambda d: d.execute_script(
+                """
+                const select = document.querySelector('#new_sd_tech_id');
+                const template = document.querySelector("#hiddenFormElements input[name='template_id']");
+                if (!select || !template || template.value !== arguments[1]) return false;
+                const selected = Array.from(select.options || []).find(opt => !!opt.selected);
+                const status = document.querySelector("select[data-locationfieldid='status'], #s_4, #s_3");
+                return !!selected && String(selected.value || '').replace(/^x'|'$/g, '') === arguments[0] && !!status;
+                """,
+                RESIDENTIAL_QUICK_SEARCH_VIEW_ID,
+                RESIDENTIAL_QUICK_SEARCH_TEMPLATE_ID,
+            )
+        )
     except TimeoutException:
         _capture_debug(driver, debug_dir, "quick_search_wrong_schema")
-        raise TimeoutException("Residential Quick Search template loaded, but City field did not render.")
+        raise TimeoutException("Residential Quick Search view did not become active after loading the template.")
     _capture_debug(driver, debug_dir, "quick_search_residential_view")
 
 
@@ -808,10 +883,253 @@ def _set_subdivision_value(driver, subdivision_name: str, debug_dir: str) -> Non
     _capture_debug(driver, debug_dir, "subdivision_set")
 
 
-def _set_city_values(driver, city_names, debug_dir: str) -> None:
+def _choose_city_location(candidates, city: str):
+    """Select an exact City field, ignoring address/overlay hits and duplicate Top Hits."""
+    def norm(value):
+        return re.sub(r"\s+", " ", str(value or "")).strip().upper()
+
+    target = norm(city)
+    exact_values = {target, f"CITY OF {target}", f"{target}, FL", f"{target}, FLORIDA"}
+    matches = []
+    for candidate in candidates:
+        obj = candidate.get("search") or {}
+        # FlexMLS omits repeated category labels (e.g. Palm Beach appears
+        # below Palm Beach Gardens with a blank first cell). Trust typed query
+        # metadata, not that presentation label.
+        if norm(obj.get("tb")) != "LIST" or norm(obj.get("f")) != "CITY":
+            continue
+        # display_val is the location value; d/f describe the field. Matching
+        # against row text would conflate City with Street Address or overlays.
+        if norm(obj.get("display_val") or candidate.get("label")) not in exact_values:
+            continue
+        matches.append(candidate)
+
+    unique = {}
+    for item in matches:
+        obj = item.get("search") or {}
+        key = tuple(str(obj.get(field) or "") for field in ("tb", "f", "o", "c"))
+        # Only collapse rows when the underlying query is known to be identical.
+        if not obj.get("f") or not obj.get("c"):
+            key += (id(item),)
+        if key not in unique or norm(item.get("category")) in {"CITY", "CITY NAME"}:
+            unique[key] = item
+    if len(unique) > 1:
+        raise TimeoutException(f"Multiple distinct exact City filters for '{city}'.")
+    return next(iter(unique.values()), None)
+
+
+def _city_selector_field(fields):
+    """Prefer the actual City selector, including universal and duplicate renderings."""
+    selectors = {
+        item["id"]: item
+        for item in fields
+        if item.get("type", "").upper() == "SS" and item.get("id")
+    }
+    if len(selectors) > 1:
+        raise TimeoutException(f"Multiple selectable City fields in FlexMLS picker: {list(selectors.values())}")
+    return next(iter(selectors.values()), None)
+
+
+def _city_filter_is_exact(state, city: str) -> bool:
+    """Verify the enabled query, including the Location widget's '=City' syntax."""
+    if not state or not state.get("enabled"):
+        return False
+    target = re.sub(r"\s+", " ", city).strip().upper()
+    selected = state.get("selected")
+    if selected is not None:
+        return [str(value).strip().upper() for value in selected] == [target]
+    criteria = state.get("criteria") or []
+    if not criteria:
+        return False
+    for obj in criteria:
+        if str(obj.get("tb", "")).lower() != "list" or str(obj.get("f", "")).lower() != "city":
+            return False
+        value = str(obj.get("c") or "").strip()
+        if value.startswith("'") and value.endswith("'"):
+            value = value[1:-1].replace("''", "'")
+        operator = str(obj.get("o", "")).lower()
+        if operator == "like":
+            if not value.startswith("="):
+                return False
+            value = value[1:]
+        elif operator not in {"in", "="}:
+            return False
+        if str(obj.get("r", "")).upper() == "X" or re.sub(r"\s+", " ", value).strip().upper() != target:
+            return False
+    return True
+
+
+def _set_city_via_location_search(driver, city: str, debug_dir: str, wait: WebDriverWait) -> bool:
+    """Return True for verified Location criteria, False when a City selector was added."""
+    add_field = wait.until(EC.presence_of_element_located((By.ID, "findfield_btn")))
+    driver.execute_script("arguments[0].click();", add_field)
+    wait.until(
+        lambda d: d.execute_script(
+            "return typeof isFieldPickerShowing === 'function' && isFieldPickerShowing();"
+        )
+    )
+
+    # All fields are already in the picker DOM. Read City metadata directly;
+    # typing in findfield queues callbacks that can reopen it and steal focus.
+    field_info = wait.until(
+        lambda d: d.execute_script(
+            """
+            const list = document.querySelector('#fieldPicker_list');
+            if (!list) return null;
+            const cells = Array.from(list.querySelectorAll('td')).filter(td =>
+              String(td.textContent || '').trim().toUpperCase() === 'CITY'
+            );
+            if (!cells.length) return null;
+            return cells.map(td => ({
+              label: String(td.textContent || '').trim(),
+              type: td.field_type || '',
+              id: td.display_id || '',
+              universal: Array.from(td.querySelectorAll('img')).some(img =>
+                /location section on the left side/i.test(img.title || '')
+              )
+            }));
+            """
+        )
+    )
+
+    # Deduplicate alternate renderings of the same field and prefer the explicit
+    # universal-location marker over a similarly named ordinary search field.
+    unique_fields = {}
+    for item in field_info:
+        unique_fields[(item.get("type", ""), item.get("id", ""), bool(item.get("universal")))] = item
+    fields = list(unique_fields.values())
+    universal = [item for item in fields if item.get("universal")]
+
+    def _add_city_select(item):
+        driver.execute_script(
+            "if (typeof addFieldPickerSearch === 'function') addFieldPickerSearch(arguments[0], arguments[1]);",
+            item["type"],
+            item["id"],
+        )
+        try:
+            WebDriverWait(driver, 5).until(lambda d: d.execute_script("return !!document.querySelector(\"select[data-locationfieldid='city']\")"))
+        except TimeoutException:
+            _capture_debug(driver, debug_dir, "city_field_not_added")
+            raise TimeoutException("FlexMLS listed City as a selectable field but did not add its selector.")
+
+    # City remains a real SS field even in layouts that advertise it through
+    # universal Location. Prefer its typed selector to autocomplete suggestions.
+    try:
+        city_select = _city_selector_field(fields)
+    except TimeoutException:
+        _capture_debug(driver, debug_dir, "city_field_picker_ambiguous")
+        raise
+    if city_select:
+        try:
+            _add_city_select(city_select)
+            return False
+        except TimeoutException:
+            if not universal:
+                raise
+
+    if universal:
+        if len(universal) != 1:
+            _capture_debug(driver, debug_dir, "city_field_picker_ambiguous")
+            raise TimeoutException(f"Ambiguous universal City fields in FlexMLS picker: {universal}")
+        # userFieldPickerInput toggles the dialog and its delayed key handler
+        # can reopen it. Close explicitly before initiating Location search.
+        driver.execute_script("document.getElementById('findfield').blur(); hideFieldPicker();")
+        wait.until(lambda d: d.execute_script("return !isFieldPickerShowing();"))
+    else:
+        direct = [item for item in fields if item.get("type") and item.get("id")]
+        if len(direct) != 1:
+            _capture_debug(driver, debug_dir, "city_field_picker_ambiguous")
+            raise TimeoutException(f"Could not identify one City field in FlexMLS picker: {fields}")
+        _add_city_select(direct[0])
+        return False
+
+    # The universal-location input returns typed MLS fields. Match their City
+    # query metadata and exact displayed value, including repeated blank labels.
+    suggestion_script = """
+      const $ = window.jQuery;
+      const rows = Array.from(document.querySelectorAll('div.uloc_search tr')).filter(row => {
+        const root = row.closest('div.uloc_search');
+        return root && root.getClientRects().length > 0 && $ && $(row).data('srchObj');
+      });
+      return rows.map(row => {
+        const obj = $(row).data('srchObj') || {};
+        const cells = row.querySelectorAll('td');
+        return {
+          row,
+          category: cells.length ? cells[0].textContent.trim() : '',
+          label: cells.length > 1 ? cells[cells.length - 1].textContent.trim() : '',
+          search: {tb:obj.tb, f:obj.f, o:obj.o, c:obj.c, d:obj.d, display_val:obj.display_val}
+        };
+      });
+    """
+    last_suggestions = []
+    matched_row = None
+    wait.until(EC.presence_of_element_located((By.ID, "location_search_input")))
+    for attempt in range(2):
+        # Use the widget's own initiate/search events. Keyboard focus can be
+        # stolen by a queued field-picker event, leaving the Location box empty.
+        driver.execute_script(
+            """
+            hideFieldPicker();
+            const input = window.jQuery('#location_search_input');
+            input.trigger('focus').trigger('initiate').val(arguments[0]).trigger('search', [false, true]);
+            """,
+            city,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            candidates = driver.execute_script(suggestion_script) or []
+            last_suggestions = [{k: v for k, v in item.items() if k != "row"} for item in candidates]
+            try:
+                match = _choose_city_location(candidates, city)
+            except TimeoutException:
+                _capture_debug(driver, debug_dir, "city_location_ambiguous")
+                raise TimeoutException(f"Multiple exact City filters for '{city}': {last_suggestions}")
+            if match:
+                matched_row = match["row"]
+                break
+            time.sleep(0.25)
+        if matched_row is not None:
+            break
+        print(f"city_location_retry city={city!r} attempt={attempt + 1} candidates={last_suggestions}", flush=True)
+    if matched_row is None:
+        _capture_debug(driver, debug_dir, "city_location_not_found")
+        raise TimeoutException(f"No exact City suggestion for '{city}'. Suggestions: {last_suggestions}")
+
+    from selenium.webdriver.common.action_chains import ActionChains
+    driver.execute_script("hideFieldPicker();")
+    ActionChains(driver).move_to_element(matched_row).double_click(matched_row).perform()
+
+    try:
+        wait.until(lambda d: _city_filter_is_exact(d.execute_script(
+            """
+            const enabled = item => {
+              const checkbox = item && document.getElementById('enabled_' + item.unique_id);
+              return !checkbox || checkbox.checked;
+            };
+            const select = document.querySelector("select[data-locationfieldid='city']");
+            if (select) {
+              return {enabled: enabled(srch.get_parent(select)), selected: Array.from(select.selectedOptions).map(opt => opt.textContent)};
+            }
+            const item = window.srch && srch.type && srch.type.location && srch.type.location.findLocationItem
+              ? srch.type.location.findLocationItem()
+              : null;
+            if (!item) return null;
+            return {enabled: enabled(item), criteria: srch.type.location.compile(item)};
+            """,
+        ), city))
+    except TimeoutException:
+        _capture_debug(driver, debug_dir, "city_location_unverified")
+        raise TimeoutException(f"FlexMLS did not confirm the exact City location filter for '{city}'.")
+    print(f"city_location_verified city={city!r}", flush=True)
+    return True
+
+
+def _set_city_values(driver, city_names, debug_dir: str, wait: WebDriverWait | None = None) -> None:
     requested = [str(c).strip() for c in city_names if str(c).strip()]
     if not requested:
         raise TimeoutException("No city names provided.")
+    wait = wait or WebDriverWait(driver, 25)
     js = """
         const requested = (arguments[0] || []).map(x => String(x).trim()).filter(Boolean);
         if (!requested.length) return {ok:false, reason:'empty_requested'};
@@ -849,6 +1167,12 @@ def _set_city_values(driver, city_names, debug_dir: str) -> None:
         return {ok:selected.length > 0, selected, missing};
     """
     result = driver.execute_script(js, requested) or {}
+    if result.get("reason") == "city_select_not_found" and len(requested) == 1:
+        verified_location = _set_city_via_location_search(driver, requested[0], debug_dir, wait)
+        if verified_location:
+            result = {"ok": True, "selected": requested, "missing": []}
+        else:
+            result = driver.execute_script(js, requested) or {}
     _capture_debug(driver, debug_dir, "city_set")
     if not result.get("ok"):
         raise TimeoutException(f"Unable to set city filter. reason={result.get('reason')} missing={result.get('missing')}")
@@ -961,6 +1285,58 @@ def _get_visible_match_count(driver):
         return None
 
 
+def _completed_result_count(state):
+    """Reject cached count-only responses until the actual results query finishes."""
+    if not state or any(state.get(flag) for flag in ("dirty", "busy", "loading")):
+        return None
+    if not state.get("query_ready"):
+        return None
+    counts = [_parse_match_count(str(state.get(key, ""))) for key in ("total", "results_text", "top_text")]
+    return counts[0] if counts[0] is not None and counts.count(counts[0]) == len(counts) else None
+
+
+def _wait_for_final_match_count(driver, timeout_sec: int = 60):
+    """Require completed result rows/counts, rather than a stable cached count banner."""
+    deadline = time.monotonic() + timeout_sec
+    last_count = None
+    stable_reads = 0
+    while time.monotonic() < deadline:
+        state = driver.execute_script(
+            """
+            // showResults can be ignored while an earlier count request runs.
+            // Retry it once that request finishes and the query is still dirty.
+            if (window.dirtysearch && !window.alreadyrunning && !window.HALT_COMPILE &&
+                typeof showResults === 'function') showResults();
+            const results = document.getElementById('results_totaldiv');
+            const top = document.getElementById('top_matchesdiv');
+            const loader = document.getElementById('loadingdiv');
+            return {
+              total: window.results_totallistings,
+              results_text: results ? results.textContent : '',
+              top_text: top ? top.textContent : '',
+              dirty: !!window.dirtysearch,
+              busy: !!window.alreadyrunning || !!window.HALT_COMPILE,
+              loading: !!loader && loader.getClientRects().length > 0 && getComputedStyle(loader).display !== 'none',
+              query_ready: !!window.results_allwherestr
+            };
+            """
+        ) or {}
+        current = _completed_result_count(state)
+        if current is not None:
+            if current == last_count:
+                stable_reads += 1
+                if stable_reads >= 4:
+                    return current
+            else:
+                last_count = current
+                stable_reads = 1
+        else:
+            last_count = None
+            stable_reads = 0
+        time.sleep(0.5)
+    raise TimeoutException("Results query did not finish with matching final counters; refusing to export.")
+
+
 def _run_search(driver, wait: WebDriverWait, debug_dir: str):
     # Quick Search in the new Flex shell commonly uses Update Count + View Results
     # rather than a normal submit button.
@@ -1045,7 +1421,7 @@ def _run_search(driver, wait: WebDriverWait, debug_dir: str):
 
     if _force_show_results("initial"):
         _capture_debug(driver, debug_dir, "after_show_results_js")
-        return match_count or _get_visible_match_count(driver)
+        return _wait_for_final_match_count(driver)
 
     result_selectors = [
         (By.ID, "topgridlink_outermatch"),
@@ -1065,7 +1441,7 @@ def _run_search(driver, wait: WebDriverWait, debug_dir: str):
                 "#more-ellipses, li#export-listings a, #gridlink_results, #results_totaldiv",
                 timeout_sec=12,
             ):
-                return match_count or _get_visible_match_count(driver)
+                return _wait_for_final_match_count(driver)
             break
         except Exception:
             continue
@@ -1079,11 +1455,11 @@ def _run_search(driver, wait: WebDriverWait, debug_dir: str):
             "#more-ellipses, li#export-listings a, #gridlink_results, #results_totaldiv",
             timeout_sec=12,
         ):
-            return match_count or _get_visible_match_count(driver)
+            return _wait_for_final_match_count(driver)
 
     if _force_show_results("retry"):
         _capture_debug(driver, debug_dir, "after_show_results_retry")
-        return match_count or _get_visible_match_count(driver)
+        return _wait_for_final_match_count(driver)
 
     wait.until(
         lambda d: _switch_to_context_with_selector(
@@ -1095,7 +1471,7 @@ def _run_search(driver, wait: WebDriverWait, debug_dir: str):
     )
     if not populated:
         _capture_debug(driver, debug_dir, "search_results_without_count")
-    return match_count or _get_visible_match_count(driver)
+    return _wait_for_final_match_count(driver)
 
 
 def _wait_for_csv(download_dir: str, timeout_sec: int = 180):
@@ -1175,6 +1551,7 @@ def _backup_and_import(
     db_file: str,
     backup_dir: str,
     reconcile_active_inventory: bool = False,
+    defer_rx_cleanup: bool = False,
 ) -> Path:
     db_path = Path(db_file)
     if not db_path.exists():
@@ -1183,7 +1560,9 @@ def _backup_and_import(
     backup_root.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_root / f"{db_path.stem}_backup_before_quicksearch_import_{ts}{db_path.suffix}"
-    shutil.copy2(db_path, backup_path)
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(backup_path)) as backup:
+            source.backup(backup)
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "generate_db.py"),
@@ -1194,20 +1573,38 @@ def _backup_and_import(
     ]
     if reconcile_active_inventory:
         cmd.append("--reconcile-active-inventory")
+    if defer_rx_cleanup:
+        cmd.append("--defer-rx-cleanup")
     proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=False)
     if proc.returncode != 0:
         raise SystemExit(f"CSV import failed with exit code {proc.returncode}")
     return backup_path
 
 
-def _stamp_authoritative_city(csv_path: str, city: str) -> None:
-    """Stamp the city selected in FlexMLS when the export omits that field."""
+def _stamp_authoritative_city(csv_path: str, city: str, expected_count: int | None = None) -> None:
+    """Validate a city export, then fill missing city values from the search."""
     path = Path(csv_path)
     try:
         frame = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
         frame = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="latin1")
-    frame["City"] = str(city).strip()
+    requested = str(city).strip()
+    if expected_count is not None and len(frame) != expected_count:
+        raise ValueError(
+            f"Export for {requested} contains {len(frame):,} rows but Quick Search reported "
+            f"{expected_count:,}; refusing to import."
+        )
+    if "City" in frame.columns:
+        present = frame["City"].str.strip()
+        conflicting = present[(present != "") & (present.str.casefold() != requested.casefold())]
+        if not conflicting.empty:
+            raise ValueError(
+                f"Export City values conflict with requested '{requested}': "
+                f"{sorted(conflicting.unique().tolist())}; refusing to import."
+            )
+        frame.loc[present == "", "City"] = requested
+    else:
+        frame["City"] = requested
     frame.to_csv(path, index=False, encoding="utf-8")
 
 
@@ -2116,6 +2513,11 @@ def parse_args():
         default="tmp",
         help="Directory for DB backups before --import-to-db runs.",
     )
+    p.add_argument(
+        "--defer-rx-cleanup",
+        action="store_true",
+        help="Leave board-overlap cleanup to the enclosing multi-city refresh.",
+    )
     return p.parse_args()
 
 
@@ -2257,7 +2659,11 @@ def main():
     wait = WebDriverWait(driver, 30)
     exported_csvs = []
     try:
-        login(driver, wait, email=email, password=password, debug_dir=args.debug_dir)
+        try:
+            login(driver, wait, email=email, password=password, debug_dir=args.debug_dir)
+        except TransientLoginError as exc:
+            print(f"Transient BeachesMLS login failure: {exc.msg}", file=sys.stderr, flush=True)
+            raise SystemExit(os.EX_TEMPFAIL) from exc
         for i, row in enumerate(search_terms, start=1):
             source = row["source"]
             print(f"[{i}/{len(search_terms)}] Quick Search ({source}): {row['name']}")
@@ -2268,7 +2674,7 @@ def main():
             if from_date:
                 _set_status_from_date(driver, from_date, args.debug_dir, status_codes=status_codes)
             if args.search_mode == "city":
-                _set_city_values(driver, row["cities"], args.debug_dir)
+                _set_city_values(driver, row["cities"], args.debug_dir, wait)
             else:
                 subdivision = row["name"].strip()
                 _set_subdivision_value(driver, subdivision, args.debug_dir)
@@ -2277,7 +2683,11 @@ def main():
                 print(f"  match_count={match_count}")
             time.sleep(2.0)
             if args.export_each_search:
-                if match_count is not None and match_count > args.max_export_records:
+                if match_count is None:
+                    raise TimeoutException(
+                        f"Search '{row['name']}' has no verified final count; refusing to export."
+                    )
+                if match_count > args.max_export_records:
                     raise TimeoutException(
                         f"Search '{row['name']}' returned {match_count:,} records, above export limit "
                         f"{args.max_export_records:,}. Split this search before exporting."
@@ -2299,7 +2709,7 @@ def main():
                     csv_path = str(unique_csv)
                 print(f"  export_csv={csv_path}")
                 if args.search_mode == "city":
-                    _stamp_authoritative_city(csv_path, row["cities"][0])
+                    _stamp_authoritative_city(csv_path, row["cities"][0], expected_count=match_count)
                 exported_csvs.append(csv_path)
 
         print("Quick Search run completed.")
@@ -2314,6 +2724,7 @@ def main():
             args.db_file,
             args.backup_dir,
             reconcile_active_inventory=args.reconcile_active_inventory,
+            defer_rx_cleanup=args.defer_rx_cleanup,
         )
         print(f"db_backup={backup_path}")
 

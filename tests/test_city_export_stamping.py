@@ -45,6 +45,22 @@ class CityExportStampingTests(unittest.TestCase):
                 (today - timedelta(days=1)).strftime("%m/%d/%Y"),
             )
 
+    def test_existing_source_city_is_preserved_and_only_blanks_are_filled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "export.csv"
+            pd.DataFrame([{"City": "PALM BEACH"}, {"City": ""}]).to_csv(path, index=False)
+            _stamp_authoritative_city(str(path), "Palm Beach")
+            self.assertEqual(pd.read_csv(path)["City"].tolist(), ["PALM BEACH", "Palm Beach"])
+
+    def test_conflicting_city_is_rejected_before_file_is_changed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "export.csv"
+            pd.DataFrame([{"City": "West Palm Beach"}]).to_csv(path, index=False)
+            original = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "conflict with requested"):
+                _stamp_authoritative_city(str(path), "Palm Beach")
+            self.assertEqual(path.read_bytes(), original)
+
     def test_derived_start_date_applies_configured_overlap(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "mls.db"
