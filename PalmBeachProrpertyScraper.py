@@ -38,16 +38,16 @@ def parse_mmddyyyy(date_str):
     return dt.strftime("%m/%d/%Y")
 
 
-def get_last_imported_pbc_sale_date(target_city=None):
+def get_last_imported_pbc_sale_date(target_city=None, *, db_file=DB_FILE):
     """
     Returns latest sold_date for PBC-imported rows.
     If city is provided, filters by that city.
     """
-    if not os.path.exists(DB_FILE):
+    if not os.path.exists(db_file):
         return None
 
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
         city_filter = target_city.strip().title() if target_city else None
         if city_filter:
@@ -705,6 +705,7 @@ def run_scraper(
     download_folder=None,
     chromedriver_port=9516,
     last_imported_overlap_days=90,
+    db_file=DB_FILE,
 ):
     # --- PHASE 0: USER INPUTS ---
     print("\n--- PBC Property Scraper Configuration ---")
@@ -735,7 +736,9 @@ def run_scraper(
     # 2. Get Start Date (with optional last-imported mode)
     default_date = (datetime.now() - timedelta(days=180)).strftime("%m/%d/%Y")
     if use_last_imported and not start_date:
-        latest = get_last_imported_pbc_sale_date(target_city if search_mode == "municipality" else None)
+        latest = get_last_imported_pbc_sale_date(
+            target_city if search_mode == "municipality" else None, db_file=db_file
+        )
         if latest:
             overlap_start = pbc_overlap_start_date(latest, last_imported_overlap_days)
             start_date = overlap_start.strftime("%m/%d/%Y")

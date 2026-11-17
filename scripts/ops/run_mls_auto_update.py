@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -343,12 +344,13 @@ def _parse_pbc_output(output: str, cities: list[str]) -> dict:
         elif line.startswith("pbc_manual_follow_up="):
             manual_follow_up = line.split("=", 1)[1].strip()
 
-    failures = [row for row in results if row.get("status") == "error"]
+    result_counts = Counter(row["city"] for row in results)
+    successful = {row["city"] for row in results if row.get("status") in {"ok", "no_results"}}
     return {
         "cities": cities,
         "results": results,
         "manual_follow_up": manual_follow_up or None,
-        "failed_cities": [row.get("city", "") for row in failures if row.get("city")],
+        "failed_cities": [city for city in cities if result_counts[city] != 1 or city not in successful],
     }
 
 

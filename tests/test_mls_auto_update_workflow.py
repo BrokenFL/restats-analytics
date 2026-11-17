@@ -111,6 +111,17 @@ class MlsAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertEqual(result["failed_cities"], ["Delray Beach"])
         self.assertEqual(result["manual_follow_up"], "Delray Beach(csv_export_unavailable)")
 
+    def test_county_requires_one_valid_outcome_per_requested_city(self):
+        result = workflow._parse_pbc_output(
+            "\n".join([
+                "pbc_city_result=Palm Beach|status=ok",
+                "pbc_city_result=Palm Beach|status=no_results",
+                "pbc_city_result=Wellington|status=ok",
+            ]),
+            ["Palm Beach", "Wellington", "Delray Beach"],
+        )
+        self.assertEqual(result["failed_cities"], ["Palm Beach", "Delray Beach"])
+
     def test_pbc_failure_marks_overall_run_failed(self):
         args = argparse.Namespace(
             cities="Palm Beach",

@@ -3,7 +3,6 @@ from contextlib import closing
 import getpass
 import os
 import re
-import shutil
 import sqlite3
 import socket
 import subprocess
@@ -2700,16 +2699,14 @@ def main():
                     export_template=args.export_template,
                     download_timeout=args.download_timeout,
                 )
+                if args.search_mode == "city":
+                    _stamp_authoritative_city(csv_path, row["cities"][0], expected_count=match_count)
                 downloaded = Path(csv_path)
                 unique_csv = downloaded.with_name(f"{i:02d}_{_slugify_filename(row['name'])}_{downloaded.name}")
                 if downloaded != unique_csv:
-                    if unique_csv.exists():
-                        unique_csv.unlink()
-                    shutil.move(str(downloaded), str(unique_csv))
+                    downloaded.replace(unique_csv)
                     csv_path = str(unique_csv)
                 print(f"  export_csv={csv_path}")
-                if args.search_mode == "city":
-                    _stamp_authoritative_city(csv_path, row["cities"][0], expected_count=match_count)
                 exported_csvs.append(csv_path)
 
         print("Quick Search run completed.")

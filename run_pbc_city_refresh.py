@@ -1,7 +1,8 @@
 import argparse
 import os
 import re
-import shutil
+import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,9 @@ def backup_db(db_file, backup_dir):
     backup_root.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_root / f"mls_backup_before_pbc_import_{ts}.db"
-    shutil.copy2(db_path, backup_path)
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(backup_path)) as backup:
+            source.backup(backup)
     return str(backup_path)
 
 
@@ -115,6 +118,7 @@ def main():
                 download_folder=str(city_download_dir),
                 chromedriver_port=args.chromedriver_port + index - 1,
                 last_imported_overlap_days=args.overlap_days,
+                db_file=args.db_file,
             ) or {}
 
             status = scrape_result.get("status")
@@ -124,7 +128,7 @@ def main():
                 if not backup_path:
                     backup_path = backup_db(args.db_file, args.backup_dir)
                     print(f"pbc_db_backup={backup_path}", flush=True)
-                import_result = import_pbc_data(final_csv, dry_run=False)
+                import_result = import_pbc_data(final_csv, dry_run=False, db_file=args.db_file)
                 import_errors = import_result.get("errors", 0)
                 row = {
                     "city": city,

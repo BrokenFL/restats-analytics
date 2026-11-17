@@ -15,11 +15,11 @@ from city_utils import canonical_city_name, normalize_city_values_in_db
 # Configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mls.db')
 
-def get_existing_sales():
+def get_existing_sales(db_file=DB_FILE):
     """Load existing parcel_id + sold_date from database for duplicate checking."""
     existing = {}
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT parcel_id, DATE(sold_date) 
@@ -131,7 +131,7 @@ def clean_int(val):
         return None
 
 
-def import_pbc_data(csv_path, dry_run=False):
+def import_pbc_data(csv_path, dry_run=False, *, db_file=DB_FILE):
     """
     Import PBC scraped data into the database.
     
@@ -146,16 +146,15 @@ def import_pbc_data(csv_path, dry_run=False):
     print("PBC Off-Market Sales Importer")
     print(f"{'='*60}")
     print(f"CSV: {csv_path}")
-    print(f"Database: {DB_FILE}")
+    print(f"Database: {db_file}")
     print(f"Mode: {'DRY RUN' if dry_run else 'LIVE IMPORT'}")
     print(f"{'='*60}\n")
     
-    if not os.path.exists(csv_path):
-        print(f"Error: CSV file not found: {csv_path}")
-        return {'imported': 0, 'skipped': 0, 'errors': 0}
+    if not csv_path or not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"County export not found: {csv_path}")
     
     # Load existing sales for duplicate checking
-    existing_sales = get_existing_sales()
+    existing_sales = get_existing_sales(db_file)
     print(f"✓ Loaded {sum(len(v) for v in existing_sales.values())} existing sales for duplicate check")
     
     # Read CSV
@@ -201,7 +200,7 @@ def import_pbc_data(csv_path, dry_run=False):
     )
     
     # Connect to database
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     
     imported = 0
@@ -346,4 +345,5 @@ if __name__ == "__main__":
     csv_path = sys.argv[1]
     dry_run = '--dry-run' in sys.argv
     
-    import_pbc_data(csv_path, dry_run=dry_run)
+    result = import_pbc_data(csv_path, dry_run=dry_run)
+    sys.exit(1 if result["errors"] else 0)
