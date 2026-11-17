@@ -984,9 +984,10 @@ def _load_market_analysis_frame(
         params=query_params,
     )
 
+    # SQLite imports store both date-only strings and timestamps in the same columns.
     for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = pd.to_datetime(df[col], format="mixed", errors="coerce")
     for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -2031,7 +2032,7 @@ def ops_parity(
         )
 
     for col in ["listing_date", "effective_active_end_date", "under_contract_date", "sold_date"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+        df[col] = pd.to_datetime(df[col], format="mixed", errors="coerce")
     for col in ["list_price", "original_list_price", "sold_price", "sqft_living", "days_on_market", "cumulative_dom"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["days_on_market"] = df["days_on_market"].fillna(df["cumulative_dom"])
@@ -2134,8 +2135,10 @@ def summary_kpis(
         active_current = 0
         active_snapshot = 0
     else:
-        active_df["listing_date"] = pd.to_datetime(active_df["listing_date"], errors="coerce")
-        active_df["effective_active_end_date"] = pd.to_datetime(active_df["effective_active_end_date"], errors="coerce")
+        active_df["listing_date"] = pd.to_datetime(active_df["listing_date"], format="mixed", errors="coerce")
+        active_df["effective_active_end_date"] = pd.to_datetime(
+            active_df["effective_active_end_date"], format="mixed", errors="coerce"
+        )
         active_current = int(_is_active_now_mask(active_df).sum())
         if snapshot_date:
             parsed_snapshot = _parse_iso_date(snapshot_date)

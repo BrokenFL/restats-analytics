@@ -4,7 +4,7 @@ import unittest
 import pandas as pd
 
 import data_analysis_functions as daf
-from api.main import _is_active_as_of_mask, _is_active_now_mask
+from api.main import _is_active_as_of_mask, _is_active_now_mask, _load_market_analysis_frame
 from data_cleaning import _mls_canonical_rank, reconcile_stale_active_inventory
 
 
@@ -97,6 +97,26 @@ class InventoryEligibilityTests(unittest.TestCase):
         self.assertEqual(before_replacement.tolist(), [True, False])
         self.assertEqual(after_replacement.tolist(), [False, True])
         self.assertEqual(_is_active_as_of_mask(frame, pd.Timestamp("2026-05-31")).tolist(), [True, False])
+
+    def test_sqlite_report_preserves_mixed_inventory_retirement_dates(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        rows = [
+            listing("B26050001", effective_active_end_date="2026-10-24 00:00:00"),
+            listing(
+                "B26050002",
+                parcel_id="parcel-2",
+                short_address="2 Main Street",
+                listing_date="2026-04-01 00:00:00",
+                effective_active_end_date="2026-11-17",
+            ),
+        ]
+        pd.DataFrame(rows).to_sql("listing_details", conn, index=False)
+
+        frame = _load_market_analysis_frame(conn, "1=1", [], select_columns=list(rows[0]))
+
+        self.assertEqual(_is_active_as_of_mask(frame, pd.Timestamp("2026-10-31")).tolist(), [False, True])
+        self.assertEqual(_is_active_as_of_mask(frame, pd.Timestamp("2026-11-30")).tolist(), [False, False])
 
     def test_castellina_b_listings_remain_eligible_without_counterparts(self):
         frame = pd.DataFrame(
