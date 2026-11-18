@@ -1109,16 +1109,88 @@ def _build_dashboard_bootstrap(
         }
 
 
-def _postgres_inventory_identity_expr(alias: str = "d") -> str:
+def _postgres_inventory_city_expr(alias: str) -> str:
+    return f"regexp_replace(UPPER(COALESCE({alias}.city, '')), '[^A-Z0-9]', '', 'g')"
+
+
+def _postgres_inventory_identity_expr(alias: str = "d", *, normalize_once: bool = False) -> str:
     """Return the SQL identity expression used by inventory deduplication."""
     address = f"regexp_replace(UPPER(COALESCE({alias}.short_address, '')), '[^A-Z0-9]', '', 'g')"
-    city = f"regexp_replace(UPPER(COALESCE({alias}.city, '')), '[^A-Z0-9]', '', 'g')"
+    city = _postgres_inventory_city_expr(alias)
     parcel = f"regexp_replace(UPPER(COALESCE({alias}.parcel_id, '')), '[^A-Z0-9]', '', 'g')"
+    if normalize_once:
+        return (
+            f"COALESCE('address:' || {city} || ':' || NULLIF({address}, ''), "
+            f"'parcel:' || NULLIF({parcel}, ''), '')"
+        )
     return (
         "CASE "
         f"WHEN NULLIF({address}, '') IS NOT NULL THEN 'address:' || {city} || ':' || {address} "
         f"WHEN NULLIF({parcel}, '') IS NOT NULL THEN 'parcel:' || {parcel} "
         "ELSE '' END"
+    )
+
+
+def _postgres_scoped_inventory_source(candidate_filter: str, extra_joins: str = "") -> str:
+    """Find possible replacements for the identities in the filtered report."""
+    # Check raw city variants through the city index before comparing addresses.
+    # Parcel-only identities can match across cities, so include that search
+    # only when the report actually contains parcel-only identities.
+    # Materialize the normalized candidates so a nested loop cannot repeat
+    # address normalization for every pair of listings it compares.
+    return f"""
+        inventory_keys AS (
+            SELECT DISTINCT inventory_identity FROM base WHERE inventory_identity <> ''
+        ),
+        matching_cities AS MATERIALIZED (
+            SELECT c.city
+            FROM (SELECT DISTINCT city FROM listing_details) c
+            JOIN (
+                SELECT DISTINCT split_part(inventory_identity, ':', 2) AS city_key
+                FROM inventory_keys WHERE inventory_identity LIKE 'address:%'
+            ) k ON k.city_key = {_postgres_inventory_city_expr('c')}
+        ),
+        inventory_candidates AS (
+            SELECT d.*
+            FROM matching_cities c
+            CROSS JOIN LATERAL (
+                SELECT * FROM listing_details d
+                WHERE d.city = c.city
+                OFFSET 0
+            ) d
+            WHERE c.city IS NOT NULL
+            UNION ALL
+            SELECT d.* FROM listing_details d
+            WHERE d.city IS NULL AND EXISTS (SELECT 1 FROM matching_cities WHERE city IS NULL)
+            UNION ALL
+            SELECT d.* FROM listing_details d
+            WHERE EXISTS (SELECT 1 FROM inventory_keys WHERE inventory_identity LIKE 'parcel:%')
+              AND NOT EXISTS (SELECT 1 FROM matching_cities c WHERE c.city IS NOT DISTINCT FROM d.city)
+        ),
+        normalized_candidates AS MATERIALIZED (
+            SELECT d.listing_number, d.listing_date, d.status_change_date,
+                {_postgres_inventory_identity_expr('d', normalize_once=True)} AS inventory_identity,
+                CASE WHEN UPPER(d.listing_number) LIKE 'B%' THEN 0 ELSE 1 END AS source_rank
+            FROM inventory_candidates d
+            {extra_joins}
+            WHERE (UPPER(d.listing_number) LIKE 'B%' OR UPPER(d.listing_number) ~ '^R[0-9]+$')
+              AND {candidate_filter}
+        ),
+        inventory_source AS MATERIALIZED (
+            SELECT d.*
+            FROM normalized_candidates d
+            JOIN inventory_keys k ON k.inventory_identity = d.inventory_identity
+        ),
+    """
+
+
+def _postgres_joined_inventory_predicate(period_end: str, winner_alias: str) -> str:
+    return (
+        "(UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%' "
+        "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%' "
+        f"AND (d.listing_date IS NULL OR {winner_alias}.listing_number IS NULL "
+        f"OR d.listing_date >= {period_end} + INTERVAL '1 day' "
+        f"OR d.listing_number = {winner_alias}.listing_number))"
     )
 
 
@@ -1147,6 +1219,7 @@ def _postgres_report_period_metrics(
     previous_start: str,
     previous_end: str,
     history_start: str,
+    scoped_inventory: bool = False,
 ) -> tuple[dict, dict]:
     """Compute report metrics in Postgres without shipping a wide dataframe to pandas."""
     cabana_flag_expr = "d.cabana_flag" if _listing_details_has_column("cabana_flag") else "0"
@@ -1164,18 +1237,9 @@ def _postgres_report_period_metrics(
     def pending_sales_window(start_ref: str, end_ref: str) -> str:
         return f"DATE(d.under_contract_date) >= b.{start_ref} AND DATE(d.under_contract_date) <= b.{end_ref}"
 
-    def eligible_inventory(end_ref: str, winner_ref: str) -> str:
-        return (
-            "(UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%' "
-            "AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%' "
-            f"AND (d.listing_date IS NULL OR {winner_ref}.listing_number IS NULL "
-            f"OR d.listing_date >= b.{end_ref} + INTERVAL '1 day' "
-            f"OR d.listing_number = {winner_ref}.listing_number))"
-        )
-
     def active_inventory(end_ref: str, winner_ref: str) -> str:
         return (
-            f"{cabana_predicate} AND {eligible_inventory(end_ref, winner_ref)} "
+            f"{cabana_predicate} AND {_postgres_joined_inventory_predicate(f'b.{end_ref}', winner_ref)} "
             f"AND d.listing_date IS NOT NULL AND DATE(d.listing_date) <= b.{end_ref} "
             f"AND (DATE(d.effective_active_end_date) > b.{end_ref} "
             f"OR (d.effective_active_end_date IS NULL AND {active_status}))"
@@ -1183,7 +1247,7 @@ def _postgres_report_period_metrics(
 
     def pending_inventory(end_ref: str, winner_ref: str) -> str:
         return (
-            f"{cabana_predicate} AND {eligible_inventory(end_ref, winner_ref)} "
+            f"{cabana_predicate} AND {_postgres_joined_inventory_predicate(f'b.{end_ref}', winner_ref)} "
             f"AND d.under_contract_date IS NOT NULL AND DATE(d.under_contract_date) <= b.{end_ref} "
             f"AND (d.sold_date IS NULL OR DATE(d.sold_date) > b.{end_ref}) "
             f"AND (d.effective_active_end_date IS NULL OR DATE(d.effective_active_end_date) > b.{end_ref} "
@@ -1211,6 +1275,37 @@ def _postgres_report_period_metrics(
     current_pending_sales = pending_sales_window("current_start", "current_end")
     previous_pending_sales = pending_sales_window("previous_start", "previous_end")
 
+    history_predicate = """
+        (DATE(d.sold_date) >= b.history_start
+         OR DATE(d.listing_date) >= b.history_start
+         OR DATE(d.under_contract_date) >= b.history_start
+         OR d.effective_active_end_date IS NULL
+         OR DATE(d.effective_active_end_date) >= b.history_start)
+    """
+    candidate_date = "d.listing_date < (GREATEST(b.current_end, b.previous_end) + INTERVAL '1 day')"
+    history_scope = f"AND ({where_sql})" if scoped_inventory else ""
+    base_scope = "TRUE" if scoped_inventory else where_sql
+    if scoped_inventory:
+        inventory_source = _postgres_scoped_inventory_source(
+            f"{candidate_date} AND {history_predicate}",
+            "CROSS JOIN bounds b",
+        )
+    else:
+        inventory_source = f"""
+        inventory_source AS MATERIALIZED (
+            SELECT
+                d.listing_number,
+                d.listing_date,
+                d.status_change_date,
+                d.inventory_identity,
+                CASE WHEN UPPER(d.listing_number) LIKE 'B%' THEN 0 ELSE 1 END AS source_rank
+            FROM history d
+            CROSS JOIN bounds b
+            WHERE (UPPER(d.listing_number) LIKE 'B%' OR UPPER(d.listing_number) ~ '^R[0-9]+$')
+              AND {candidate_date}
+        ),
+        """
+
     sql = f"""
         WITH bounds AS (
             SELECT
@@ -1228,36 +1323,21 @@ def _postgres_report_period_metrics(
                 d.city, d.geo_zone, d.final_subdivision, d.property_type,
                 {cabana_flag_expr} AS cabana_flag,
                 {buyer_financing_expr} AS buyer_financing,
-                {_postgres_inventory_identity_expr('d')} AS inventory_identity
+                {_postgres_inventory_identity_expr('d', normalize_once=scoped_inventory)} AS inventory_identity
             FROM listing_details d
             CROSS JOIN bounds b
-            WHERE DATE(d.sold_date) >= b.history_start
-               OR DATE(d.listing_date) >= b.history_start
-               OR DATE(d.under_contract_date) >= b.history_start
-               OR d.effective_active_end_date IS NULL
-               OR DATE(d.effective_active_end_date) >= b.history_start
+            WHERE {history_predicate} {history_scope}
         ),
         base AS (
             SELECT * FROM history
-            WHERE {where_sql}
+            WHERE {base_scope}
         ),
         inventory_periods AS (
             SELECT 'current'::text AS period_key, current_end AS period_end FROM bounds
             UNION ALL
             SELECT 'previous'::text AS period_key, previous_end AS period_end FROM bounds
         ),
-        inventory_source AS MATERIALIZED (
-            SELECT
-                d.listing_number,
-                d.listing_date,
-                d.status_change_date,
-                d.inventory_identity,
-                CASE WHEN UPPER(d.listing_number) LIKE 'B%' THEN 0 ELSE 1 END AS source_rank
-            FROM history d
-            CROSS JOIN bounds b
-            WHERE (UPPER(d.listing_number) LIKE 'B%' OR UPPER(d.listing_number) ~ '^R[0-9]+$')
-              AND d.listing_date < (GREATEST(b.current_end, b.previous_end) + INTERVAL '1 day')
-        ),
+        {inventory_source}
         inventory_winners AS (
             SELECT p.period_key, latest.inventory_identity, latest.listing_number
             FROM inventory_periods p
@@ -1378,6 +1458,8 @@ def _postgres_period_series(
     params: list[str],
     period_specs: list[tuple[int, str, str, str]],
     history_start: str,
+    *,
+    scoped_inventory: bool = False,
 ) -> list[dict]:
     """Aggregate all requested periods in one Postgres query."""
     cabana_predicate = "COALESCE(d.cabana_flag, 0) = 0" if _listing_details_has_column("cabana_flag") else "TRUE"
@@ -1391,8 +1473,44 @@ def _postgres_period_series(
         ["(?, ?, CAST(? AS date), CAST(? AS date))" for _ in period_specs]
     )
 
+    if scoped_inventory:
+        base_columns = f"d.*, {_postgres_inventory_identity_expr('d', normalize_once=True)} AS inventory_identity"
+        inventory_source = _postgres_scoped_inventory_source(
+            "d.listing_date < (SELECT MAX(period_end) FROM inventory_periods) + INTERVAL '1 day'"
+        )
+        winner_column = "latest.inventory_identity"
+        winner_join = """
+            LEFT JOIN inventory_winners w
+            ON w.period_key = CAST(p.idx AS text) AND w.inventory_identity = d.inventory_identity
+        """
+        eligible_inventory = _postgres_joined_inventory_predicate("p.end_date", "w")
+    else:
+        base_columns = "d.*"
+        inventory_source = f"""
+        inventory_source AS MATERIALIZED (
+            SELECT
+                d.listing_number,
+                d.listing_date,
+                d.status_change_date,
+                {_postgres_inventory_identity_expr('d')} AS inventory_identity,
+                CASE
+                    WHEN UPPER(COALESCE(d.listing_number, '')) LIKE 'B%'
+                    THEN 0
+                    WHEN UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
+                    THEN 1
+                    ELSE 2
+                END AS source_rank
+            FROM listing_details d
+            WHERE UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%'
+              AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%'
+        ),
+        """
+        winner_column = "p.period_end"
+        winner_join = ""
+        eligible_inventory = _postgres_inventory_predicate("CAST(p.idx AS text)")
+
     active_inventory = (
-        f"{cabana_predicate} AND {_postgres_inventory_predicate('CAST(p.idx AS text)')} "
+        f"{cabana_predicate} AND {eligible_inventory} "
         "AND d.listing_date IS NOT NULL "
         "AND d.listing_date < (p.end_date + INTERVAL '1 day') "
         "AND ((d.effective_active_end_date IS NULL "
@@ -1400,7 +1518,7 @@ def _postgres_period_series(
         "OR d.effective_active_end_date >= (p.end_date + INTERVAL '1 day'))"
     )
     pending_inventory = (
-        f"{cabana_predicate} AND {_postgres_inventory_predicate('CAST(p.idx AS text)')} "
+        f"{cabana_predicate} AND {eligible_inventory} "
         "AND d.under_contract_date IS NOT NULL "
         "AND d.under_contract_date < (p.end_date + INTERVAL '1 day') "
         "AND (d.sold_date IS NULL OR d.sold_date >= (p.end_date + INTERVAL '1 day')) "
@@ -1425,7 +1543,7 @@ def _postgres_period_series(
             FROM periods
         ),
         base AS (
-            SELECT d.*
+            SELECT {base_columns}
             FROM listing_details d
             WHERE {where_sql}
               AND (
@@ -1436,23 +1554,7 @@ def _postgres_period_series(
                  OR d.effective_active_end_date >= CAST(? AS date)
               )
         ),
-        inventory_source AS MATERIALIZED (
-            SELECT
-                d.listing_number,
-                d.listing_date,
-                d.status_change_date,
-                {_postgres_inventory_identity_expr('d')} AS inventory_identity,
-                CASE
-                    WHEN UPPER(COALESCE(d.listing_number, '')) LIKE 'B%'
-                    THEN 0
-                    WHEN UPPER(COALESCE(d.listing_number, '')) ~ '^R[0-9]+$'
-                    THEN 1
-                    ELSE 2
-                END AS source_rank
-            FROM listing_details d
-            WHERE UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'AX-%'
-              AND UPPER(COALESCE(d.listing_number, '')) NOT LIKE 'FX-%'
-        ),
+        {inventory_source}
         inventory_new_keys AS (
             SELECT DISTINCT p.period_key, s.inventory_identity
             FROM inventory_periods p
@@ -1463,7 +1565,7 @@ def _postgres_period_series(
               AND s.inventory_identity <> ''
         ),
         inventory_winners AS (
-            SELECT p.period_key, p.period_end, latest.listing_number
+            SELECT p.period_key, {winner_column}, latest.listing_number
             FROM inventory_periods p
             CROSS JOIN LATERAL (
                 SELECT DISTINCT ON (s.inventory_identity)
@@ -1569,6 +1671,7 @@ def _postgres_period_series(
         FROM periods p
         CROSS JOIN base d
         CROSS JOIN max_dates m
+        {winner_join}
         GROUP BY p.idx, p.period, p.start_date, p.end_date
         ORDER BY p.idx
     """
@@ -2581,6 +2684,7 @@ def market_report_summary(
                     previous_start=previous_start,
                     previous_end=previous_end,
                     history_start=history_start,
+                    scoped_inventory=bool(final_subdivision or geo_zone),
                 )
             except Exception:
                 logger.exception("Postgres report-summary aggregate failed; falling back to dataframe metrics")
@@ -2838,7 +2942,10 @@ def market_period_series(
                 return {
                     "frequency": frequency,
                     "periods": periods,
-                    "rows": _postgres_period_series(conn, where_sql, params, period_specs, history_start),
+                    "rows": _postgres_period_series(
+                        conn, where_sql, params, period_specs, history_start,
+                        scoped_inventory=bool(city or final_subdivision or geo_zone),
+                    ),
                 }
             except Exception:
                 logger.exception("Postgres period-series aggregate failed; falling back to dataframe metrics")
